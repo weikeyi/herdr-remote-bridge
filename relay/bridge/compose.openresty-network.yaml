@@ -1,0 +1,37 @@
+# Standalone file: never merge with compose.yaml.
+services:
+  gateway:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.gateway
+    restart: unless-stopped
+    environment:
+      HERDR_GATEWAY_ADDR: ':8443'
+      HERDR_GATEWAY_STUN_ADDR: ''
+      HERDR_GATEWAY_REGISTRATION_TOKEN: ${HERDR_GATEWAY_REGISTRATION_TOKEN:?Set a private registration token}
+      HERDR_GATEWAY_ALLOWED_RELAY_IDS: ${HERDR_GATEWAY_ALLOWED_RELAY_IDS:-}
+      HERDR_GATEWAY_TRUSTED_PROXY: 'true'
+      HERDR_GATEWAY_MAX_CLIENTS_PER_RELAY: '8'
+      HERDR_GATEWAY_CONNECT_RATE_PER_MINUTE: '30'
+      HERDR_GATEWAY_IDLE_TIMEOUT: '300'
+    networks: [backend]
+    # No published gateway port, UDP listener or Docker host networking.
+  caddy:
+    image: ${HERDR_CADDY_IMAGE:?Set an exact Caddy image tag or digest}
+    restart: unless-stopped
+    # Only Caddy joins the dedicated OpenResty network. No published ports.
+    networks:
+      backend:
+      ingress:
+        aliases: [herdr-bridge-http]
+    volumes:
+      - ./Caddyfile.openresty:/etc/caddy/Caddyfile:ro
+      - '${HERDR_PHONE_WEB_ROOT:-../../frontend/dist}:/srv/phone:ro'
+    depends_on:
+      - gateway
+networks:
+  backend:
+    internal: true
+  ingress:
+    external: true
+    name: ${HERDR_OPENRESTY_NETWORK:?Set the dedicated OpenResty network name}

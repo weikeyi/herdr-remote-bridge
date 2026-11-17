@@ -5,6 +5,8 @@
 > and Windows task installation/update tools. Start with
 > [Windows Bridge](relay/windows/README.md) and
 > [private gateway](relay/bridge/README.md), not the upstream Unix installers below.
+> See the [Chinese end-to-end test guide](docs/bridge-user-testing.zh-CN.md)
+> for existing 1Panel/OpenResty servers.
 > Native Windows/VPS/Android acceptance remains required. The following upstream
 > feature guide describes the v0.25.1 baseline; unsupported Windows integrations
 > fail closed rather than silently receiving Unix behavior.

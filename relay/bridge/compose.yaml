@@ -25,7 +25,7 @@ services:
       HERDR_BRIDGE_DOMAIN: ${HERDR_BRIDGE_DOMAIN:?Set the public DNS hostname}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ../../frontend/dist:/srv/phone:ro
+      - '${HERDR_PHONE_WEB_ROOT:-../../frontend/dist}:/srv/phone:ro'
       - caddy-data:/data
       - caddy-config:/config
     depends_on:

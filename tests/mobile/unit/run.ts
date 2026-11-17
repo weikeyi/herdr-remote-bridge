@@ -194,6 +194,19 @@ test('checksum validation is terminal and leaves no downloaded artifact', async 
   assert.equal(existsSync(filename), false);
 });
 
+test('retention permits only the Windows distribution ZIP for fourteen days', async () => {
+  const filename = '.github/workflows/bridge-windows.yml';
+  const bundle = `jobs:\n  build:\n    steps:\n      - name: upload bundle\n        id: bridge-bundle\n        uses: actions/upload-artifact@v4\n        with:\n          path: artifacts/bundle/herdr-remote-bridge_*.zip\n          retention-days: 14\n`;
+  assert.equal(retentionIssues(bundle, filename).length, 0);
+  for (const invalid of [
+    bundle.replace('bridge-bundle', 'reports'),
+    bundle.replace('14', '30'),
+    bundle.replace('artifacts/bundle/herdr-remote-bridge_*.zip', 'artifacts/**'),
+    bundle.replace('artifacts/bundle/herdr-remote-bridge_*.zip', '|\n            artifacts/bundle/herdr-remote-bridge_*.zip\n            artifacts/logs.txt'),
+  ]) assert.equal(retentionIssues(invalid, filename).length, 1);
+  assert.equal(retentionIssues(bundle, '.github/workflows/other.yml').length, 1);
+});
+
 test('retention and composite checks cover named and unnamed steps', async () => {
   const named = `jobs:\n  build:\n    steps:\n      - name: named upload\n        uses: actions/upload-artifact@v4\n        with:\n          retention-days: 7\n`;
   const unnamed = `jobs:\n  build:\n    steps:\n      - uses: actions/upload-artifact@v4\n        with:\n          retention-days: \${{ inputs.retention }}\n`;

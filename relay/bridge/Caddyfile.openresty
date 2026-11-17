@@ -1,0 +1,51 @@
+{
+	auto_https off
+	admin off
+	servers {
+		protocols h1 h2
+	}
+}
+
+:8080 {
+	# Caddy does not interpret the static bundle's _headers file. A
+	# conservative default also covers SPA fallbacks and future loader names.
+	header {
+		Cache-Control "no-cache, no-store"
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		-Server
+	}
+
+	# The bridge does not expose UDP reachability diagnostics.
+	@probe path /probe /probe/*
+	handle @probe {
+		respond 404
+	}
+	@websocket header Upgrade websocket
+	handle @websocket {
+		reverse_proxy gateway:8443 {
+			# The only ingress must be the sanitizing OpenResty proxy.
+			header_up X-Forwarded-For {http.request.header.X-Forwarded-For}
+			header_up X-Forwarded-Proto https
+			header_up -Forwarded
+			header_up -X-Real-IP
+		}
+	}
+	handle /healthz {
+		reverse_proxy gateway:8443 {
+			# The only ingress must be the sanitizing OpenResty proxy.
+			header_up X-Forwarded-For {http.request.header.X-Forwarded-For}
+			header_up X-Forwarded-Proto https
+			header_up -Forwarded
+			header_up -X-Real-IP
+		}
+	}
+	handle {
+		root * /srv/phone
+		try_files {path} /index.html
+		file_server {
+			precompressed br gzip
+		}
+	}
+}

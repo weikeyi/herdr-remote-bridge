@@ -20,7 +20,7 @@ jobs:
     # directories explicitly, without changing tokens or relaxing ACL checks.
     # This is not proof of limited-user task installation or real Core access.
     runs-on: windows-2025
-    timeout-minutes: 25
+    timeout-minutes: 40
     defaults:
       run:
         shell: pwsh
@@ -28,10 +28,42 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Bundle revision must be fetchable from its source branch, not a synthetic PR merge.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26.13.0
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+      - name: Resolve matching build identity
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $match = [regex]::Match((Get-Content herdr-plugin.toml -Raw), '(?m)^version = "([0-9]+\.[0-9]+\.[0-9]+)"\r?$')
+          if (!$match.Success) { throw 'Product version is missing.' }
+          $revision = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $revision -notmatch '^[0-9a-f]{40}$') { throw 'Invalid build revision.' }
+          "BRIDGE_VERSION=$($match.Groups[1].Value)" >> $env:GITHUB_ENV
+          "BRIDGE_REVISION=$revision" >> $env:GITHUB_ENV
+      - name: Build matching PWA from source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          bun install --frozen-lockfile --cwd frontend
+          if ($LASTEXITCODE -ne 0) { throw 'Frontend dependency installation failed.' }
+          bun run --cwd frontend build
+          if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed.' }
+          bun frontend/scripts/validate-build.mjs frontend/dist
+          if ($LASTEXITCODE -ne 0) { throw 'Frontend validation failed.' }
+          bun scripts/stamp-web-version.mjs frontend/dist/version.json $env:BRIDGE_VERSION $env:BRIDGE_REVISION
+          if ($LASTEXITCODE -ne 0) { throw 'Frontend identity stamping failed.' }
+          bun frontend/scripts/validate-build.mjs frontend/dist
+          if ($LASTEXITCODE -ne 0) { throw 'Stamped frontend validation failed.' }
+          bun run --cwd frontend size
+          if ($LASTEXITCODE -ne 0) { throw 'Frontend size budget failed.' }
       - name: Native Windows package tests
         run: |
           $ErrorActionPreference = 'Stop'
@@ -40,8 +72,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Native Windows tests failed.' }
       - name: Build Windows relay executable
         run: |
-          go build -trimpath -o artifacts/herdr-mobile-relay.exe ./cmd/herdr-mobile-relay
+          go build -trimpath -ldflags "-s -w -X main.version=$env:BRIDGE_VERSION -X main.revision=$env:BRIDGE_REVISION" -o artifacts/herdr-mobile-relay.exe ./cmd/herdr-mobile-relay
           if ($LASTEXITCODE -ne 0) { throw 'Windows relay build failed.' }
+          & ./artifacts/herdr-mobile-relay.exe version --json | Set-Content artifacts/windows-version.json -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'Executable identity check failed.' }
       - name: Isolated executable self-test
         run: |
           $ErrorActionPreference = 'Stop'
@@ -66,7 +100,23 @@ jobs:
           $result = Invoke-Pester -Configuration $configuration
           if ($result.FailedCount -ne 0 -or $result.PassedCount -eq 0) { throw 'Pester acceptance failed.' }
           # No installer, task registration, relay startup or deployment runs here.
-      - name: Upload synthetic test reports and executable
+      - name: Test bundle assembly contracts
+        run: |
+          python .github/scripts/test_package_bridge_windows.py
+          if ($LASTEXITCODE -ne 0) { throw 'Bundle contract tests failed.' }
+      - name: Assemble complete matching Windows test bundle
+        run: |
+          python .github/scripts/package_bridge_windows.py --version $env:BRIDGE_VERSION --revision $env:BRIDGE_REVISION
+          if ($LASTEXITCODE -ne 0) { throw 'Bundle assembly or identity verification failed.' }
+      - name: Upload installable test bundle (no logs or credentials)
+        id: bridge-bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bridge-windows-bundle-${{ github.run_id }}
+          path: artifacts/bundle/herdr-remote-bridge_*.zip
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload synthetic test reports
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -75,6 +125,5 @@ jobs:
             artifacts/windows-go-tests.txt
             artifacts/bridge-self-test.json
             artifacts/windows-pester.xml
-            artifacts/herdr-mobile-relay.exe
           if-no-files-found: warn
           retention-days: 1

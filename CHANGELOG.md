@@ -7,6 +7,9 @@ project follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Existing HTTPS reverse proxies can host the private bridge without replacing
+  their port 80/443 listeners. A matching Windows executable, phone app and
+  scripts bundle supports manual end-to-end testing.
 - Experimental native Windows Core Named Pipe transport and a private WSS-only
   Bridge path. Relay-only phone pairings never fall back to direct connections.
   Current-user Windows setup and local pairing tools are included; native
