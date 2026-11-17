@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFile, readdir, stat } from 'node:fs/promises';
-import { join, normalize, resolve } from 'node:path';
+import { join, resolve } from 'node:path';
+import { safeRelativePath } from './release-path.mjs';
 import { brotliDecompressSync } from 'node:zlib';
 import versions from '../build-versions.json' with { type: 'json' };
 import { releaseCompressedAssets } from './compressed-assets.mjs';
@@ -100,16 +101,6 @@ function integrityFor(hex) {
   return `sha256-${Buffer.from(hex, 'hex').toString('base64')}`;
 }
 
-function safeRelativePath(value) {
-  return typeof value === 'string'
-    && value.length > 0
-    && !value.startsWith('/')
-    && !value.includes('\\')
-    && normalize(value) === value
-    && value !== '.'
-    && value !== '..'
-    && !value.startsWith('../');
-}
 
 if (descriptor.schema !== 1
   || descriptor.version !== productVersion
