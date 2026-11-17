@@ -1,0 +1,80 @@
+name: Bridge Windows acceptance
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, dev, "bridge/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bridge-windows-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Windows native transport and protected storage
+    # Hosted runners are elevated. Tests create current-user-owned child
+    # directories explicitly, without changing tokens or relaxing ACL checks.
+    # This is not proof of limited-user task installation or real Core access.
+    runs-on: windows-2025
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Native Windows package tests
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          go test -count=1 -timeout 8m -v ./internal/coretransport ./internal/securestore ./internal/bridgectl ./internal/config ./internal/push ./internal/filelock ./internal/deviceauth 2>&1 | Tee-Object artifacts/windows-go-tests.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows tests failed.' }
+      - name: Build Windows relay executable
+        run: |
+          go build -trimpath -o artifacts/herdr-mobile-relay.exe ./cmd/herdr-mobile-relay
+          if ($LASTEXITCODE -ne 0) { throw 'Windows relay build failed.' }
+      - name: Isolated executable self-test
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Uses temporary synthetic secrets and pipes only. Never connects Core,
+          # Gateway, existing user credentials, or Task Scheduler.
+          & ./artifacts/herdr-mobile-relay.exe bridge self-test | Tee-Object artifacts/bridge-self-test.json
+          if ($LASTEXITCODE -ne 0) { throw 'Bridge self-test failed.' }
+      - name: Install pinned Pester
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Install-Module Pester -RequiredVersion 5.7.1 -Repository PSGallery -Scope CurrentUser -Force
+      - name: PowerShell syntax and mocked lifecycle tests
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module Pester -RequiredVersion 5.7.1 -Force
+          $configuration = New-PesterConfiguration
+          $configuration.Run.Path = @('./relay/windows/Bridge.Tests.ps1', './relay/windows/Update.Tests.ps1')
+          $configuration.Run.PassThru = $true
+          $configuration.TestResult.Enabled = $true
+          $configuration.TestResult.OutputPath = './artifacts/windows-pester.xml'
+          $configuration.Output.Verbosity = 'Detailed'
+          $result = Invoke-Pester -Configuration $configuration
+          if ($result.FailedCount -ne 0 -or $result.PassedCount -eq 0) { throw 'Pester acceptance failed.' }
+          # No installer, task registration, relay startup or deployment runs here.
+      - name: Upload synthetic test reports and executable
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bridge-windows-${{ github.run_id }}
+          path: |
+            artifacts/windows-go-tests.txt
+            artifacts/bridge-self-test.json
+            artifacts/windows-pester.xml
+            artifacts/herdr-mobile-relay.exe
+          if-no-files-found: warn
+          retention-days: 7

@@ -1,0 +1,50 @@
+{
+  "type": "push_config",
+  "vapid_public_key": "BTest-key-base64url",
+  "host": "dev-workstation",
+  "home": "/home/dev",
+  "protocol": 3,
+  "version": "0.9.0",
+  "release_version": "0.9.0",
+  "revision": "abc123",
+  "update": {"state": "current"},
+  "app_deploy": {"state": "idle", "configured": false},
+  "capabilities": [
+    "pi_integration",
+    "attention_classification",
+    "clear_activities",
+    "directory_browser",
+    "workspace_management",
+    "worktree_management",
+    "self_update",
+    "structured_questions",
+    "slash_commands",
+    "conversation_history",
+    "conversation_activity",
+    "pane_size_opt_in",
+    "pane_size_opt_in_rows",
+    "workspace_inspection",
+    "semantic_input",
+    "manual_terminal_input",
+    "secret_input",
+    "speech_voice_management",
+    "invitation_qr"
+  ],
+  "herdr_status": {
+    "installed_client_version": "0.9.0",
+    "server_version": "0.9.0",
+    "server_protocol": 1,
+    "server_protocol_known": true,
+    "endpoint_protocol_generation": 1,
+    "generation": 1,
+    "features": {
+      "ordinary_json": {"state": "supported", "reason": "ping", "generation": 1},
+      "workspace.move_block": {"state": "supported", "reason": "recognized_validation_refusal", "generation": 1}
+    }
+  },
+  "inventory": {"state": "ready"},
+  "agent_profiles": [
+    {"id": "claude", "label": "Claude"},
+    {"id": "codex", "label": "Codex"}
+  ]
+}

@@ -1,0 +1,858 @@
+import { get } from 'svelte/store';
+import { render, screen, waitFor, within } from '@testing-library/svelte';
+import userEvent from '@testing-library/user-event';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import SettingsView from '$components/SettingsView.svelte';
+import {
+  APP_ASSET_VERSION,
+  APP_VERSION,
+  PUSH_ENABLED_KEY,
+  TERMINAL_HISTORY_KEY,
+  TERMINAL_REFRESH_KEY,
+  TERMINAL_RESIZE_SESSION_KEY,
+} from '$lib/config';
+import { currentView, navigate } from '$lib/router';
+import { relayStore } from '$lib/store';
+import type { RelayTransport, TransportHandlers, TransportStatus, TransportStatusDetail } from '$lib/transports';
+import type { RelayConfig } from '$lib/types';
+import { appUpdateStatus, clearUpdateProgress, MANAGED_UPDATE_COMMAND } from '$lib/updates';
+import { guardReload } from '$lib/reload-guard';
+import { defaultAgentView, paneAgentViewOverrides, readTerminalResizeSession, setTerminalResizeSession } from '$lib/preferences';
+
+type TransportFactory = (relay: RelayConfig, handlers: TransportHandlers) => RelayTransport;
+
+/** Lets one test drive a relayed or direct path the mock socket cannot produce. */
+const transportHijack = vi.hoisted(() => ({ current: null as TransportFactory | null }));
+
+vi.mock('$lib/transports', async (importOriginal) => {
+  const actual = await importOriginal() as { createRelayTransport: TransportFactory };
+  return {
+    ...actual,
+    createRelayTransport: (relay: RelayConfig, handlers: TransportHandlers) =>
+      (transportHijack.current ?? actual.createRelayTransport)(relay, handlers),
+  };
+});
+
+class MockWebSocket {
+  static OPEN = 1;
+  static instances: MockWebSocket[] = [];
+  readyState = 0;
+  onopen: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  onmessage: ((event: { data: string }) => void) | null = null;
+  sent: string[] = [];
+
+  constructor(readonly url: string) {
+    MockWebSocket.instances.push(this);
+  }
+
+  send(payload: string) { this.sent.push(payload); }
+  close() { this.readyState = 3; }
+  open() {
+    this.readyState = MockWebSocket.OPEN;
+    this.onopen?.();
+  }
+  server(message: unknown) {
+    this.onmessage?.({ data: JSON.stringify(message) });
+  }
+}
+
+describe('settings relay status', () => {
+  it('exposes Pi Integration per connected relay with reader access kept read-only', async () => {
+    const credential = vi.spyOn(relayStore, 'deviceCredential').mockReturnValue({ role: 'reader', deviceId: 'device' } as never);
+    const send = vi.spyOn(relayStore, 'sendCommand').mockResolvedValue({ type: 'command_result', request_id: 'pi-setting', ok: true,
+      data: { instance: 'synthetic', enabled: true, profiles: [] } });
+    try {
+      render(SettingsView);
+      const socket = MockWebSocket.instances[0];
+      socket.open();
+      socket.server({ type: 'push_config', protocol: 3, capabilities: ['pi_integration'], inventory: { state: 'ready' } });
+      const toggle = await screen.findByRole('switch', { name: 'Pi Integration' });
+      await waitFor(() => expect(toggle).toBeChecked());
+      expect(toggle).toBeDisabled();
+      expect(send).toHaveBeenCalledWith(get(relayStore.relayConfigs)[0].id, { type: 'get_pi_integration' });
+    } finally { credential.mockRestore(); send.mockRestore(); }
+  });
+
+  it('keeps Pi Integration loaded while unrelated relay updates arrive', async () => {
+    const send = vi.spyOn(relayStore, 'sendCommand').mockResolvedValueOnce({ type: 'command_result', request_id: 'pi-setting', ok: true,
+      data: { instance: 'synthetic', enabled: true, profiles: [{ path: '/synthetic/agent', status: 'up to date' }] } })
+      .mockReturnValue(new Promise(() => {}));
+    try {
+      render(SettingsView);
+      const socket = MockWebSocket.instances[0];
+      socket.open();
+      socket.server({ type: 'push_config', protocol: 3, capabilities: ['pi_integration'], inventory: { state: 'ready' } });
+      const toggle = await screen.findByRole('switch', { name: 'Pi Integration' });
+      await waitFor(() => expect(toggle).toBeChecked());
+      socket.server({ type: 'agents', agents: [] });
+      socket.server({ type: 'inventory_status', state: 'ready' });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(toggle).toBeChecked();
+      expect(screen.getByText('/synthetic/agent: up to date')).toBeInTheDocument();
+      expect(send.mock.calls.filter(([, command]) => command.type === 'get_pi_integration')).toHaveLength(1);
+    } finally { send.mockRestore(); }
+  });
+
+  const serviceWorkerDescriptor = Object.getOwnPropertyDescriptor(navigator, 'serviceWorker');
+
+  beforeEach(() => {
+    transportHijack.current = null;
+    MockWebSocket.instances = [];
+    vi.stubGlobal('WebSocket', MockWebSocket);
+    vi.stubGlobal('Notification', { permission: 'granted', requestPermission: vi.fn().mockResolvedValue('granted') });
+    vi.stubGlobal('PushManager', class {});
+    Object.defineProperty(navigator, 'serviceWorker', { configurable: true, value: {} });
+    relayStore.destroy();
+    relayStore.relayConfigs.set([]);
+    defaultAgentView.set('terminal');
+    paneAgentViewOverrides.set({});
+    appUpdateStatus.set({
+      state: 'current',
+      currentVersion: APP_VERSION,
+      currentAssets: APP_ASSET_VERSION,
+      deployedVersion: APP_VERSION,
+      deployedAssets: APP_ASSET_VERSION,
+      upstreamVersion: APP_VERSION,
+      upstreamAssets: APP_ASSET_VERSION,
+      checkedAt: 123,
+      error: '',
+    });
+    relayStore.addRelay({ label: 'Fedora', url: 'ws://127.0.0.1:8871', token: '' });
+  });
+
+  afterEach(() => {
+    transportHijack.current = null;
+    relayStore.destroy();
+    setTerminalResizeSession(false);
+    relayStore.relayConfigs.set([]);
+    defaultAgentView.set('terminal');
+    paneAgentViewOverrides.set({});
+    vi.unstubAllGlobals();
+    if (serviceWorkerDescriptor) Object.defineProperty(navigator, 'serviceWorker', serviceWorkerDescriptor);
+    else Reflect.deleteProperty(navigator, 'serviceWorker');
+  });
+
+  it('requires confirmation to pair a deferred browser and leaves Cancel harmless', async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal('navigator', {
+      standalone: false, userAgent: 'Mozilla/5.0 (iPhone)', maxTouchPoints: 5,
+    });
+    const hash = `#setup=${'A'.repeat(43)}&invite=invitation-settings01&invite_version=1`
+      + `&invite_expires=${Date.now() + 60_000}&label=Invited&relay=${encodeURIComponent('wss://invited.example')}`;
+    history.replaceState(null, '', `/pair${hash}`);
+    relayStore.importSetupLink();
+    navigate({ view: 'settings' });
+    expect(location.hash).toBe(hash);
+    const pair = vi.spyOn(relayStore, 'pairDeferredRelay');
+    try {
+      render(SettingsView);
+      expect(screen.getByText(/Waiting for the Home Screen app/)).toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: 'Pair this browser instead' }));
+      expect(pair).not.toHaveBeenCalled();
+      expect(screen.getByText(/This browser becomes its own device/)).toHaveAttribute('role', 'alert');
+      expect(screen.getByText(/This browser becomes its own device/)).toHaveTextContent(/Safari may clear this site's storage/);
+      expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus();
+      await user.click(screen.getByRole('button', { name: 'Cancel' }));
+      expect(pair).not.toHaveBeenCalled();
+      expect(screen.getByRole('button', { name: 'Pair this browser instead' })).toHaveFocus();
+      expect(screen.queryByRole('button', { name: 'Confirm' })).not.toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: 'Pair this browser instead' }));
+      await user.click(screen.getByRole('button', { name: 'Confirm' }));
+      expect(pair).toHaveBeenCalledExactlyOnceWith('invited-wss-invited-example');
+      expect(pair).toHaveReturnedWith(true);
+      expect(location.hash).toBe('');
+      expect(get(relayStore.connections).get('invited-wss-invited-example')?.pairingDeferred).toBe(false);
+      await waitFor(() => expect(screen.queryByText(/Waiting for the Home Screen app/)).not.toBeInTheDocument());
+    } finally {
+      pair.mockRestore();
+      currentView.set({ view: 'agents' });
+    }
+  });
+
+  it('updates connection and push state without remounting settings', async () => {
+    render(SettingsView);
+    const socket = MockWebSocket.instances[0];
+    expect(screen.getByRole('img', { name: 'Fedora relay connecting' })).toBeInTheDocument();
+    expect(screen.getByText('Push: waiting for relay…')).toBeInTheDocument();
+
+    socket.open();
+    relayStore.setPushStatus(get(relayStore.relayConfigs)[0].id, 'sent');
+    await waitFor(() => expect(screen.getByRole('img', { name: 'Fedora relay connected' })).toBeInTheDocument());
+    expect(screen.getByText('Push: syncing…')).toBeInTheDocument();
+
+    socket.server({ type: 'push_subscribed', ok: true });
+    await waitFor(() => expect(screen.getByText('Push: synced')).toBeInTheDocument());
+  });
+
+  it('shows installed client and running server compatibility separately', async () => {
+    render(SettingsView);
+    const socket = MockWebSocket.instances[0];
+    socket.open();
+    socket.server({
+      type: 'push_config',
+      protocol: 3,
+      capabilities: ['workspace_management'],
+      herdr_status: {
+        installed_client_version: '0.9.0',
+        server_version: '0.8.0',
+        server_protocol: 7,
+        server_protocol_known: true,
+        endpoint_protocol_generation: 3,
+        generation: 2,
+        features: {
+          'workspace.move_block': {
+            state: 'unsupported',
+            reason: 'method_not_supported',
+            generation: 2,
+          },
+        },
+      },
+      agent_profiles: [],
+    });
+    expect(await screen.findByText('Herdr client: 0.9.0')).toBeInTheDocument();
+    expect(screen.getByText(/Herdr server: 0\.8\.0/)).toBeInTheDocument();
+    expect(screen.getByText(/protocol 7/)).toBeInTheDocument();
+    expect(screen.getByText('Herdr 0.9.0 recommended.')).toBeInTheDocument();
+    expect(screen.getByText('Workspace group reorder: Server upgrade needed')).toBeInTheDocument();
+  });
+
+  it('does not warn for unprobed or unadvertised optional Herdr features', async () => {
+    render(SettingsView);
+    const socket = MockWebSocket.instances[0];
+    socket.open();
+    socket.server({
+      type: 'push_config',
+      protocol: 3,
+      capabilities: [],
+      herdr_status: {
+        server_version: '0.9.0',
+        server_protocol_known: false,
+        generation: 1,
+        features: {
+          ordinary_json: { state: 'supported', reason: 'ping', generation: 1 },
+          direct_terminal: { state: 'unknown', reason: 'not_checked', generation: 1 },
+          'pane.read': { state: 'unknown', reason: 'not_checked', generation: 1 },
+          'client_shell.endpoint': { state: 'unknown', reason: 'not_advertised', generation: 1 },
+        },
+      },
+      agent_profiles: [],
+    });
+    expect(await screen.findByText(/Herdr server: 0\.9\.0/)).toBeInTheDocument();
+    expect(screen.queryByText(/Could not check|Server upgrade needed|Server feature unavailable/)).not.toBeInTheDocument();
+
+    // A real read failure must appear without remounting Settings, and a later
+    // successful observation must remove it rather than leave a stale warning.
+    socket.server({
+      type: 'herdr_status',
+      status: {
+        server_version: '0.9.0',
+        server_protocol_known: false,
+        generation: 2,
+        features: {
+          'pane.read': { state: 'unknown', reason: 'timeout', generation: 2 },
+        },
+      },
+    });
+    expect(await screen.findByText('Terminal reads: Could not check')).toBeInTheDocument();
+    socket.server({
+      type: 'herdr_status',
+      status: {
+        server_version: '0.9.0',
+        server_protocol_known: false,
+        generation: 3,
+        features: {
+          'pane.read': { state: 'supported', reason: 'operation_succeeded', generation: 3 },
+        },
+      },
+    });
+    await waitFor(() => expect(screen.queryByText('Terminal reads: Could not check')).not.toBeInTheDocument());
+  });
+
+  it.each([
+    ['server_unavailable', 'Could not check'],
+    ['malformed_ping', 'Could not check'],
+    ['probe_failed', 'Could not check'],
+    ['reconnect_required', 'Rechecking after Herdr reconnect'],
+  ])(
+    'keeps Herdr check outcomes visible: %s',
+    async (reason, message) => {
+      render(SettingsView);
+      const socket = MockWebSocket.instances[0];
+      socket.open();
+      socket.server({
+        type: 'push_config',
+        protocol: 3,
+        capabilities: [],
+        herdr_status: {
+          server_protocol_known: false,
+          generation: 1,
+          features: {
+            ordinary_json: { state: 'unknown', reason, generation: 1 },
+            direct_terminal: { state: 'unknown', reason: 'not_checked', generation: 1 },
+          },
+        },
+        agent_profiles: [],
+      });
+      expect(await screen.findByText(`Herdr API: ${message}`)).toBeInTheDocument();
+    },
+  );
+
+  it('shows every potential gateway in priority order', () => {
+    relayStore.destroy();
+    relayStore.relayConfigs.set([]);
+    relayStore.addRelay({
+      label: 'Fedora',
+      url: '',
+      token: '0123456789abcdef0123456789abcdef',
+      transport: 'hybrid',
+      gatewayUrl: 'wss://own.example.test',
+      gatewayUrls: [
+        'wss://own.example.test',
+        'wss://community-a.example.test',
+        'wss://community-b.example.test',
+      ],
+    });
+
+    render(SettingsView);
+
+    const candidates = screen.getByRole('list', { name: 'Gateway candidates for Fedora' });
+    expect(within(candidates).getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+      'wss://own.example.test',
+      'wss://community-a.example.test',
+      'wss://community-b.example.test',
+    ]);
+  });
+
+  it('names the gateway carrying each relay, and the direct path that replaces it', async () => {
+    let report: (status: TransportStatus, detail?: TransportStatusDetail) => void = () => {};
+    let deliver: (message: Record<string, unknown>) => void = () => {};
+    transportHijack.current = (_relay, handlers) => ({
+      kind: 'gateway',
+      connect: () => {
+        report = handlers.onStatus;
+        deliver = handlers.onMessage;
+        handlers.onStatus('connecting');
+      },
+      send: () => true,
+      close: () => {},
+    });
+    relayStore.destroy();
+    relayStore.relayConfigs.set([]);
+    relayStore.addRelay({
+      label: 'Fedora',
+      url: '',
+      token: '0123456789abcdef0123456789abcdef',
+      transport: 'hybrid',
+      gatewayUrl: 'wss://own.example.test',
+      gatewayUrls: ['wss://own.example.test', 'wss://community-a.example.test'],
+    });
+    render(SettingsView);
+
+    // The configured head was skipped, so the list order is not the answer to
+    // "which gateway am I on": the live session names itself.
+    report('connected', { path: 'gateway', gatewayUrl: 'wss://community-a.example.test' });
+    deliver({ type: 'push_config', protocol: 3, capabilities: [], agent_profiles: [] });
+
+    expect(await screen.findByText('Connection: gateway community-a.example.test')).toBeInTheDocument();
+
+    report('connected', { path: 'webrtc', gatewayUrl: 'wss://community-a.example.test' });
+    expect(await screen.findByText('Connection: direct, via community-a.example.test')).toBeInTheDocument();
+  });
+
+  it('names the relay URL when no gateway carries the connection', async () => {
+    render(SettingsView);
+    const socket = MockWebSocket.instances[0];
+    socket.open();
+
+    expect(await screen.findByText('Connection: relay URL 127.0.0.1:8871')).toBeInTheDocument();
+  });
+
+  it('shows active and latest gateway versions without regressing to an older upstream', async () => {
+    render(SettingsView);
+    const socket = MockWebSocket.instances[0];
+    socket.open();
+    socket.server({
+      type: 'push_config',
+      protocol: 3,
+      release_version: '0.15.0',
+      capabilities: [],
+      agent_profiles: [],
+      update: { state: 'available', available_version: '0.16.0', upstream_version: '0.16.0' },
+      hybrid: {
+        gateway_url: 'wss://own.example.test',
+        gateway_urls: ['wss://own.example.test'],
+        gateway_version: '0.15.0',
+        gateway_revision: 'gateway-revision',
+        gateway_available_version: '0.16.0',
+      },
+    });
+
+    expect(await screen.findByText('Gateway: 0.15.0 · Latest: 0.16.0')).toBeInTheDocument();
+    socket.server({
+      type: 'update_status',
+      update: { state: 'current', upstream_version: '0.14.0' },
+    });
+    expect(await screen.findByText('Gateway: 0.15.0 · Latest: 0.16.0')).toBeInTheDocument();
+    socket.server({
+      type: 'push_config',
+      protocol: 3,
+      release_version: '0.17.0',
+      capabilities: [],
+      agent_profiles: [],
+      update: { state: 'current', upstream_version: '0.16.0' },
+      hybrid: {
+        gateway_url: 'wss://own.example.test',
+        gateway_urls: ['wss://own.example.test'],
+        gateway_version: '0.17.0',
+        gateway_available_version: '0.17.0',
+      },
+    });
+    expect(await screen.findByText('Gateway: 0.17.0 · Latest: 0.17.0')).toBeInTheDocument();
+  });
+
+  it('shows the complete one-time update command for an older relay', async () => {
+    const user = userEvent.setup();
+    render(SettingsView);
+    const socket = MockWebSocket.instances[0];
+    socket.open();
+    socket.server({
+      type: 'push_config',
+      protocol: 3,
+      release_version: '0.6.0',
+      capabilities: [],
+      agent_profiles: [],
+    });
+
+    await user.click(await screen.findByRole('button', { name: 'How to update Fedora' }));
+    const dialog = screen.getByRole('dialog', { name: 'Update Fedora' });
+    expect(dialog).toHaveTextContent('one-time Terminal update before phone-driven updates can continue');
+    expect(within(dialog).getByText(/HERDR_MOBILE_RELAY_NO_AUTO_SETUP=1 herdr plugin install/)).not.toHaveTextContent(
+      'plugin action invoke install-service',
+    );
+    expect(dialog).toHaveTextContent('preserves the configuration used by an existing stable service');
+    expect(dialog).toHaveTextContent('Prefer to keep using a source checkout?');
+    expect(screen.queryByText(/assets \d+/i)).not.toBeInTheDocument();
+    expect(screen.getAllByRole('heading', { level: 3 }).at(-1)).toHaveTextContent('About');
+  });
+  it('routes a legacy app deployment owner to Update Help before scheduling', async () => {
+    const user = userEvent.setup();
+    render(SettingsView);
+    const socket = MockWebSocket.instances[0];
+    socket.open();
+    socket.server({
+      type: 'push_config',
+      protocol: 3,
+      release_version: '0.13.2',
+      capabilities: ['self_update', 'app_deploy'],
+      agent_profiles: [],
+      update: {
+        state: 'available',
+        current_version: '0.13.2',
+        available_version: APP_VERSION,
+        available_revision: 'f'.repeat(12),
+        target_revision: 'f'.repeat(40),
+        can_install: true,
+      },
+      app_deploy: {
+        configured: true,
+        origin: location.origin,
+        project: 'herdr-app',
+        branch: 'main',
+        revision: 'abc1234',
+        state: 'idle',
+      },
+    });
+
+    expect(await screen.findByText('Manual update required')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Check Fedora for updates' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'How to update Fedora' }));
+    const dialog = screen.getByRole('dialog', { name: 'Update Fedora' });
+    expect(dialog).toHaveTextContent('one-time Terminal update before phone-driven updates can continue');
+    expect(dialog).toHaveTextContent(MANAGED_UPDATE_COMMAND);
+    expect(socket.sent.map((payload) => JSON.parse(payload)).some((message) => message.type === 'install_update')).toBe(false);
+  });
+
+
+  it('requires confirmation before removing a relay', async () => {
+    const user = userEvent.setup();
+    render(SettingsView);
+
+    await user.click(screen.getByRole('button', { name: 'Remove Fedora' }));
+    const dialog = screen.getByRole('dialog', { name: 'Remove Fedora?' });
+    expect(dialog).toHaveTextContent('You will need its setup link or connection details to add it again.');
+    expect(screen.getByText('Fedora')).toBeInTheDocument();
+
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(screen.getByText('Fedora')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Remove Fedora' }));
+    await user.click(within(screen.getByRole('dialog', { name: 'Remove Fedora?' })).getByRole('button', { name: 'Remove Relay' }));
+    await waitFor(() => expect(screen.queryByText('Fedora')).not.toBeInTheDocument());
+  });
+
+  it('shows and persists the global Default View choice', async () => {
+    const user = userEvent.setup();
+    const first = render(SettingsView);
+    const views = within(screen.getByRole('group', { name: 'Default View' }));
+    expect(views.getByRole('button', { name: 'Terminal' })).toHaveAttribute('aria-pressed', 'true');
+    await user.click(views.getByRole('button', { name: 'Conversation' }));
+    expect(views.getByRole('button', { name: 'Conversation' })).toHaveAttribute('aria-pressed', 'true');
+    expect(localStorage.getItem('herdr_default_agent_view')).toBe('conversation');
+    first.unmount();
+    render(SettingsView);
+    expect(within(screen.getByRole('group', { name: 'Default View' })).getByRole('button', { name: 'Conversation' })).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('keeps the previous global choice when local storage rejects a save', async () => {
+    const user = userEvent.setup();
+    render(SettingsView);
+    const views = within(screen.getByRole('group', { name: 'Default View' }));
+    const setItem = vi.spyOn(localStorage, 'setItem').mockImplementation(() => {
+      throw new Error('storage full');
+    });
+    await user.click(views.getByRole('button', { name: 'Conversation' }));
+    expect(views.getByRole('button', { name: 'Terminal' })).toHaveAttribute('aria-pressed', 'true');
+    expect(views.getByRole('button', { name: 'Conversation' })).toHaveAttribute('aria-pressed', 'false');
+    setItem.mockRestore();
+  });
+
+  it('shows the local agent choice without a connected relay', () => {
+    relayStore.destroy();
+    relayStore.relayConfigs.set([]);
+    render(SettingsView);
+    expect(screen.getByRole('group', { name: 'Default View' })).toBeInTheDocument();
+  });
+
+  it('applies interface size from the accessible settings group', async () => {
+    const user = userEvent.setup();
+    render(SettingsView);
+    const sizes = within(screen.getByRole('group', { name: 'Interface Size' }));
+
+    await user.click(sizes.getByRole('button', { name: 'Large' }));
+    expect(document.documentElement.dataset.interfaceSize).toBe('large');
+    expect(localStorage.getItem('herdr_terminal_font_size')).toBe('large');
+
+    await user.click(sizes.getByRole('button', { name: 'Compact' }));
+    expect(document.documentElement.dataset.interfaceSize).toBe('compact');
+
+  });
+
+  it('persists the selected terminal history size', async () => {
+    const user = userEvent.setup();
+    render(SettingsView);
+    const history = within(screen.getByRole('group', { name: 'Terminal History' }));
+
+    expect(history.getByRole('button', { name: '1000' })).toHaveAttribute('aria-pressed', 'true');
+    await user.click(history.getByRole('button', { name: '500' }));
+    expect(history.getByRole('button', { name: '500' })).toHaveAttribute('aria-pressed', 'true');
+    expect(localStorage.getItem(TERMINAL_HISTORY_KEY)).toBe('500');
+
+    await user.click(history.getByRole('button', { name: '1000' }));
+  });
+
+  it('persists the selected terminal refresh interval', async () => {
+    const user = userEvent.setup();
+    render(SettingsView);
+    const refresh = within(screen.getByRole('group', { name: 'Terminal Refresh' }));
+
+    expect(refresh.getByRole('button', { name: '250 ms' })).toHaveAttribute('aria-pressed', 'true');
+    await user.click(refresh.getByRole('button', { name: '100 ms' }));
+    expect(refresh.getByRole('button', { name: '100 ms' })).toHaveAttribute('aria-pressed', 'true');
+    expect(localStorage.getItem(TERMINAL_REFRESH_KEY)).toBe('100');
+
+    await user.click(refresh.getByRole('button', { name: '250 ms' }));
+  });
+
+  it('offers Resize Session off by default with a subordinate height switch', async () => {
+    setTerminalResizeSession(readTerminalResizeSession());
+    const user = userEvent.setup();
+    render(SettingsView);
+
+    expect(screen.queryByRole('group', { name: 'Terminal Width' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Fit to Phone' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Original Columns' })).not.toBeInTheDocument();
+    const resize = screen.getByRole('switch', { name: 'Resize Session' });
+    expect(resize).not.toBeChecked();
+    for (const disclosure of [
+      /Off by default\. Enable explicitly on this device\./,
+      /Resizes the shared terminal to fit this phone while the phone has it open\./,
+      /the laptop and SSH views of that pane look garbled/,
+      /agents may leave narrow copies of their output in the scrollback/,
+      /Resizing may truncate scrollback and lose older output\./,
+      /previous size is restored when the phone leaves the pane, unless it was changed on the laptop meanwhile/,
+      /Unavailable on relays that do not support it\./,
+      /controller terminals keep the desktop width and scroll horizontally; read-only reader panes wrap to the phone width\./,
+    ]) expect(resize).toHaveAccessibleDescription(disclosure);
+    const height = screen.getByRole('switch', { name: 'Lease Terminal Height' });
+    expect(height).toBeDisabled();
+    expect(height).not.toBeChecked();
+
+    await user.click(resize);
+    expect(resize).toBeChecked();
+    expect(localStorage.getItem(TERMINAL_RESIZE_SESSION_KEY)).toBe('true');
+    // No connected relay supports leasing the height yet.
+    expect(height).toBeDisabled();
+    const socket = MockWebSocket.instances.at(-1)!;
+    socket.open();
+    socket.server({
+      type: 'push_config', protocol: 3, host: 'fedora', agent_profiles: [],
+      capabilities: ['pane_size_opt_in', 'pane_size_opt_in_rows'],
+    });
+    await waitFor(() => expect(height).toBeEnabled());
+    await user.click(height);
+    expect(height).toBeChecked();
+
+    await user.click(resize);
+    expect(resize).not.toBeChecked();
+    expect(height).toBeDisabled();
+    expect(height).toBeChecked();
+    expect(height).toHaveAccessibleDescription(/The checked preference is remembered but inactive while Resize Session is off\./);
+    expect(localStorage.getItem(TERMINAL_RESIZE_SESSION_KEY)).toBe('false');
+
+    await user.click(resize);
+    expect(height).toBeEnabled();
+    expect(height).toBeChecked();
+    // Leave the shared preferences at their defaults for subsequent tests.
+    await user.click(height);
+    await user.click(resize);
+  });
+
+  it('keeps notification controls out of the way until push delivery is enabled', async () => {
+    const user = userEvent.setup();
+    localStorage.setItem(PUSH_ENABLED_KEY, 'false');
+    render(SettingsView);
+    const socket = MockWebSocket.instances[0];
+    socket.open();
+    await waitFor(() => expect(screen.getByRole('img', { name: 'Fedora relay connected' })).toBeInTheDocument());
+    socket.server({ type: 'push_config', protocol: 3, version: 'abc1234', vapid_public_key: 'test-key' });
+
+    // One Notifications section owns the switch; categories, delays, and
+    // delivery tests do nothing without a subscription, so they stay hidden.
+    expect(screen.getByRole('heading', { name: 'Notifications' })).toBeInTheDocument();
+    expect(screen.queryByText('No paired notification device is available.')).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Push delivery' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Permission and installation' })).not.toBeInTheDocument();
+
+    await user.click(await screen.findByRole('button', { name: 'Enable Push Notifications' }));
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Stop Push Notifications' })).toBeEnabled());
+    expect(screen.getByText('No paired notification device is available.')).toBeInTheDocument();
+  });
+
+  it('confirms an available relay update before sending the exact target', async () => {
+    const user = userEvent.setup();
+    render(SettingsView);
+    const socket = MockWebSocket.instances[0];
+    socket.open();
+    socket.server({
+      type: 'push_config',
+      protocol: 3,
+      release_version: '0.7.0',
+      revision: 'abc123',
+      capabilities: ['self_update'],
+      agent_profiles: [],
+      update: {
+        state: 'available',
+        current_version: '0.7.0',
+        current_revision: 'abc123',
+        available_version: '0.8.0',
+        available_revision: 'f'.repeat(12),
+        target_revision: 'f'.repeat(40),
+        can_install: true,
+        mode: 'local',
+      },
+    });
+
+    await user.click(await screen.findByRole('button', { name: 'Update Relays' }));
+    expect(screen.getByRole('dialog', { name: 'Update Relays' })).toHaveTextContent('Update Fedora first');
+    expect(screen.queryByRole('button', { name: 'Update Fedora to version 0.8.0' })).not.toBeInTheDocument();
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Start Update' }));
+    const command = socket.sent.map((payload) => JSON.parse(payload))
+      .find((message) => message.type === 'install_update');
+
+    expect(command).toMatchObject({
+      expected_version: '0.8.0',
+      expected_revision: 'f'.repeat(40),
+    });
+    socket.server({
+      type: 'command_result',
+      request_id: command.request_id,
+      ok: true,
+      phase: 'scheduled',
+      data: { update: { state: 'scheduled', target_revision: 'f'.repeat(40) } },
+    });
+  });
+
+  it('asks again before Load Update discards work that appeared after the dialog opened', async () => {
+    const user = userEvent.setup();
+    appUpdateStatus.set({
+      state: 'reload-ready',
+      currentVersion: APP_VERSION,
+      currentAssets: APP_ASSET_VERSION,
+      deployedVersion: APP_VERSION,
+      deployedAssets: APP_ASSET_VERSION + 1,
+      upstreamVersion: APP_VERSION,
+      upstreamAssets: APP_ASSET_VERSION + 1,
+      checkedAt: 123,
+      error: '',
+    });
+    const replace = vi.fn();
+    render(SettingsView);
+    await user.click(screen.getByRole('button', { name: 'Load Update' }));
+    let dialog = screen.getByRole('dialog', { name: 'Load Update' });
+    expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument();
+    const release = guardReload(() => 'draft');
+    vi.stubGlobal('location', { href: 'https://app.example/', origin: 'https://app.example', replace });
+    try {
+      await user.click(within(dialog).getByRole('button', { name: 'Load Update' }));
+      expect(replace).not.toHaveBeenCalled();
+      dialog = screen.getByRole('dialog', { name: 'Load Update' });
+      expect(within(dialog).getByRole('alert')).toHaveTextContent('A draft is not saved on this phone, and loading the app update discards it.');
+      await user.click(within(dialog).getByRole('button', { name: 'Load Update Anyway' }));
+      expect(replace).toHaveBeenCalledTimes(1);
+    } finally {
+      release();
+      clearUpdateProgress();
+    }
+  });
+
+  it('confirms a separate app deployment through its authorized relay', async () => {
+    const user = userEvent.setup();
+    appUpdateStatus.set({
+      state: 'deployment-required',
+      currentVersion: APP_VERSION,
+      currentAssets: APP_ASSET_VERSION,
+      deployedVersion: APP_VERSION,
+      deployedAssets: APP_ASSET_VERSION,
+      upstreamVersion: '9.0.0',
+      upstreamAssets: 999,
+      checkedAt: 123,
+      error: '',
+    });
+    render(SettingsView);
+    const socket = MockWebSocket.instances[0];
+    socket.open();
+    socket.server({
+      type: 'push_config',
+      protocol: 3,
+      release_version: '9.0.0',
+      revision: 'abc123',
+      capabilities: ['self_update', 'app_deploy'],
+      agent_profiles: [],
+      app_deploy: {
+        configured: true,
+        origin: location.origin,
+        project: 'herdr-app',
+        branch: 'main',
+        revision: 'f'.repeat(40),
+        state: 'idle',
+      },
+    });
+
+    await user.click(await screen.findByRole('button', { name: 'Update Herdr' }));
+    const dialog = screen.getByRole('dialog', { name: 'Update Herdr' });
+    expect(dialog).toHaveTextContent('Publish the phone app from Fedora');
+    await user.click(within(dialog).getByRole('button', { name: 'Start Update' }));
+    const command = socket.sent.map((payload) => JSON.parse(payload))
+      .find((message) => message.type === 'deploy_app_update');
+
+    expect(command).toMatchObject({
+      expected_version: '9.0.0',
+      expected_revision: 'f'.repeat(40),
+      expected_origin: location.origin,
+    });
+    socket.server({
+      type: 'command_result',
+      request_id: command.request_id,
+      ok: true,
+      phase: 'scheduled',
+      data: {
+        app_deploy: {
+          configured: true,
+          origin: location.origin,
+          project: 'herdr-app',
+          branch: 'main',
+          revision: 'f'.repeat(40),
+          state: 'scheduled',
+          target_version: '9.0.0',
+        },
+      },
+    });
+    const publishing = /Publishing v9\.0\.0 from Fedora and waiting for this app origin to update\. This can take up to two minutes\./;
+    expect(await screen.findByText(publishing)).toBeInTheDocument();
+
+    socket.server({
+      type: 'app_deploy_status',
+      app_deploy: {
+        configured: true,
+        origin: location.origin,
+        project: 'herdr-app',
+        branch: 'main',
+        revision: 'f'.repeat(40),
+        state: 'deploying',
+        target_version: '9.0.0',
+      },
+    });
+    await waitFor(() => expect(screen.getByText(publishing)).toBeInTheDocument());
+  });
+  it('deploys the owner app before updating its relay', async () => {
+    const user = userEvent.setup();
+    appUpdateStatus.set({
+      state: 'deployment-required',
+      currentVersion: APP_VERSION,
+      currentAssets: APP_ASSET_VERSION,
+      deployedVersion: APP_VERSION,
+      deployedAssets: APP_ASSET_VERSION,
+      upstreamVersion: '9.0.0',
+      upstreamAssets: 999,
+      checkedAt: 123,
+      error: '',
+    });
+    render(SettingsView);
+    const socket = MockWebSocket.instances[0];
+    socket.open();
+    socket.server({
+      type: 'push_config',
+      protocol: 3,
+      release_version: '8.0.0',
+      revision: 'abc123',
+      capabilities: ['self_update', 'app_deploy'],
+      agent_profiles: [],
+      update: {
+        state: 'available',
+        current_version: '8.0.0',
+        current_revision: 'abc123',
+        available_version: '9.0.0',
+        available_revision: 'f'.repeat(12),
+        target_revision: 'f'.repeat(40),
+        can_install: true,
+        mode: 'plugin',
+      },
+      app_deploy: {
+        configured: true,
+        origin: location.origin,
+        project: 'herdr-app',
+        branch: 'main',
+        revision: 'abc123',
+        state: 'idle',
+      },
+    });
+
+    await user.click(await screen.findByRole('button', { name: 'Update Herdr' }));
+    const dialog = screen.getByRole('dialog', { name: 'Update Herdr' });
+    expect(dialog).toHaveTextContent('Publish the phone app first, then update Fedora');
+    await user.click(within(dialog).getByRole('button', { name: 'Start Update' }));
+    const commands = socket.sent.map((payload) => JSON.parse(payload));
+    const command = commands.find((message) => message.type === 'install_update');
+
+    expect(command).toMatchObject({
+      expected_version: '9.0.0',
+      expected_revision: 'f'.repeat(40),
+      expected_origin: location.origin,
+    });
+    expect(commands.some((message) => message.type === 'deploy_app_update')).toBe(false);
+  });
+
+});

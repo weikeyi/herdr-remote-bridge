@@ -1,0 +1,1099 @@
+<script lang="ts">
+  import { onMount } from 'svelte';
+  import DeviceSettings from '$components/DeviceSettings.svelte';
+  import PiIntegration from '$components/PiIntegration.svelte';
+  import NotificationSettings from '$components/NotificationSettings.svelte';
+  import PairDeferredRelay from '$components/PairDeferredRelay.svelte';
+  import AppDialog from '$components/ui/AppDialog.svelte';
+  import AppSwitch from '$components/ui/AppSwitch.svelte';
+  import Button from '$components/ui/Button.svelte';
+  import Card from '$components/ui/Card.svelte';
+  import {
+    AGENT_VIEW_LABELS,
+    AGENT_VIEWS,
+    APP_ASSET_VERSION,
+    APP_BUILD_ID,
+    APP_VERSION,
+    canInviteFrom,
+    HOME_LAYOUTS,
+    HOME_LAYOUT_LABELS,
+    INTERFACE_SIZES,
+    TERMINAL_HISTORY_OPTIONS,
+    TERMINAL_REFRESH_LABELS,
+    TERMINAL_REFRESH_OPTIONS,
+    THEMES,
+    type AgentView,
+    type HomeLayout,
+    type InterfaceSize,
+    type TerminalHistoryLines,
+    type TerminalRefreshInterval,
+    type Theme,
+  } from '$lib/config';
+  import {
+    setSpeechEnabled,
+    setSpeechLanguage,
+    SPEECH_LANGUAGES,
+    speechEnabled,
+    speechLanguage,
+    speechLanguageLabel,
+    speechState,
+    stopSpeech,
+  } from '$lib/speech';
+  import {
+    defaultAgentView,
+    homeLayout,
+    interfaceSize,
+    setDefaultAgentView,
+    setHomeLayout,
+    setInterfaceSize,
+    setTerminalHeightLease,
+    setTerminalResizeSession,
+    setTerminalHistoryLines,
+    setTerminalRefreshInterval,
+    setTerminalWakeLock,
+    setTheme,
+    terminalHeightLease,
+    terminalResizeSession,
+    terminalWakeLock,
+    terminalHistoryLines,
+    terminalRefreshInterval,
+    theme,
+  } from '$lib/preferences';
+  import { relayVersionMeta, shortRevision } from '$lib/protocol';
+  import {
+    notificationsSupported,
+    pushPreferences,
+    pushSupported,
+    refreshPushPreferences,
+    removeRelayPushSubscription,
+    sendPushPolicy,
+    sendTargetedPushTest,
+    toggleNotifications,
+  } from '$lib/push';
+  import {
+    defaultDevicePushPolicy,
+    type NotificationPlatformInfo,
+    type NotificationPolicyScope,
+    type PushTestState,
+  } from '$lib/push-policy';
+  import {
+    deviceVerificationEnabled,
+    deviceVerificationSupported,
+    securityState,
+    setDeviceVerificationRequired,
+  } from '$lib/security';
+  import { wakeLockState } from '$lib/wake-lock';
+  import { relayStore } from '$lib/store';
+  import { reloadRisk, reloadRiskMessage, type ReloadRisk } from '$lib/reload-guard';
+  import {
+    appUpdateStatus,
+    CHECKOUT_UPDATE_COMMAND,
+    beginUpdateProgress,
+    checkAppUpdate,
+    MANAGED_UPDATE_COMMAND,
+    relayNeedsManualBootstrap,
+    queueUpdateProgressForReload,
+    reloadApp,
+    setUpdateProgressError,
+  } from '$lib/updates';
+  import type { AppUpdateStatus, RelayConfig, RelayConnectionView, RelaySpeechVoice } from '$lib/types';
+
+  function herdrWarnings(features: Record<string, { state: string; reason: string }> | undefined): string {
+    const labels: Record<string, string> = {
+      ordinary_json: 'Herdr API',
+      'workspace.move_block': 'Workspace group reorder',
+      'workspace.reordered': 'Workspace reorder events',
+      'pane.read': 'Terminal reads',
+      'tab.move': 'Tab reorder',
+      'client_shell.endpoint': 'Client endpoint',
+      direct_terminal: 'Direct terminal',
+    };
+    return Object.entries(features || {})
+      .filter(([, feature]) => {
+        if (feature.state === 'supported') return false;
+        // Optional features may not be probed until used, or advertised at all.
+        // Neither is evidence of a failed check or an incompatible server.
+        return feature.state !== 'unknown'
+          || !['not_checked', 'not_advertised'].includes(feature.reason);
+      })
+      .map(([name, feature]) => {
+        const label = labels[name] || name;
+        const message = feature.state === 'unsupported'
+          ? feature.reason === 'method_not_supported' ? 'Server upgrade needed' : 'Server feature unavailable'
+          : feature.reason === 'reconnect_required' ? 'Rechecking after Herdr reconnect' : 'Could not check';
+        return `${label}: ${message}`;
+      })
+      .join(' · ');
+  }
+
+  const APP_DEPLOY_SETUP_COMMAND = 'herdr plugin action invoke configure-app-deploy --plugin herdr-mobile-relay.events';
+
+
+  type SafeUpdateAction =
+    | {
+      kind: 'deploy_app' | 'install_relay';
+      relayId: string;
+      targetVersion: string;
+      appRelayId: string;
+      phoneAppRequired: boolean;
+      phoneTarget: { version: string; assets: number; build: string } | null;
+      description: string;
+    }
+    | {
+      kind: 'reload_app';
+      targetVersion: string;
+      phoneTarget: { version: string; assets: number; build: string } | null;
+      description: string;
+    };
+  let { readOnlyRelayIds = new Set<string>() }: { readOnlyRelayIds?: Set<string> } = $props();
+
+  const relays = relayStore.relayConfigs;
+  const connections = relayStore.connections;
+  const agents = relayStore.agents;
+  const notificationBusy = relayStore.notificationBusy;
+  const devices = relayStore.devices;
+  const pushPolicies = relayStore.pushPolicies;
+  const pushTests = relayStore.pushTests;
+  const appUpdate = appUpdateStatus;
+  function appPhoneTarget(version: string) {
+    return {
+      version,
+      assets: $appUpdate.deployedVersion === version ? $appUpdate.deployedAssets : 0,
+      build: $appUpdate.deployedVersion === version ? ($appUpdate.deployedBuild || '') : '',
+    };
+  }
+  let previousAppUpdate = $state<AppUpdateStatus | null>(null);
+  let checkingUpdates = $state(false);
+  const appUpdateChecking = $derived(checkingUpdates || $appUpdate.state === 'checking');
+  const appUpdateForLayout = $derived(
+    appUpdateChecking && previousAppUpdate ? previousAppUpdate : $appUpdate,
+  );
+  const wakeLockStatus = $derived.by(() => {
+    if (!$terminalWakeLock) return 'Off';
+    if (!('wakeLock' in navigator)) return 'Unavailable in this browser';
+    return {
+      disabled: 'Ready when a visible Terminal opens',
+      unsupported: 'Unavailable in this browser',
+      requesting: 'Requesting…',
+      active: 'Active while Terminal is visible',
+      released: 'Released while Terminal is hidden or closed',
+      failed: 'Request failed',
+    }[$wakeLockState];
+  });
+  $effect(() => {
+    if (!appUpdateChecking) previousAppUpdate = $appUpdate;
+  });
+
+  onMount(refreshPushPreferences);
+
+  let relayLabel = $state('');
+  let relayUrl = $state('');
+  let relayToken = $state('');
+  let deviceLock = $state(deviceVerificationEnabled());
+  let updateOpen = $state(false);
+  let pendingUpdateAction = $state<SafeUpdateAction | null>(null);
+  let pendingReloadRisk = $state<ReloadRisk | null>(null);
+  let manualRelayId = $state('');
+  let manualOpen = $state(false);
+  let removalRelayId = $state('');
+  let removalOpen = $state(false);
+  let busyRelayId = $state('');
+  let speechVoiceBusy = $state<string[]>([]);
+  const speechVoiceRequested = new Set<string>();
+  function isReadOnlyRelay(relayId: string): boolean {
+    return readOnlyRelayIds.has(relayId);
+  }
+
+  const relayRows = $derived($relays.map((relay) => ({
+    relay,
+    connection: $connections.get(relay.id),
+  })));
+  const connectedCount = $derived([...$connections.values()].filter((connection) => connection.status === 'connected').length);
+  const heightLeaseSupported = $derived([...$connections.values()].some((connection) =>
+    connection.status === 'connected' && connection.capabilities.includes('pane_size_opt_in_rows')));
+  const degradedCount = $derived([...$connections.values()].filter(
+    (connection) => connection.status === 'connected' && connection.inventory.state !== 'ready',
+  ).length);
+  const relaysWithoutVoice = $derived(relayRows
+    .filter(({ connection }) => connection?.status === 'connected'
+      && !connection.speechLanguages.includes($speechLanguage))
+    .map(({ relay }) => relay.label || relay.id));
+  const speechVoiceRelays = $derived(relayRows.filter(({ connection }) => connection?.status === 'connected'
+    && connection.capabilities.includes('speech_voice_management')));
+  const manualRow = $derived(relayRows.find(({ relay }) => relay.id === manualRelayId));
+  const removalRow = $derived(relayRows.find(({ relay }) => relay.id === removalRelayId));
+  const appDeploymentOwner = $derived(relayRows.find(({ relay, connection }) => (
+    !isReadOnlyRelay(relay.id)
+    && connection?.status === 'connected'
+    && connection.capabilities.includes('app_deploy')
+    && connection.appDeploy.configured
+    && connection.appDeploy.origin === location.origin
+  )));
+  // The owner relay is behind the released app version but can self-update to
+  // exactly that version, so one action can deploy the app before updating it.
+  const ownerUpdateReady = $derived.by(() => {
+    const connection = appDeploymentOwner?.connection;
+    if (!connection
+      || connection.releaseVersion === $appUpdate.upstreamVersion
+      || relayNeedsManualBootstrap(connection)) return false;
+    const update = connection.update;
+    return connection.capabilities.includes('self_update')
+      && update.state === 'available'
+      && update.can_install
+      && Boolean(update.target_revision)
+      && update.available_version === $appUpdate.upstreamVersion;
+  });
+  const safeUpdateAction = $derived.by((): SafeUpdateAction | null => {
+    if (appUpdateChecking || $appUpdate.state === 'failed') return null;
+    const targetVersion = $appUpdate.upstreamVersion;
+    if ($appUpdate.state === 'reload-ready') {
+      return {
+        kind: 'reload_app',
+        targetVersion: $appUpdate.deployedVersion,
+        phoneTarget: {
+          version: $appUpdate.deployedVersion,
+          assets: $appUpdate.deployedAssets,
+          build: $appUpdate.deployedBuild || '',
+        },
+        description: `Load the verified phone app v${$appUpdate.deployedVersion}.`,
+      };
+    }
+    if ($appUpdate.state === 'deployment-required') {
+      const owner = appDeploymentOwner;
+      if (!owner?.connection || !targetVersion) return null;
+      if (owner.connection.releaseVersion === targetVersion
+        && ['scheduled', 'deploying'].includes(owner.connection.appDeploy.state)) return null;
+      if (owner.connection.releaseVersion === targetVersion) {
+        return {
+          kind: 'deploy_app',
+          relayId: owner.relay.id,
+          targetVersion,
+          appRelayId: owner.relay.id,
+          phoneAppRequired: true,
+          phoneTarget: appPhoneTarget(targetVersion),
+          description: `Publish the phone app from ${owner.relay.label}, then continue with any remaining relay updates.`,
+        };
+      }
+      if (!ownerUpdateReady) return null;
+      return {
+        kind: 'install_relay',
+        relayId: owner.relay.id,
+        targetVersion,
+        appRelayId: owner.relay.id,
+        phoneAppRequired: true,
+        phoneTarget: appPhoneTarget(targetVersion),
+        description: `Publish the phone app first, then update ${owner.relay.label} and continue with the remaining relays.`,
+      };
+    }
+    const installable = relayRows.filter(({ relay, connection }) => (
+      !isReadOnlyRelay(relay.id)
+      && connection?.status === 'connected'
+      && connection.capabilities.includes('self_update')
+      && !relayNeedsManualBootstrap(connection)
+      && connection.update.state === 'available'
+      && connection.update.can_install
+      && Boolean(connection.update.target_revision)
+    ));
+    const selected = installable.find(({ relay }) => relay.id === appDeploymentOwner?.relay.id) || installable[0];
+    if (!selected?.connection) return null;
+    return {
+      kind: 'install_relay',
+      relayId: selected.relay.id,
+      targetVersion: selected.connection.update.available_version,
+      appRelayId: '',
+      phoneAppRequired: false,
+      phoneTarget: null,
+      description: `Update ${selected.relay.label} first, then continue safely with each remaining relay.`,
+    };
+  });
+  const relayUpdateCount = $derived(relayRows.filter(
+    ({ connection }) => connection?.update.state === 'available',
+  ).length);
+  const blockedRelayUpdateCount = $derived(relayRows.filter(
+    ({ connection }) => connection?.update.state === 'blocked',
+  ).length);
+  const manualRelayUpdateCount = $derived(relayRows.filter(
+    ({ connection }) => connection?.status === 'connected'
+      && relayNeedsManualBootstrap(connection),
+  ).length);
+  const updatePending = $derived(
+    $appUpdate.state === 'deployment-required'
+      || $appUpdate.state === 'reload-ready'
+      || relayRows.some(({ connection }) => connection?.update.state === 'available'),
+  );
+  const notificationScopes = $derived.by((): NotificationPolicyScope[] => relayRows.flatMap(({ relay }) => {
+    const credential = relayStore.deviceCredential(relay.id);
+    if (!credential) return [];
+    const device = ($devices.get(relay.id) || []).find(candidate => candidate.deviceId === credential.deviceId);
+    return [{
+      relay_id: relay.id,
+      relay_label: relay.label,
+      device_id: credential.deviceId,
+      device_label: device?.name || 'This device',
+      current_device: true,
+      policy: $pushPolicies.get(relay.id)
+        || defaultDevicePushPolicy(credential.deviceId, document.documentElement.lang || 'en'),
+    }];
+  }));
+  const notificationTestStates = $derived.by((): Record<string, PushTestState> => Object.fromEntries(
+    [...$pushTests].map(([relayId, state]) => [relayId, state]),
+  ));
+  const notificationPlatform = $derived.by((): NotificationPlatformInfo => {
+    void $pushPreferences;
+    const userAgent = navigator.userAgent;
+    const platform = /iPad|iPhone|iPod/i.test(userAgent)
+      ? 'ios'
+      : /Android/i.test(userAgent)
+        ? 'android'
+        : 'other';
+    const standalone = (window.matchMedia?.('(display-mode: standalone)').matches ?? false)
+      || (navigator as Navigator & { standalone?: boolean }).standalone === true;
+    return {
+      platform,
+      installed: standalone,
+      supports_push: pushSupported(),
+      permission: notificationsSupported() ? Notification.permission : 'unavailable',
+    };
+  });
+
+  function changeDefaultAgentView(value: AgentView): void {
+    if (setDefaultAgentView(value) === 'unavailable') {
+      relayStore.showToast('Could not save the default view on this device.', true);
+    }
+  }
+
+  function updateActionLabel(action: SafeUpdateAction | null): string {
+    if (action?.kind === 'reload_app') return 'Load Update';
+    if (action?.kind === 'install_relay' && !action.appRelayId) return 'Update Relays';
+    if (!action && $appUpdate.state !== 'deployment-required') return 'Update Relays';
+    return 'Update Herdr';
+  }
+
+  function addRelay(event: SubmitEvent) {
+    event.preventDefault();
+    relayStore.addRelay({ label: relayLabel, url: relayUrl, token: relayToken });
+    relayLabel = '';
+    relayUrl = '';
+    relayToken = '';
+  }
+
+  function requestRelayRemoval(id: string) {
+    removalRelayId = id;
+    removalOpen = true;
+  }
+
+  async function confirmRelayRemoval() {
+    if (!removalRelayId) return;
+    const relayId = removalRelayId;
+    removalOpen = false;
+    await removeRelayPushSubscription(relayId);
+    relayStore.removeRelay(relayId);
+    removalRelayId = '';
+  }
+
+
+  async function changeDeviceLock(value: boolean) {
+    const changed = await setDeviceVerificationRequired(value);
+    deviceLock = value && changed;
+  }
+
+  function relayUpdateMeta(connection?: RelayConnectionView) {
+    if (!connection || connection.status !== 'connected') {
+      return {
+        label: 'Update status unavailable',
+        detail: 'Connect this relay to check its version.',
+        warning: false,
+      };
+    }
+    if (relayNeedsManualBootstrap(connection)) {
+      return {
+        label: 'Manual update required',
+        detail: 'Open Update Help for the one-time Terminal bootstrap.',
+        warning: true,
+      };
+    }
+    const update = connection.update;
+    if (update.state === 'checking') return { label: 'Checking for updates…', detail: '', warning: false };
+    if (update.state === 'available') {
+      return {
+        label: `Update v${update.available_version} available`,
+        detail: `Revision ${shortRevision(update.available_revision)}`,
+        warning: true,
+      };
+    }
+    if (update.state === 'blocked') {
+      return {
+        label: `Update v${update.available_version} needs attention`,
+        detail: update.reason,
+        warning: true,
+      };
+    }
+    if (update.state === 'scheduled') {
+      return { label: 'Update scheduled…', detail: 'Preparing the verified release.', warning: true };
+    }
+    if (update.state === 'preparing') {
+      return { label: 'Verifying update…', detail: 'Checking release identity and transport compatibility.', warning: true };
+    }
+    if (update.state === 'deploying_app') {
+      return { label: 'Publishing phone app…', detail: 'Waiting for the app origin to serve the verified bundle.', warning: true };
+    }
+    if (update.state === 'installing') {
+      return { label: 'Installing update…', detail: 'The phone connection may briefly disconnect.', warning: true };
+    }
+    if (update.state === 'restarting') {
+      return { label: 'Restarting relay…', detail: 'The phone connection may briefly disconnect.', warning: true };
+    }
+    if (update.state === 'succeeded') {
+      return { label: 'Update installed', detail: `Running v${update.current_version}`, warning: false };
+    }
+    if (update.state === 'rolled_back') {
+      return { label: 'Update rolled back', detail: update.error, warning: true };
+    }
+    if (update.state === 'failed') {
+      return { label: 'Update operation failed', detail: update.error, warning: true };
+    }
+    const checked = update.checked_at
+      ? `Checked ${new Date(update.checked_at * 1_000).toLocaleString()}`
+      : 'Update check pending';
+    return { label: 'Up to date', detail: checked, warning: false };
+  }
+
+  async function checkRelayUpdate(relayId: string) {
+    busyRelayId = relayId;
+    try {
+      await relayStore.checkRelayUpdate(relayId);
+    } catch (error) {
+      relayStore.showToast((error as Error).message, true);
+    } finally {
+      busyRelayId = '';
+    }
+  }
+
+  async function checkAppAndRelays() {
+    if (checkingUpdates) return;
+    checkingUpdates = true;
+    try {
+      const checks: Promise<unknown>[] = [checkAppUpdate()];
+      for (const { relay, connection } of relayRows) {
+        if (connection?.status === 'connected' && connection.capabilities.includes('self_update')) {
+          checks.push(relayStore.checkRelayUpdate(relay.id));
+        }
+      }
+      const results = await Promise.allSettled(checks);
+      const failure = results.find((result) => result.status === 'rejected');
+      if (failure?.status === 'rejected') {
+        relayStore.showToast((failure.reason as Error).message, true);
+      }
+    } finally {
+      checkingUpdates = false;
+    }
+  }
+
+  function requestSafeUpdate() {
+    if (!safeUpdateAction) return;
+    pendingUpdateAction = safeUpdateAction;
+    pendingReloadRisk = safeUpdateAction.kind === 'reload_app' ? reloadRisk() : null;
+    updateOpen = true;
+  }
+
+  function showManualUpdate(relayId: string) {
+    manualRelayId = relayId;
+    manualOpen = true;
+  }
+
+  async function copyUpdateCommand(command: string, installation: string) {
+    if (!navigator.clipboard?.writeText) {
+      relayStore.showToast('Clipboard access is unavailable. Select the text manually.', true);
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(command);
+      relayStore.showToast(`${installation} update command copied.`);
+    } catch {
+      relayStore.showToast('Could not copy. Select it manually.', true);
+    }
+  }
+
+  async function startSafeUpdate() {
+    const action = pendingUpdateAction;
+    pendingUpdateAction = null;
+    updateOpen = false;
+    if (!action || action.kind !== 'reload_app' && isReadOnlyRelay(action.relayId)) return;
+    if (action.kind === 'reload_app') {
+      const risk = reloadRisk();
+      if (risk && risk !== pendingReloadRisk) {
+        pendingUpdateAction = action;
+        pendingReloadRisk = risk;
+        updateOpen = true;
+        return;
+      }
+      const relayIds = relayRows.filter(({ relay }) => !isReadOnlyRelay(relay.id)).map(({ relay }) => relay.id);
+      queueUpdateProgressForReload(action.targetVersion, relayIds, action.phoneTarget);
+      reloadApp(action.targetVersion, action.phoneTarget);
+      return;
+    }
+    const relayIds = [
+      action.relayId,
+      ...relayRows
+        .map(({ relay }) => relay.id)
+        .filter((relayId) => relayId !== action.relayId && !isReadOnlyRelay(relayId)),
+    ];
+    beginUpdateProgress(action.targetVersion, relayIds, action.relayId, action.appRelayId, {
+      phoneAppRequired: action.phoneAppRequired,
+      phoneTarget: action.phoneTarget,
+      phoneState: action.phoneAppRequired ? 'publishing' : 'loaded',
+    });
+    busyRelayId = action.relayId;
+    try {
+      if (action.kind === 'deploy_app') {
+        await relayStore.deployAppUpdate(action.relayId, action.targetVersion);
+        relayStore.showToast('Publishing the phone app. This screen will resume after it reloads.');
+      } else {
+        await relayStore.installRelayUpdate(action.relayId);
+        relayStore.showToast(action.appRelayId
+          ? 'Publishing the phone app before safely updating its relay.'
+          : 'Update scheduled. Remaining relays will follow.');
+      }
+    } catch (error) {
+      relayStore.showToast((error as Error).message, true);
+      setUpdateProgressError(action.relayId, error);
+    } finally {
+      busyRelayId = '';
+    }
+  }
+
+  function speechVoiceKey(relayId: string, language: string): string {
+    return `${relayId}:${language}`;
+  }
+
+  function speechVoiceFor(connection: RelayConnectionView | undefined, language: string): RelaySpeechVoice | undefined {
+    return connection?.speechVoices.find((voice) => voice.language === language);
+  }
+
+  /** A 63,206,179-byte voice reads as "63 MB": a phone row has no room for more. */
+  function speechVoiceSize(bytes: number): string {
+    return `${Math.max(1, Math.round(bytes / 1_000_000))} MB`;
+  }
+
+  function speechVoiceState(voice: RelaySpeechVoice | undefined): string {
+    if (voice?.installed) return `Neural voice cached, ${speechVoiceSize(voice.bytes)}`;
+    if (voice?.bytes) return `Not downloaded - ${speechVoiceSize(voice.bytes)} download`;
+    return 'No voice on this computer';
+  }
+
+  async function changeSpeechVoice(relayId: string, language: string, install: boolean) {
+    const key = speechVoiceKey(relayId, language);
+    if (speechVoiceBusy.includes(key)) return;
+    speechVoiceBusy = [...speechVoiceBusy, key];
+    try {
+      if (install) await relayStore.installSpeechVoice(relayId, language);
+      else await relayStore.removeSpeechVoice(relayId, language);
+      relayStore.showToast(`${speechLanguageLabel(language)} voice ${install ? 'downloaded' : 'removed'}.`);
+    } catch (error) {
+      relayStore.showToast((error as Error).message, true);
+    } finally {
+      speechVoiceBusy = speechVoiceBusy.filter((entry) => entry !== key);
+    }
+  }
+
+  // One list per connected relay: every later install or remove is broadcast
+  // by the relay itself, and a relay that drops is asked again on reconnect.
+  $effect(() => {
+    for (const { relay, connection } of relayRows) {
+      const capable = connection?.status === 'connected'
+        && connection.capabilities.includes('speech_voice_management');
+      if (!capable) {
+        speechVoiceRequested.delete(relay.id);
+        continue;
+      }
+      if (!$speechEnabled || speechVoiceRequested.has(relay.id)) continue;
+      speechVoiceRequested.add(relay.id);
+      void relayStore.listSpeechVoices(relay.id).catch((error: Error) => {
+        relayStore.showToast(error.message, true);
+      });
+    }
+  });
+
+  function pushStatusLabel(connection?: RelayConnectionView): string {
+    if (!connection) return 'not connected';
+    if (!pushSupported()) return 'unavailable';
+    if (connection.pushStatus === 'subscribed') return 'synced';
+    if (['syncing', 'sent'].includes(connection.pushStatus)) return 'syncing…';
+    if (connection.pushStatus === 'browser-subscribed') return 'browser subscription found';
+    if (connection.pushStatus === 'missing-config') return 'relay push unavailable';
+    if (connection.pushStatus === 'key-mismatch') return 'key changed';
+    if (connection.pushStatus === 'failed') return 'sync failed';
+    if (connection.status === 'connecting') return 'waiting for relay…';
+    if (connection.status === 'connected' && $pushPreferences.optedIn) return 'checking…';
+    return 'not synced';
+  }
+
+  /** Host of a ws(s) origin, without the scheme the row does not need. */
+  function originHost(url: string): string {
+    return url.replace(/^\w+:\/\//, '').split('/')[0];
+  }
+
+  /**
+   * Which physical path is carrying this relay right now. A configured gateway
+   * list says what the phone may use; this says what it is using.
+   */
+  function relayPathLabel(connection: RelayConnectionView | undefined, relay: RelayConfig): string {
+    if (!connection || connection.status !== 'connected') return '';
+    if (connection.path === 'websocket') return `relay URL ${originHost(relay.url)}`;
+    const gateway = originHost(connection.activeGatewayUrl || relay.gatewayUrl || '');
+    return connection.path === 'webrtc' ? `direct, via ${gateway}` : `gateway ${gateway}`;
+  }
+</script>
+
+<main
+  class="page settings-page"
+  aria-labelledby="settings-title"
+  data-app-assets={APP_ASSET_VERSION}
+  data-app-build={APP_BUILD_ID}
+>
+  <h2 id="settings-title">Settings</h2>
+
+  <Card>
+    <h3>Relays</h3>
+    <form class="form-stack" onsubmit={addRelay}>
+      <label for="relay-label">Relay Name</label>
+      <input id="relay-label" bind:value={relayLabel} placeholder="Fedora" />
+      <label for="relay-url">Relay URL</label>
+      <input id="relay-url" bind:value={relayUrl} type="url" required placeholder="wss://relay-fedora.example.com" />
+      <label for="relay-token">Relay key</label>
+      <input id="relay-token" bind:value={relayToken} type="password" placeholder="HERDR_RELAY_TOKEN" />
+      <div class="form-actions">
+        <Button type="submit">Add Relay</Button>
+        <Button variant="secondary" onclick={() => relayStore.connectAll()}>Reconnect All</Button>
+      </div>
+    </form>
+    <div class="relay-list">
+      {#if !$relays.length}<p class="hint">No relays configured.</p>{/if}
+      {#each relayRows as { relay, connection } (relay.id)}
+        {@const connectionStatus = connection?.status || 'disconnected'}
+        {@const version = relayVersionMeta(connection)}
+        {@const update = relayUpdateMeta(connection)}
+        {@const manualUpdate = Boolean(connection && relayNeedsManualBootstrap(connection))}
+        {@const currentRelay = connection?.relay || relay}
+        {@const gateways = currentRelay.gatewayUrls || []}
+        {@const connectionPath = relayPathLabel(connection, currentRelay)}
+        {@const herdr = connection?.herdrStatus}
+        {@const herdrFeatureWarnings = herdrWarnings(herdr?.features)}
+        <article class="relay-row">
+          <span
+            class={`status-dot status-${connectionStatus === 'connected' && connection?.inventory.state === 'ready' ? 'success' : connectionStatus === 'connecting' || connectionStatus === 'connected' ? 'warning' : 'danger'}`}
+            role="img"
+            aria-label={`${relay.label} relay ${connectionStatus}`}
+          ></span>
+          <div class="relay-info">
+            <strong>{relay.label}</strong>
+            {#if connectionPath}<small>Connection: {connectionPath}</small>{/if}
+            {#if gateways.length}
+              <small>Gateway: {connection?.gatewayVersion || 'unknown'} · Latest: {connection?.update.available_version || connection?.gatewayAvailableVersion || connection?.releaseVersion || 'unknown'}</small>
+              <ol aria-label={`Gateway candidates for ${relay.label}`}>
+                {#each gateways as gateway (gateway)}
+                  <li>{gateway}</li>
+                {/each}
+              </ol>
+            {:else}
+              <span>{currentRelay.url}</span>
+            {/if}
+            <small>Push: {pushStatusLabel(connection)}</small>
+            {#if connection?.authRejected}
+              <small class="error" role="alert">
+                This computer refused this device. Import a new invitation link, or remove and add the relay.
+              </small>
+            {/if}
+            {#if connection?.pairingRequired}
+              <small class="error" role="alert">
+                This computer needs pairing. Import a device invitation link, or remove and add the relay.
+              </small>
+            {/if}
+            {#if connection?.pairingDeferred}
+              <small class="warning" role="status">
+                Waiting for the Home Screen app: add Herdr to the Home Screen and open it there to pair this computer.
+              </small>
+              <PairDeferredRelay relayId={relay.id} onPair={(id) => relayStore.pairDeferredRelay(id)} />
+            {/if}
+            {#if connectionStatus === 'connected' && connection?.inventory.state !== 'ready'}
+              <small class="warning" role="status">
+                {connection?.inventory.state === 'error'
+                  ? connection.inventory.message || 'Herdr agent inventory unavailable.'
+                  : 'Loading Herdr agent inventory…'}
+              </small>
+            {/if}
+            {#if version}<small class:warning={version.tone === 'warning'} title={version.title}>{version.label}</small>{/if}
+            <small>
+              <span>Herdr client: {herdr?.installed_client_version || 'unknown'}</span>
+              <span>
+                Herdr server: {herdr?.server_version || 'unavailable/unknown'}
+                {#if herdr?.server_protocol_known} · protocol {herdr.server_protocol}{/if}
+                {#if herdr?.endpoint_protocol_generation} · endpoint generation {herdr.endpoint_protocol_generation}{/if}
+              </span>
+            </small>
+            <small>Herdr 0.9.0 recommended.</small>
+            {#if herdrFeatureWarnings}
+              <small class="warning herdr-feature-warning" role="status">{herdrFeatureWarnings}</small>
+            {/if}
+            <small class:warning={update.warning} role="status">{update.label}</small>
+            {#if update.detail}<small class:warning={update.warning} title={update.detail}>{update.detail}</small>{/if}
+          </div>
+          <div class="relay-actions">
+            {#if connectionStatus === 'connected' && manualUpdate}
+              <Button
+                variant="secondary"
+                size="sm"
+                aria-label={`How to update ${relay.label}`}
+                onclick={() => showManualUpdate(relay.id)}
+              >Update Help</Button>
+            {:else if connection?.capabilities.includes('self_update')}
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={connectionStatus !== 'connected' || busyRelayId === relay.id || ['scheduled', 'preparing', 'deploying_app', 'installing', 'restarting'].includes(connection.update.state)}
+                aria-label={`Check ${relay.label} for updates`}
+                onclick={() => checkRelayUpdate(relay.id)}
+              >Check</Button>
+            {/if}
+            <Button variant="danger" size="sm" aria-label={`Remove ${relay.label}`} onclick={() => requestRelayRemoval(relay.id)}>Remove</Button>
+          </div>
+        </article>
+      {/each}
+    </div>
+    <p class="hint">Use one relay URL per computer. Relay keys stay in this browser’s local storage and encrypt relay messages end to end.</p>
+  </Card>
+  {#each relayRows as { relay, connection } (relay.id)}
+    {#if connection?.capabilities.includes('pi_integration')}
+      <PiIntegration relayId={relay.id} label={relay.label} {connection}
+        readOnly={isReadOnlyRelay(relay.id) || relayStore.deviceCredential(relay.id)?.role !== 'controller'} />
+    {/if}
+    {@const credential = relayStore.deviceCredential(relay.id)}
+    {#if credential}
+      <DeviceSettings
+        relayId={relay.id}
+        relayLabel={relay.label}
+        devices={$devices.get(relay.id) || []}
+        currentDeviceId={credential.deviceId}
+        connected={connection?.status === 'connected'}
+        canAdminister={credential.role === 'controller'}
+        canInvite={canInviteFrom(relay)}
+        onRename={(intent) => relayStore.renameDevice(intent)}
+        onInvite={(intent) => relayStore.createDeviceInvitation(intent)}
+        onRevoke={(intent) => relayStore.revokeDevice(intent)}
+        onReset={(intent) => relayStore.resetDevices(intent)}
+        onForgetCurrent={() => relayStore.forgetCurrentDevice(relay.id)}
+        onQrCode={connection?.capabilities.includes('invitation_qr')
+          ? ((text) => relayStore.qrCode(relay.id, text))
+          : undefined}
+      />
+    {/if}
+  {/each}
+
+
+  <Card>
+    <h3>Agents</h3>
+    <fieldset class="choice-grid compact-grid">
+      <legend>Default View</legend>
+      {#each AGENT_VIEWS as item (item)}
+        <button
+          class:active={$defaultAgentView === item}
+          type="button"
+          aria-pressed={$defaultAgentView === item}
+          onclick={() => changeDefaultAgentView(item)}
+        >{AGENT_VIEW_LABELS[item]}</button>
+      {/each}
+    </fieldset>
+    <p class="hint">Saved on this device. Used when opening an agent unless that pane has its own setting. Conversation falls back to Terminal when a native transcript is unavailable.</p>
+  </Card>
+
+  <Card>
+    <h3>Appearance</h3>
+    <fieldset class="choice-grid">
+      <legend>Theme</legend>
+      {#each THEMES as item (item)}
+        <button class:active={$theme === item} type="button" aria-pressed={$theme === item} onclick={() => setTheme(item as Theme)}>{item}</button>
+      {/each}
+    </fieldset>
+    <fieldset class="choice-grid compact-grid">
+      <legend>Interface Size</legend>
+      {#each INTERFACE_SIZES as item (item)}
+        <button class:active={$interfaceSize === item} type="button" aria-pressed={$interfaceSize === item} onclick={() => setInterfaceSize(item as InterfaceSize)}>{item.charAt(0).toUpperCase() + item.slice(1)}</button>
+      {/each}
+    </fieldset>
+    <fieldset class="choice-grid compact-grid">
+      <legend>Home Workspaces</legend>
+      {#each HOME_LAYOUTS as item (item)}
+        <button
+          class:active={$homeLayout === item}
+          type="button"
+          aria-pressed={$homeLayout === item}
+          onclick={() => setHomeLayout(item as HomeLayout)}
+        >{HOME_LAYOUT_LABELS[item]}</button>
+      {/each}
+    </fieldset>
+    <p class="hint">By State separates Done, Working, and Idle workspace sections. Mixed shows each workspace once with a dot for its most notable session: done, then working, then idle. Agents needing input always stay on top.</p>
+    <fieldset class="choice-grid history-grid">
+      <legend>Terminal History</legend>
+      {#each TERMINAL_HISTORY_OPTIONS as item (item)}
+        <button
+          class:active={$terminalHistoryLines === item}
+          type="button"
+          aria-pressed={$terminalHistoryLines === item}
+          onclick={() => setTerminalHistoryLines(item as TerminalHistoryLines)}
+        >{item}</button>
+      {/each}
+    </fieldset>
+    <p class="hint">Lines kept in the terminal view. Direct connections honor the selected limit; gateway transport caps each read at 1,000 lines to bound relayed traffic. Use Copy or Conversation History for clean response text.</p>
+    <fieldset class="choice-grid history-grid refresh-grid">
+      <legend>Terminal Refresh</legend>
+      {#each TERMINAL_REFRESH_OPTIONS as item (item)}
+        <button
+          class:active={$terminalRefreshInterval === item}
+          type="button"
+          aria-pressed={$terminalRefreshInterval === item}
+          onclick={() => setTerminalRefreshInterval(item as TerminalRefreshInterval)}
+        >{TERMINAL_REFRESH_LABELS[item]}</button>
+      {/each}
+    </fieldset>
+    <p class="hint">How often the relay checks the visible pane. 250 ms is balanced; faster refresh uses more computer and phone CPU during active output.</p>
+    <AppSwitch
+      checked={$terminalResizeSession}
+      label="Resize Session"
+      descriptionId="resize-session-hint"
+      onchange={(value) => {
+        if (setTerminalResizeSession(value) === 'unavailable') relayStore.showToast('Resize Session preference could not be saved.');
+      }}
+    />
+    <p class="hint" id="resize-session-hint">Off by default. Enable explicitly on this device. Resizes the shared terminal to fit this phone while the phone has it open. Until the phone lets go, the laptop and SSH views of that pane look garbled, and agents may leave narrow copies of their output in the scrollback. Resizing may truncate scrollback and lose older output. The previous size is restored when the phone leaves the pane, unless it was changed on the laptop meanwhile. Unavailable on relays that do not support it. When off, controller terminals keep the desktop width and scroll horizontally; read-only reader panes wrap to the phone width.</p>
+    <AppSwitch
+      checked={$terminalHeightLease}
+      disabled={!$terminalResizeSession || !heightLeaseSupported}
+      label="Lease Terminal Height"
+      descriptionId="height-lease-hint"
+      onchange={(value) => setTerminalHeightLease(value)}
+    />
+    <p class="hint" id="height-lease-hint">Also fits the shared terminal's height to this phone. Requires Resize Session and a connected relay that supports it. The checked preference is remembered but inactive while Resize Session is off. Height changes can strand duplicate inline-agent status bars in the scrollback.</p>
+    <AppSwitch
+      checked={$terminalWakeLock}
+      label="Keep Screen Awake"
+      descriptionId="wake-lock-hint"
+      onchange={(value) => setTerminalWakeLock(value)}
+    />
+    <p class="hint" id="wake-lock-hint">Off by default. When enabled, requests the browser screen wake lock only while a Terminal is mounted and visible. Status: {wakeLockStatus}.</p>
+    <AppSwitch
+      checked={$speechEnabled}
+      label="Read Responses Aloud"
+      descriptionId="speech-hint"
+      onchange={(value) => setSpeechEnabled(value)}
+    />
+    <p class="hint" id="speech-hint">Enabled automatically the first time a connected relay offers a compatible voice; after that, this setting remains under your control. Adds a Speak button next to Copy in the Terminal and Conversation History views. The relay synthesizes each response with its own neural voice and streams the audio here encrypted, so reading continues while the screen is off. Response text never reaches a third-party speech server.</p>
+    <label class="field-label settings-field" for="speech-language">Language</label>
+    <select
+      id="speech-language"
+      disabled={!$speechEnabled}
+      value={$speechLanguage}
+      onchange={(event) => setSpeechLanguage(event.currentTarget.value)}
+    >
+      {#each SPEECH_LANGUAGES as language (language.code)}
+        <option value={language.code}>{language.label}</option>
+      {/each}
+    </select>
+    {#if $speechState === 'error'}
+      <p class="hint error" role="alert">Reading aloud failed. Check the relay's voice below, then try again.</p>
+    {/if}
+    {#if $speechEnabled && relaysWithoutVoice.length}
+      <p class="hint" role="status">No {speechLanguageLabel($speechLanguage)} voice on {relaysWithoutVoice.join(', ')}. Download it below, or install a system speech engine on that computer.</p>
+    {/if}
+    {#if $speechState === 'speaking'}
+      <Button variant="secondary" size="sm" onclick={stopSpeech}>Stop reading</Button>
+    {/if}
+    {#if $speechEnabled}
+      {#each speechVoiceRelays as { relay, connection } (relay.id)}
+        <div class="relay-list">
+          <p class="hint">Voices on {relay.label}{connection?.speechCacheDir ? `, cached in ${connection.speechCacheDir}` : ''}</p>
+          {#if connection && !connection.speechEngineInstalled}
+            <p class="hint" role="status">The neural speech engine is not installed on {relay.label} yet. The first download installs it too.</p>
+          {/if}
+          {#each SPEECH_LANGUAGES as language (language.code)}
+            {@const voice = speechVoiceFor(connection, language.code)}
+            {@const busy = speechVoiceBusy.includes(speechVoiceKey(relay.id, language.code))}
+            <article class="relay-row" aria-label={`${language.label} voice on ${relay.label}`}>
+              <div class="relay-info">
+                <strong>{language.label}</strong>
+                <small>{speechVoiceState(voice)}</small>
+              </div>
+              <div class="relay-actions">
+                {#if voice?.installed}
+                  <Button
+                    variant="danger"
+                    size="sm"
+                    aria-busy={busy}
+                    disabled={busy}
+                    aria-label={`Remove the ${language.label} voice on ${relay.label}`}
+                    onclick={() => changeSpeechVoice(relay.id, language.code, false)}
+                  >{busy ? 'Removing…' : 'Remove'}</Button>
+                {:else}
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    aria-busy={busy}
+                    disabled={busy}
+                    aria-label={`Download the ${language.label} voice on ${relay.label}`}
+                    onclick={() => changeSpeechVoice(relay.id, language.code, true)}
+                  >{busy ? 'Downloading…' : 'Download'}</Button>
+                {/if}
+              </div>
+            </article>
+          {/each}
+        </div>
+      {/each}
+    {/if}
+  </Card>
+
+  <NotificationSettings
+    scopes={notificationScopes}
+    platform={notificationPlatform}
+    testStates={notificationTestStates}
+    busy={$notificationBusy}
+    deliveryEnabled={$pushPreferences.optedIn}
+    onpolicychange={({ relay_id, policy }) => sendPushPolicy(relay_id, policy)}
+    ontoggle={() => toggleNotifications()}
+    ontest={(request) => { sendTargetedPushTest(request); }}
+  />
+
+  <Card>
+    <h3>Security</h3>
+    <AppSwitch checked={deviceLock} disabled={$securityState.busy} label="Require Fingerprint / Device Unlock" onchange={changeDeviceLock} />
+    <p class="hint">{deviceVerificationSupported() ? $securityState.hint : 'Device verification needs HTTPS and WebAuthn support.'}</p>
+  </Card>
+
+  <Card>
+    <h3>Status</h3>
+    <p><span class={`status-dot status-${degradedCount ? 'warning' : connectedCount ? 'success' : 'danger'}`}></span> {connectedCount}/{$relays.length} relays connected · {$agents.length} agents</p>
+    {#if degradedCount}<p class="warning" role="status">{degradedCount} connected {degradedCount === 1 ? 'relay has' : 'relays have'} unavailable agent inventory.</p>{/if}
+  </Card>
+
+  <Card>
+    <h3>About</h3>
+    <p>Phone app version {APP_VERSION}</p>
+    <div class="app-update-status" aria-busy={appUpdateChecking}>
+      <div class:app-update-status-hidden={appUpdateChecking} aria-hidden={appUpdateChecking}>
+        {#if appUpdateForLayout.state === 'reload-ready'}
+          <p class="warning" role="status">Version {appUpdateForLayout.deployedVersion} is deployed to this app origin and ready to load.</p>
+        {:else if appUpdateForLayout.state === 'deployment-required'}
+          <p class="warning" role="status">
+            Version {appUpdateForLayout.upstreamVersion} is released, but this app origin still serves {appUpdateForLayout.deployedVersion}.
+          </p>
+          {#if appDeploymentOwner}
+            {#if ['scheduled', 'preparing', 'deploying_app', 'installing', 'restarting'].includes(appDeploymentOwner.connection?.update.state || '')}
+              <p class="hint" role="status">Publishing v{appUpdateForLayout.upstreamVersion} and waiting for this app origin to update. This can take up to two minutes; the relay remains online.</p>
+            {:else if ['scheduled', 'deploying'].includes(appDeploymentOwner.connection?.appDeploy.state || '')}
+              <p class="hint" role="status">Publishing v{appUpdateForLayout.upstreamVersion} from {appDeploymentOwner.relay.label} and waiting for this app origin to update. This can take up to two minutes.</p>
+            {:else if appDeploymentOwner.connection?.appDeploy.state === 'failed'}
+              <p class="warning" role="status">Deployment failed: {appDeploymentOwner.connection.appDeploy.error}</p>
+            {:else if appDeploymentOwner.connection?.releaseVersion !== appUpdateForLayout.upstreamVersion}
+              {#if appDeploymentOwner.connection && relayNeedsManualBootstrap(appDeploymentOwner.connection)}
+                <p class="warning" role="status">{appDeploymentOwner.relay.label} needs the one-time Terminal bootstrap shown in Update Help before it can deploy this app version.</p>
+              {:else if ownerUpdateReady}
+                <p class="hint">{appDeploymentOwner.relay.label} can deploy the app and update to {appUpdateForLayout.upstreamVersion} in one safe step.</p>
+              {:else}
+                <p class="hint">No installable v{appUpdateForLayout.upstreamVersion} relay update is available from {appDeploymentOwner.relay.label} yet.</p>
+              {/if}
+            {:else}
+              <p class="hint">{appDeploymentOwner.relay.label} is authorized to deploy this app origin.</p>
+            {/if}
+          {:else}
+            <p class="hint">This is a separately hosted app. Configure one relay as its deployment owner:</p>
+            <pre class="update-command"><code>{APP_DEPLOY_SETUP_COMMAND}</code></pre>
+          {/if}
+        {:else if appUpdateForLayout.state === 'checking'}
+          <p class="hint" role="status">Checking this app origin and the upstream release…</p>
+        {:else if appUpdateForLayout.state === 'failed'}
+          <p class="hint" role="status">Could not verify app updates: {appUpdateForLayout.error}</p>
+        {:else}
+          <p class="hint" role="status">Phone app is current at v{appUpdateForLayout.upstreamVersion || APP_VERSION}.</p>
+          {#if relayUpdateCount}
+            <p class="warning" role="status">{relayUpdateCount} {relayUpdateCount === 1 ? 'relay update is' : 'relay updates are'} available.</p>
+          {/if}
+          {#if blockedRelayUpdateCount}
+            <p class="warning" role="status">{blockedRelayUpdateCount} {blockedRelayUpdateCount === 1 ? 'relay update needs' : 'relay updates need'} attention.</p>
+          {/if}
+          {#if manualRelayUpdateCount}
+            <p class="warning" role="status">{manualRelayUpdateCount} {manualRelayUpdateCount === 1 ? 'relay requires' : 'relays require'} a one-time manual update.</p>
+          {/if}
+        {/if}
+      </div>
+      {#if appUpdateChecking}
+        <p class="hint app-update-status-checking" role="status">Checking this app origin and the upstream release…</p>
+      {/if}
+    </div>
+    <div class="form-actions">
+      <Button
+        class="update-check-button"
+        variant="secondary"
+        aria-busy={appUpdateChecking}
+        disabled={appUpdateChecking}
+        onclick={checkAppAndRelays}
+      >Check for Updates</Button>
+      {#if updatePending}
+        <Button disabled={!safeUpdateAction || Boolean(busyRelayId)} onclick={requestSafeUpdate}>
+          {updateActionLabel(safeUpdateAction)}
+        </Button>
+      {/if}
+    </div>
+    <p class="hint">Relay-hosted apps update with their relay. A separately hosted Pages app can be deployed only by its configured owner relay.</p>
+  </Card>
+</main>
+
+<AppDialog
+  id="update-herdr-dialog"
+  bind:open={updateOpen}
+  title={updateActionLabel(pendingUpdateAction)}
+  description={pendingUpdateAction?.description || 'No safe update path is currently available.'}
+>
+  <p class="hint">Herdr selects the safe order automatically: publish the phone app first when required, then update each relay one at a time while preserving running agents.</p>
+  {#if pendingReloadRisk}<p class="warning" role="alert">{reloadRiskMessage(pendingReloadRisk)}</p>{/if}
+  <div class="dialog-actions">
+    <Button disabled={!pendingUpdateAction || Boolean(busyRelayId)} onclick={startSafeUpdate}>
+      {pendingUpdateAction?.kind !== 'reload_app' ? 'Start Update' : pendingReloadRisk ? 'Load Update Anyway' : 'Load Update'}
+    </Button>
+    <Button variant="ghost" onclick={() => { updateOpen = false; pendingUpdateAction = null; }}>Cancel</Button>
+  </div>
+</AppDialog>
+
+<AppDialog
+  id="manual-relay-update-dialog"
+  bind:open={manualOpen}
+  title={manualRow ? `Update ${manualRow.relay.label}` : 'Update Relay'}
+  description="This relay needs a one-time Terminal update before phone-driven updates can continue."
+>
+  <p>On the computer running this relay, open Terminal and run:</p>
+  <pre class="update-command"><code>{MANAGED_UPDATE_COMMAND}</code></pre>
+  <p class="hint">This updates the Marketplace plugin, preserves the configuration used by an existing stable service, and restarts the relay.</p>
+  <div class="dialog-actions">
+    <Button onclick={() => copyUpdateCommand(MANAGED_UPDATE_COMMAND, 'Marketplace')}>Copy Command</Button>
+    <Button variant="ghost" onclick={() => { manualOpen = false; }}>Close</Button>
+  </div>
+  <details class="checkout-update">
+    <summary>Prefer to keep using a source checkout?</summary>
+    <p class="hint">Run this from the checkout directory:</p>
+    <pre class="update-command"><code>{CHECKOUT_UPDATE_COMMAND}</code></pre>
+    <Button variant="secondary" size="sm" onclick={() => copyUpdateCommand(CHECKOUT_UPDATE_COMMAND, 'Source checkout')}>Copy Checkout Command</Button>
+  </details>
+</AppDialog>
+
+<AppDialog
+  id="remove-relay-dialog"
+  bind:open={removalOpen}
+  title={removalRow ? `Remove ${removalRow.relay.label}?` : 'Remove Relay?'}
+  description="This removes the saved relay connection and its push subscription from this phone."
+>
+  {#if removalRow}
+    <p class="hint">{removalRow.relay.url}</p>
+  {/if}
+  <p>Agents on the computer keep running. You will need its setup link or connection details to add it again.</p>
+  <div class="dialog-actions">
+    <Button variant="danger" disabled={!removalRow} onclick={confirmRelayRemoval}>Remove Relay</Button>
+    <Button variant="ghost" onclick={() => { removalOpen = false; }}>Cancel</Button>
+  </div>
+</AppDialog>

@@ -1,0 +1,554 @@
+package conversation
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/0cv/herdr-mobile-relay/internal/agentroots"
+)
+
+const testSessionID = "123e4567-e89b-12d3-a456-426614174000"
+
+func testReader(t *testing.T) (*Reader, string) {
+	t.Helper()
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("PI_CODING_AGENT_DIR", "")
+	t.Setenv("HERMES_HOME", "")
+	t.Setenv("GROK_HOME", "")
+	t.Setenv(agentroots.GrokListEnv, "")
+	t.Setenv(agentroots.ClaudeListEnv, "")
+	t.Setenv(agentroots.QoderListEnv, "")
+	t.Setenv(agentroots.CodexListEnv, "")
+	t.Setenv(agentroots.PiListEnv, "")
+	t.Setenv(agentroots.OMPListEnv, "")
+	t.Setenv(agentroots.HermesListEnv, "")
+	t.Setenv(agentroots.CursorListEnv, "")
+	home := t.TempDir()
+	return NewReader(home), home
+}
+
+func writeRows(t *testing.T, path string, rows ...map[string]any) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	encoder := json.NewEncoder(file)
+	for _, row := range rows {
+		if err := encoder.Encode(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestProjectSessionWithPunctuationWithoutCWDFile(t *testing.T) {
+	for _, agent := range []string{"qoder", "claude"} {
+		t.Run(agent, func(t *testing.T) {
+			reader, _ := testReader(t)
+			roots := reader.qoderRoots()
+			if agent == "claude" {
+				roots = reader.claudeRoots()
+			}
+			path := filepath.Join(roots[0], "-Users-first-last-Development-my-project-", testSessionID+".jsonl")
+			writeRows(t, path, map[string]any{"type": "user", "message": map[string]any{"content": "hello"}})
+			cwd := "/Users/first.last/Development/my_project!"
+			if got := reader.Locate(agent, cwd, testSessionID); got.Path != path {
+				t.Fatalf("location = %#v, want %s", got, path)
+			}
+			page, err := reader.ReadFor(agent, cwd, testSessionID, "", 80)
+			if err != nil || !page.Available || len(page.Entries) != 1 || page.Entries[0].Text != "hello" {
+				t.Fatalf("page = %#v, error = %v", page, err)
+			}
+		})
+	}
+}
+
+func TestClaudeConversationFiltersInjectedAndSidechainRows(t *testing.T) {
+	reader, home := testReader(t)
+	path := filepath.Join(home, ".claude", "projects", "-work", testSessionID+".jsonl")
+	writeRows(t, path,
+		map[string]any{"type": "user", "uuid": "u1", "timestamp": "2026-08-12T10:00:00Z", "message": map[string]any{"content": "hello"}},
+		map[string]any{"type": "user", "uuid": "u2", "message": map[string]any{"content": "<system-reminder>hidden</system-reminder>"}},
+		map[string]any{"type": "assistant", "uuid": "a1", "timestamp": "2026-08-12T10:00:01Z", "message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "answer"}, map[string]any{"type": "tool_use", "name": "Read"}}}},
+		map[string]any{"type": "assistant", "uuid": "a2", "isSidechain": true, "message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "subagent"}}}},
+	)
+
+	page, err := reader.Read("claude", testSessionID, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.Available || page.Total != 2 || len(page.Entries) != 2 {
+		t.Fatalf("page = %#v, want two visible turns", page)
+	}
+	if page.Entries[0].Role != "user" || page.Entries[0].Text != "hello" ||
+		page.Entries[1].Role != "assistant" || page.Entries[1].Text != "answer" {
+		t.Fatalf("entries = %#v", page.Entries)
+	}
+}
+
+func TestCodexConversationUsesResponseItemsWithoutDuplicates(t *testing.T) {
+	reader, home := testReader(t)
+	path := filepath.Join(home, ".codex", "sessions", "2026", "08", "12", "rollout-2026-08-12T10-00-00-"+testSessionID+".jsonl")
+	writeRows(t, path,
+		map[string]any{"timestamp": "2026-08-12T10:00:00Z", "type": "response_item", "payload": map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "build it"}}}},
+		map[string]any{"timestamp": "2026-08-12T10:00:00Z", "type": "event_msg", "payload": map[string]any{"type": "user_message", "message": "build it"}},
+		map[string]any{"timestamp": "2026-08-12T10:00:00Z", "type": "response_item", "payload": map[string]any{"type": "message", "role": "developer", "content": []any{map[string]any{"type": "input_text", "text": "hidden instructions"}}}},
+		map[string]any{"timestamp": "2026-08-12T10:00:01Z", "type": "response_item", "payload": map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "done"}}}},
+	)
+
+	page, err := reader.Read("codex", testSessionID, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 2 || page.Entries[0].Text != "build it" || page.Entries[1].Text != "done" {
+		t.Fatalf("entries = %#v", page.Entries)
+	}
+}
+
+func TestPiConversationConfinesReportedPath(t *testing.T) {
+	reader, home := testReader(t)
+	path := filepath.Join(home, ".pi", "agent", "sessions", "--work--", "session.jsonl")
+	writeRows(t, path,
+		map[string]any{"type": "message", "id": "u1", "timestamp": "2026-08-12T10:00:00Z", "message": map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "question"}}}},
+		map[string]any{"type": "message", "id": "a1", "timestamp": "2026-08-12T10:00:01Z", "message": map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "response"}}}},
+		map[string]any{"type": "message", "id": "t1", "message": map[string]any{"role": "toolResult", "content": []any{map[string]any{"type": "text", "text": "secret output"}}}},
+	)
+	page, err := reader.Read("pi", path, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 2 {
+		t.Fatalf("entries = %#v", page.Entries)
+	}
+
+	external := filepath.Join(t.TempDir(), "outside.jsonl")
+	writeRows(t, external, map[string]any{"type": "message", "message": map[string]any{"role": "user", "content": "outside"}})
+	outside, err := reader.Read("pi", external, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outside.Available {
+		t.Fatal("path outside the pi session root was served")
+	}
+
+	link := filepath.Join(home, ".pi", "agent", "sessions", "--work--", "linked.jsonl")
+	if err := os.Symlink(external, link); err != nil {
+		t.Fatal(err)
+	}
+	linked, err := reader.Read("pi", link, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linked.Available {
+		t.Fatal("symlink outside the pi session root was served")
+	}
+}
+
+func TestConversationPagesOlderTurnsWithStableCursors(t *testing.T) {
+	reader, home := testReader(t)
+	path := filepath.Join(home, ".claude", "projects", "-work", testSessionID+".jsonl")
+	writeRows(t, path,
+		map[string]any{"type": "user", "message": map[string]any{"content": "one"}},
+		map[string]any{"type": "assistant", "message": map[string]any{"content": "two"}},
+		map[string]any{"type": "user", "message": map[string]any{"content": "three"}},
+	)
+	latest, err := reader.Read("claude", testSessionID, "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(latest.Entries) != 1 || latest.Entries[0].Text != "three" || !latest.HasMore {
+		t.Fatalf("latest page = %#v", latest)
+	}
+	older, err := reader.Read("claude", testSessionID, latest.Entries[0].ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(older.Entries) != 2 || older.Entries[0].Text != "one" || older.Entries[1].Text != "two" || older.HasMore {
+		t.Fatalf("older page = %#v", older)
+	}
+}
+
+func TestClaudeConversationAssociatesToolResultsWithCallingTurn(t *testing.T) {
+	reader, home := testReader(t)
+	path := filepath.Join(home, ".claude", "projects", "-work", testSessionID+".jsonl")
+	writeRows(t, path,
+		map[string]any{
+			"type": "assistant", "timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"content": []any{
+				map[string]any{"type": "text", "text": "I will inspect the file."},
+				map[string]any{"type": "tool_use", "id": "tool-1", "name": "Read", "input": map[string]any{"path": "README.md"}},
+			}},
+		},
+		map[string]any{
+			"type": "user", "timestamp": "2026-08-12T10:00:01Z",
+			"message": map[string]any{"content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "tool-1", "content": "file contents"},
+			}},
+		},
+	)
+
+	page, err := reader.Read("claude", testSessionID, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 || len(page.Entries[0].Tools) != 1 {
+		t.Fatalf("entries = %#v", page.Entries)
+	}
+	tool := page.Entries[0].Tools[0]
+	if tool.ID != "tool-1" || tool.Name != "Read" ||
+		!strings.Contains(tool.Input, `"path":"README.md"`) ||
+		tool.Output != "file contents" || tool.Error {
+		t.Fatalf("tool = %#v", tool)
+	}
+}
+
+func TestClaudeConversationKeepsArrayShapedUserPrompts(t *testing.T) {
+	reader, home := testReader(t)
+	path := filepath.Join(home, ".claude", "projects", "-work", testSessionID+".jsonl")
+	writeRows(t, path,
+		map[string]any{
+			"type": "user", "timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "hi"}}},
+		},
+	)
+
+	page, err := reader.Read("claude", testSessionID, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.Available || page.Total != 1 || len(page.Entries) != 1 {
+		t.Fatalf("page = %#v, want one visible turn", page)
+	}
+	if page.Entries[0].Role != "user" || page.Entries[0].Text != "hi" {
+		t.Fatalf("entries = %#v", page.Entries)
+	}
+}
+
+func TestClaudeConversationDropsToolResultOnlyUserRowButKeepsToolOutput(t *testing.T) {
+	reader, home := testReader(t)
+	path := filepath.Join(home, ".claude", "projects", "-work", testSessionID+".jsonl")
+	writeRows(t, path,
+		map[string]any{
+			"type": "assistant", "timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"content": []any{
+				map[string]any{"type": "text", "text": "I will inspect the file."},
+				map[string]any{"type": "tool_use", "id": "tool-1", "name": "Read", "input": map[string]any{"path": "README.md"}},
+			}},
+		},
+		map[string]any{
+			"type": "user", "timestamp": "2026-08-12T10:00:01Z",
+			"message": map[string]any{"content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "tool-1", "content": "file contents"},
+			}},
+		},
+	)
+
+	page, err := reader.Read("claude", testSessionID, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 || len(page.Entries) != 1 || page.Entries[0].Role != "assistant" {
+		t.Fatalf("entries = %#v, want only the calling assistant turn", page.Entries)
+	}
+	if len(page.Entries[0].Tools) != 1 || page.Entries[0].Tools[0].Output != "file contents" {
+		t.Fatalf("tools = %#v, want the tool output attached", page.Entries[0].Tools)
+	}
+}
+
+func TestClaudeConversationFiltersArrayShapedEnvelopes(t *testing.T) {
+	reader, home := testReader(t)
+	path := filepath.Join(home, ".claude", "projects", "-work", testSessionID+".jsonl")
+	writeRows(t, path,
+		map[string]any{
+			"type": "user", "timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"content": []any{
+				map[string]any{"type": "text", "text": "<system-reminder>hidden</system-reminder>"},
+			}},
+		},
+	)
+
+	page, err := reader.Read("claude", testSessionID, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 0 || len(page.Entries) != 0 {
+		t.Fatalf("entries = %#v, want the injected envelope filtered", page.Entries)
+	}
+}
+
+func TestClaudeConversationKeepsOnlyTextFromMixedUserBlocks(t *testing.T) {
+	reader, home := testReader(t)
+	path := filepath.Join(home, ".claude", "projects", "-work", testSessionID+".jsonl")
+	writeRows(t, path,
+		map[string]any{
+			"type": "assistant", "timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"content": []any{
+				map[string]any{"type": "tool_use", "id": "tool-1", "name": "Read", "input": map[string]any{"path": "README.md"}},
+			}},
+		},
+		map[string]any{
+			"type": "user", "timestamp": "2026-08-12T10:00:01Z",
+			"message": map[string]any{"content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "tool-1", "content": "secret file contents"},
+				map[string]any{"type": "text", "text": "now summarise it"},
+			}},
+		},
+	)
+
+	page, err := reader.Read("claude", testSessionID, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 2 || len(page.Entries) != 2 {
+		t.Fatalf("entries = %#v, want the assistant call and the user prompt", page.Entries)
+	}
+	entry := page.Entries[1]
+	if entry.Role != "user" || entry.Text != "now summarise it" {
+		t.Fatalf("entry = %#v, want only the text block", entry)
+	}
+	if strings.Contains(entry.Text, "secret file contents") || strings.Contains(entry.Text, "tool_result") {
+		t.Fatalf("entry text leaked tool_result payload: %q", entry.Text)
+	}
+}
+
+func TestClaudeConversationDropsEmptyArrayUserRow(t *testing.T) {
+	reader, home := testReader(t)
+	path := filepath.Join(home, ".claude", "projects", "-work", testSessionID+".jsonl")
+	writeRows(t, path,
+		map[string]any{
+			"type": "user", "timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"content": []any{}},
+		},
+	)
+
+	page, err := reader.Read("claude", testSessionID, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 0 || len(page.Entries) != 0 {
+		t.Fatalf("entries = %#v, want no turn for an empty content array", page.Entries)
+	}
+}
+
+func TestClaudeConversationRendersArrayShapedSlashCommands(t *testing.T) {
+	reader, home := testReader(t)
+	path := filepath.Join(home, ".claude", "projects", "-work", testSessionID+".jsonl")
+	writeRows(t, path,
+		map[string]any{
+			"type": "user", "timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"content": []any{map[string]any{
+				"type": "text",
+				"text": "<command-name>/clear</command-name><command-args>x</command-args>",
+			}}},
+		},
+		map[string]any{
+			"type": "user", "timestamp": "2026-08-12T10:00:01Z",
+			"message": map[string]any{"content": "<command-name>/clear</command-name><command-args>x</command-args>"},
+		},
+	)
+
+	page, err := reader.Read("claude", testSessionID, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 2 || len(page.Entries) != 2 {
+		t.Fatalf("entries = %#v, want both command rows", page.Entries)
+	}
+	if page.Entries[0].Text != "/clear x" || page.Entries[1].Text != "/clear x" {
+		t.Fatalf("entries = %#v, want array and string forms rendered identically", page.Entries)
+	}
+}
+
+// Regression guard for the per-block envelope filter. Before array-shaped user
+// records were parsed at all they were dropped wholesale, so an injected
+// <system-reminder> could not reach the phone. Parsing them made it reachable:
+// humanClaudeText anchors its envelope checks on the start of the string it is
+// given, so filtering the JOINED block text lets an envelope in any block after
+// the first through. Filtering must happen per block.
+func TestClaudeConversationDropsEnvelopeBlocksAfterTheFirst(t *testing.T) {
+	reader, home := testReader(t)
+	path := filepath.Join(home, ".claude", "projects", "-work", testSessionID+".jsonl")
+	writeRows(t, path,
+		map[string]any{"type": "user", "uuid": "u1", "timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"content": []any{
+				map[string]any{"type": "text", "text": "please refactor the parser"},
+				map[string]any{"type": "text", "text": "<system-reminder>INJECTED-SECRET</system-reminder>"},
+			}}},
+		map[string]any{"type": "assistant", "uuid": "a1", "timestamp": "2026-08-12T10:00:01Z",
+			"message": map[string]any{"content": []any{map[string]any{"type": "text", "text": "done"}}}},
+	)
+
+	page, err := reader.Read("claude", testSessionID, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 2 {
+		t.Fatalf("entries = %#v, want the prompt and the answer", page.Entries)
+	}
+	if got := page.Entries[0].Text; got != "please refactor the parser" {
+		t.Errorf("user text = %q, want the prompt block only", got)
+	}
+	for _, entry := range page.Entries {
+		if strings.Contains(entry.Text, "INJECTED-SECRET") {
+			t.Fatalf("injected system-reminder block reached the conversation view: %q", entry.Text)
+		}
+	}
+}
+
+// An envelope in the FIRST block must still suppress that block while later
+// real prompt text survives, proving the filter is per block in both directions
+// rather than an all-or-nothing check on the record.
+func TestClaudeConversationKeepsPromptWhenEnvelopeComesFirst(t *testing.T) {
+	reader, home := testReader(t)
+	path := filepath.Join(home, ".claude", "projects", "-work", testSessionID+".jsonl")
+	writeRows(t, path,
+		map[string]any{"type": "user", "uuid": "u1", "timestamp": "2026-08-12T10:00:00Z",
+			"message": map[string]any{"content": []any{
+				map[string]any{"type": "text", "text": "<system-reminder>INJECTED-SECRET</system-reminder>"},
+				map[string]any{"type": "text", "text": "the actual question"},
+			}}},
+	)
+
+	page, err := reader.Read("claude", testSessionID, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 || page.Entries[0].Text != "the actual question" {
+		t.Fatalf("entries = %#v, want only the real prompt text", page.Entries)
+	}
+}
+
+func TestClaudeConversationReadForSelectsCurrentProjectOnDuplicateID(t *testing.T) {
+	reader, home := testReader(t)
+	projects := filepath.Join(home, ".claude", "projects")
+	writeRows(t, filepath.Join(projects, "-old", testSessionID+".jsonl"),
+		map[string]any{"type": "assistant", "uuid": "old", "message": map[string]any{"content": "old response"}})
+	writeRows(t, filepath.Join(projects, "-work", testSessionID+".jsonl"),
+		map[string]any{"type": "assistant", "uuid": "current", "message": map[string]any{"content": "current response"}})
+
+	page, err := reader.ReadFor("claude", "/work", testSessionID, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.Available || len(page.Entries) != 1 || page.Entries[0].Text != "current response" {
+		t.Fatalf("page = %#v, want the transcript from the current project only", page)
+	}
+}
+
+func TestClaudeConversationReadForDistinguishesDottedProjectDirectory(t *testing.T) {
+	reader, home := testReader(t)
+	projects := filepath.Join(home, ".claude", "projects")
+	writeRows(t, filepath.Join(projects, "-home-cv-Development-test-com", testSessionID+".jsonl"),
+		map[string]any{"type": "assistant", "uuid": "dotted", "message": map[string]any{"content": "dotted response"}})
+	writeRows(t, filepath.Join(projects, "-home-cv-Development-testcom", testSessionID+".jsonl"),
+		map[string]any{"type": "assistant", "uuid": "plain", "message": map[string]any{"content": "plain response"}})
+
+	for _, test := range []struct {
+		cwd  string
+		want string
+	}{
+		{cwd: "/home/cv/Development/test.com", want: "dotted response"},
+		{cwd: "/home/cv/Development/testcom", want: "plain response"},
+	} {
+		t.Run(filepath.Base(test.cwd), func(t *testing.T) {
+			page, err := reader.ReadFor("claude", test.cwd, testSessionID, "", 80)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !page.Available || len(page.Entries) != 1 || page.Entries[0].Text != test.want {
+				t.Fatalf("page = %#v, want %q from the selected project directory", page, test.want)
+			}
+		})
+	}
+}
+
+func TestClaudeConversationReadForRejectsProjectDirectoryEscape(t *testing.T) {
+	reader, home := testReader(t)
+	external := filepath.Join(t.TempDir(), "external-project")
+	writeRows(t, filepath.Join(external, testSessionID+".jsonl"),
+		map[string]any{"type": "assistant", "uuid": "outside", "message": map[string]any{"content": "outside response"}})
+	projects := filepath.Join(home, ".claude", "projects")
+	if err := os.MkdirAll(projects, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(projects, "-work")); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := reader.ReadFor("claude", "/work", testSessionID, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Available {
+		t.Fatalf("page = %#v, want an escaping project symlink rejected", page)
+	}
+}
+
+func TestClaudeConversationHidesHarnessGeneratedUserRows(t *testing.T) {
+	reader, home := testReader(t)
+	path := filepath.Join(home, ".claude", "projects", "-work", testSessionID+".jsonl")
+	user := func(id string, extra map[string]any, content any) map[string]any {
+		row := map[string]any{"type": "user", "uuid": id, "message": map[string]any{"content": content}}
+		for key, value := range extra {
+			row[key] = value
+		}
+		return row
+	}
+	writeRows(t, path,
+		user("u1", nil, "real question"),
+		user("u2", map[string]any{"isMeta": true}, []any{map[string]any{"type": "text", "text": "Base directory for this skill: /x\n\n# Skill body"}}),
+		user("u3", map[string]any{"isMeta": true}, "Another Claude session sent a message:\n<cross-session-message>hi</cross-session-message>"),
+		user("u4", map[string]any{"isCompactSummary": true}, "This session is being continued from a previous conversation..."),
+		user("u5", nil, "<command-message>loop</command-message>\n<command-name>/loop</command-name>\n<command-args>5m check</command-args>"),
+		user("u6", nil, "[Request interrupted by user]"),
+		user("u7", nil, "<bash-input>ls</bash-input>"),
+		user("u8", nil, "<bash-stdout>file1\nfile2</bash-stdout><bash-stderr></bash-stderr>"),
+		user("u9", nil, "<bash-stdout></bash-stdout><bash-stderr>zsh: command not found</bash-stderr>"),
+		user("u14", nil, "<bash-stdout>cat: <bash-stdout>x</bash-stdout> and </bash-stderr></bash-stdout><bash-stderr></bash-stderr>"),
+		user("u17", nil, "<bash-stdout>x</bash-stdout> explain this <bash-stderr></bash-stderr>"),
+		user("u18", nil, "<bash-stdout>x</bash-stdout> explain this"),
+		user("u19", nil, "<bash-stdout>stdout only</bash-stdout>"),
+		user("u20", nil, "<bash-input>a</bash-input> and <bash-input>b</bash-input>"),
+		user("u21", nil, "<bash-input>echo '</bash-input>'</bash-input>"),
+		user("u15", nil, "<command-message>x</command-message> what does <command-name>/foo</command-name> mean?"),
+		user("u16", nil, "<command-message></command-message><command-name></command-name><command-args></command-args>"),
+		user("u10", nil, "[Request interrupted by user] why does this keep happening?"),
+		user("u11", nil, "<bash-input>ls</bash-input> explain this output"),
+		user("u12", nil, "<command-message>hello</command-message> explain this tag"),
+		user("u13", nil, []any{map[string]any{"type": "text", "text": "[Request interrupted by user] block form"}}),
+	)
+
+	page, err := reader.Read("claude", testSessionID, "", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(page.Entries))
+	for _, entry := range page.Entries {
+		got = append(got, entry.Text)
+	}
+	want := []string{
+		"real question", "/loop 5m check",
+		"[Request interrupted by user]",
+		"! ls",
+		"<bash-stdout>x</bash-stdout> explain this <bash-stderr></bash-stderr>",
+		"<bash-stdout>x</bash-stdout> explain this",
+		"<bash-input>a</bash-input> and <bash-input>b</bash-input>",
+		"! echo '</bash-input>'",
+		"<command-message>x</command-message> what does <command-name>/foo</command-name> mean?",
+		"[Request interrupted by user] why does this keep happening?",
+		"<bash-input>ls</bash-input> explain this output",
+		"<command-message>hello</command-message> explain this tag",
+		"[Request interrupted by user] block form",
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("visible turns = %q, want %q", got, want)
+	}
+}

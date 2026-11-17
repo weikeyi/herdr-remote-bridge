@@ -1,0 +1,531 @@
+package speech
+
+import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+)
+
+// publishedVoices serves the pinned catalog from a local server, keeping the
+// digests the code checks in charge of the outcome.
+func publishedVoices(t *testing.T, corrupt map[string]bool) *httptest.Server {
+	t.Helper()
+	files := map[string][]byte{}
+	for language, entry := range catalog {
+		model := []byte("model for " + language)
+		config := []byte(`{"language":"` + language + `"}`)
+		files["/"+entry.path+"/"+entry.name+".onnx"] = model
+		files["/"+entry.path+"/"+entry.name+".onnx.json"] = config
+		if corrupt[language] {
+			files["/"+entry.path+"/"+entry.name+".onnx"] = []byte("tampered")
+		}
+		entry.modelSHA = digestOf(model)
+		entry.configSHA = digestOf(config)
+		if corrupt[language] {
+			// Leave the pinned digest describing the honest bytes.
+			entry.modelSHA = digestOf(model)
+		}
+		catalog[language] = entry
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, published := files[request.URL.Path]
+		if !published {
+			http.NotFound(writer, request)
+			return
+		}
+		writer.Write(body)
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("HERDR_PIPER_VOICE_BASE_URL", server.URL)
+	return server
+}
+
+func digestOf(body []byte) string {
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
+}
+
+// publishedRuntime serves an engine archive shaped like the real one, including
+// the relative SONAME links its loader needs.
+func publishedRuntime(t *testing.T) {
+	t.Helper()
+	publishedRuntimeWithEngine(t, []byte("#!/bin/sh\nexit 0\n"))
+}
+
+func publishedRuntimeWithEngine(t *testing.T, engine []byte) {
+	t.Helper()
+	var archive bytes.Buffer
+	compressor := gzip.NewWriter(&archive)
+	writer := tar.NewWriter(compressor)
+	for _, entry := range []struct {
+		name string
+		mode int64
+		body []byte
+		link string
+	}{
+		{"piper/", 0o755, nil, ""},
+		{"piper/piper", 0o755, engine, ""},
+		{"piper/espeak-ng-data/phontab", 0o644, []byte("data"), ""},
+		{"piper/libonnxruntime.so.1.14.1", 0o644, []byte("library"), ""},
+		{"piper/libonnxruntime.so.1", 0o644, nil, "libonnxruntime.so.1.14.1"},
+		{"piper/libonnxruntime.so", 0o644, nil, "libonnxruntime.so.1"},
+	} {
+		header := &tar.Header{Name: entry.name, Mode: entry.mode, Size: int64(len(entry.body)), Typeflag: tar.TypeReg}
+		if entry.link != "" {
+			header.Typeflag = tar.TypeSymlink
+			header.Linkname = entry.link
+			header.Size = 0
+		} else if entry.body == nil {
+			header.Typeflag = tar.TypeDir
+			header.Size = 0
+		}
+		if err := writer.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write(entry.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := compressor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	payload := archive.Bytes()
+	for target, asset := range runtimeAssets {
+		asset.digest = digestOf(payload)
+		runtimeAssets[target] = asset
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Write(payload)
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("HERDR_PIPER_RUNTIME_BASE_URL", server.URL)
+}
+
+// restoreCatalog keeps a test's fixture digests from leaking into the next one.
+func restoreCatalog(t *testing.T) {
+	t.Helper()
+	voices := map[string]voice{}
+	for language, entry := range catalog {
+		voices[language] = entry
+	}
+	assets := map[string]struct{ name, digest string }{}
+	for target, asset := range runtimeAssets {
+		assets[target] = asset
+	}
+	t.Cleanup(func() {
+		for language, entry := range voices {
+			catalog[language] = entry
+		}
+		for target, asset := range assets {
+			runtimeAssets[target] = asset
+		}
+	})
+}
+
+func requirePublishedRuntime(t *testing.T) {
+	t.Helper()
+	if _, ok := runtimeAssets[runtime.GOOS+"/"+runtime.GOARCH]; !ok {
+		t.Skipf("no published speech runtime for %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+}
+
+func TestInstallCachesTheEngineAndVoiceOnce(t *testing.T) {
+	requirePublishedRuntime(t)
+	restoreCatalog(t)
+	binDir := t.TempDir()
+	hermeticEnv(t, binDir)
+	cache := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cache)
+	publishedVoices(t, nil)
+	publishedRuntime(t)
+	t.Setenv("TMPDIR", filepath.Join(t.TempDir(), "unavailable"))
+
+	if got := strings.Join(missing([]string{"fr"}), ","); got != "runtime,fr" {
+		t.Fatalf("missing() = %q, want \"runtime,fr\"", got)
+	}
+	if err := Install(context.Background(), "fr"); err != nil {
+		t.Fatalf("Install(fr) error = %v", err)
+	}
+
+	engine := filepath.Join(cache, "herdr-mobile-relay", "speech", "runtime", "piper", "piper")
+	if info, err := os.Stat(engine); err != nil || info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("cached engine = %v (%v), want an executable", info, err)
+	}
+	for name, target := range map[string]string{
+		"libonnxruntime.so":   "libonnxruntime.so.1",
+		"libonnxruntime.so.1": "libonnxruntime.so.1.14.1",
+	} {
+		path := filepath.Join(filepath.Dir(engine), name)
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("%s = %v (%v), want a symlink", name, info, err)
+		}
+		link, err := os.Readlink(path)
+		if err != nil || link != target {
+			t.Fatalf("%s target = %q (%v), want %q", name, link, err, target)
+		}
+	}
+	if body, err := os.ReadFile(filepath.Join(filepath.Dir(engine), "libonnxruntime.so")); err != nil || string(body) != "library" {
+		t.Fatalf("reading the chained library alias = %q (%v), want library", body, err)
+	}
+	if items := missing([]string{"fr"}); len(items) != 0 {
+		t.Fatalf("missing() after install = %v, want none", items)
+	}
+	status := Status()
+	if !status.EngineInstalled {
+		t.Fatal("Status() reports no engine after installing one")
+	}
+	french := voiceStatus(t, status, "fr")
+	if !french.Installed || french.Engine != "piper" || french.Bytes <= 0 {
+		t.Fatalf("French status = %+v, want an installed piper voice", french)
+	}
+	if english := voiceStatus(t, status, "en"); english.Installed || english.Engine != "" {
+		t.Fatalf("English status = %+v, want no voice and no engine for it", english)
+	}
+	if got := strings.Join(status.Languages, ","); got != "fr" {
+		t.Fatalf("Status().Languages = %q, want \"fr\"", got)
+	}
+
+	// A second install is a no-op: this is what keeps a relay update from
+	// downloading the voices again.
+	before, err := os.Stat(filepath.Join(cache, "herdr-mobile-relay", "speech", "voices", "fr_FR-siwis-medium.onnx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Install(context.Background(), "fr"); err != nil {
+		t.Fatalf("second Install(fr) error = %v", err)
+	}
+	after, err := os.Stat(filepath.Join(cache, "herdr-mobile-relay", "speech", "voices", "fr_FR-siwis-medium.onnx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatal("Install() re-downloaded a cached voice")
+	}
+
+	if err := Remove("fr"); err != nil {
+		t.Fatalf("Remove(fr) error = %v", err)
+	}
+	if items := strings.Join(missing([]string{"fr"}), ","); items != "fr" {
+		t.Fatalf("missing() after remove = %q, want \"fr\"", items)
+	}
+	if err := Remove("fr"); err != nil {
+		t.Fatalf("Remove() on an absent voice error = %v", err)
+	}
+}
+
+type testTarEntry struct {
+	name string
+	mode int64
+	body []byte
+	link string
+}
+
+func writeTestArchive(t *testing.T, entries []testTarEntry) string {
+	t.Helper()
+	var archive bytes.Buffer
+	compressor := gzip.NewWriter(&archive)
+	writer := tar.NewWriter(compressor)
+	for _, entry := range entries {
+		header := &tar.Header{
+			Name:     entry.name,
+			Mode:     entry.mode,
+			Size:     int64(len(entry.body)),
+			Typeflag: tar.TypeReg,
+		}
+		if entry.link != "" {
+			header.Typeflag = tar.TypeSymlink
+			header.Linkname = entry.link
+			header.Size = 0
+		} else if entry.body == nil {
+			header.Typeflag = tar.TypeDir
+			header.Size = 0
+		}
+		if err := writer.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write(entry.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := compressor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "runtime.tar.gz")
+	if err := os.WriteFile(path, archive.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestExtractTarGzRejectsChainedTraversal(t *testing.T) {
+	archive := writeTestArchive(t, []testTarEntry{
+		{name: "piper/", mode: 0o755},
+		{name: "piper/a", mode: 0o755, link: "."},
+		{name: "piper/b", mode: 0o755, link: "a/../.."},
+		{name: "piper/b/escaped", mode: 0o644, body: []byte("outside")},
+	})
+	destination := t.TempDir()
+	outside := filepath.Join(filepath.Dir(destination), "escaped")
+	_ = os.Remove(outside)
+	err := extractTarGz(archive, destination)
+	if err == nil || !strings.Contains(err.Error(), "unsafe link target") {
+		t.Fatalf("extractTarGz() error = %v, want unsafe link target", err)
+	}
+	if _, err := os.Lstat(outside); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("path outside extraction root = %v, want absent", err)
+	}
+}
+
+func TestBrokenCachedRuntimeIsReportedMissing(t *testing.T) {
+	requirePublishedRuntime(t)
+	restoreCatalog(t)
+	hermeticEnv(t, t.TempDir())
+	cache := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cache)
+	engineDir := filepath.Dir(runtimeBinary())
+	if err := os.MkdirAll(engineDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeExecutable(t, engineDir, "piper", "exit 1")
+
+	status := Status()
+	if status.EngineInstalled {
+		t.Fatal("Status() reports a broken cached engine as installed")
+	}
+	if got := strings.Join(missing([]string{"en"}), ","); got != "runtime,en" {
+		t.Fatalf("missing() = %q, want runtime,en", got)
+	}
+}
+
+func TestFailedRuntimeValidationKeepsExistingEngine(t *testing.T) {
+	requirePublishedRuntime(t)
+	restoreCatalog(t)
+	hermeticEnv(t, t.TempDir())
+	cache := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cache)
+	current := runtimeBinary()
+	if err := os.MkdirAll(filepath.Dir(current), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := []byte("#!/bin/sh\nexit 0\n")
+	if err := os.WriteFile(current, old, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	publishedRuntimeWithEngine(t, []byte("#!/bin/sh\nexit 1\n"))
+
+	err := installRuntime(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "validate the speech engine") {
+		t.Fatalf("installRuntime() error = %v, want validation failure", err)
+	}
+	if body, readErr := os.ReadFile(current); readErr != nil || string(body) != string(old) {
+		t.Fatalf("existing engine = %q (%v), want the old engine", body, readErr)
+	}
+}
+
+func TestReinstallRuntimePreservesVoices(t *testing.T) {
+	requirePublishedRuntime(t)
+	restoreCatalog(t)
+	hermeticEnv(t, t.TempDir())
+	cache := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cache)
+	voices := voiceDir()
+	if err := os.MkdirAll(voices, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	model := installVoice(t, voices, "en_US-lessac-medium.onnx", true)
+	before, err := os.ReadFile(model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishedRuntime(t)
+
+	var output, errorOutput bytes.Buffer
+	if err := Run(context.Background(), []string{"reinstall-runtime"}, &output, &errorOutput); err != nil {
+		t.Fatalf("reinstall-runtime error = %v", err)
+	}
+	if !strings.Contains(output.String(), "Speech engine reinstalled") {
+		t.Fatalf("reinstall-runtime output = %q", output.String())
+	}
+	if after, err := os.ReadFile(model); err != nil || string(after) != string(before) {
+		t.Fatalf("voice model after reinstall = %q (%v), want unchanged", after, err)
+	}
+	if _, err := os.Stat(runtimeBinary()); err != nil {
+		t.Fatalf("reinstalled runtime = %v", err)
+	}
+}
+
+func TestConcurrentVoiceInstallsUseIndependentStaging(t *testing.T) {
+	restoreCatalog(t)
+	binDir := t.TempDir()
+	writeExecutable(t, binDir, "piper", ":")
+	hermeticEnv(t, binDir)
+	t.Setenv("PATH", binDir)
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	publishedVoices(t, nil)
+
+	var wait sync.WaitGroup
+	errorsSeen := make(chan error, 2)
+	for range 2 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			errorsSeen <- Install(context.Background(), "fr")
+		}()
+	}
+	wait.Wait()
+	close(errorsSeen)
+	for err := range errorsSeen {
+		if err != nil {
+			t.Fatalf("concurrent Install(fr) error = %v", err)
+		}
+	}
+}
+
+func TestRuntimeCatalogDoesNotTreatIntelPiperAsAppleSiliconNative(t *testing.T) {
+	if _, published := runtimeAssets["darwin/arm64"]; published {
+		t.Fatal("darwin/arm64 must not install the Intel-only Piper runtime")
+	}
+	if voiceManagementSupported(false, "darwin", "arm64") {
+		t.Fatal("darwin/arm64 must not advertise unavailable voice downloads")
+	}
+	if !voiceManagementSupported(true, "darwin", "arm64") {
+		t.Fatal("an installed native Piper must keep voice management available")
+	}
+	if !voiceManagementSupported(false, "darwin", "amd64") {
+		t.Fatal("darwin/amd64 should advertise its published Piper runtime")
+	}
+}
+
+func TestInstallRejectsTamperedBytesAndUnknownLanguages(t *testing.T) {
+	restoreCatalog(t)
+	binDir := t.TempDir()
+	writeExecutable(t, binDir, "piper", ":")
+	hermeticEnv(t, binDir)
+	t.Setenv("PATH", binDir)
+	cache := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cache)
+	publishedVoices(t, map[string]bool{"de": true})
+
+	err := Install(context.Background(), "de")
+	if err == nil || !strings.Contains(err.Error(), "published checksum") {
+		t.Fatalf("Install(de) error = %v, want a checksum rejection", err)
+	}
+	voices := filepath.Join(cache, "herdr-mobile-relay", "speech", "voices")
+	for _, leftover := range []string{"de_DE-thorsten-medium.onnx", "de_DE-thorsten-medium.onnx.part"} {
+		if _, err := os.Stat(filepath.Join(voices, leftover)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s survived a failed download", leftover)
+		}
+	}
+	if err := Install(context.Background(), "ja"); !errors.Is(err, ErrUsage) {
+		t.Fatalf("Install(ja) error = %v, want a usage error", err)
+	}
+	if err := Remove("ja"); !errors.Is(err, ErrUsage) {
+		t.Fatalf("Remove(ja) error = %v, want a usage error", err)
+	}
+}
+
+func TestRunReportsAndInstallsFromTheCommandLine(t *testing.T) {
+	requirePublishedRuntime(t)
+	restoreCatalog(t)
+	binDir := t.TempDir()
+	hermeticEnv(t, binDir)
+	cache := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cache)
+	publishedVoices(t, nil)
+	publishedRuntime(t)
+
+	var out, errOut bytes.Buffer
+	if err := Run(context.Background(), []string{"missing"}, &out, &errOut); err != nil {
+		t.Fatalf("missing error = %v", err)
+	}
+	// English is the only voice a computer downloads on its own.
+	if got := out.String(); got != "runtime\nen\n" {
+		t.Fatalf("default missing output = %q, want the engine and English", got)
+	}
+
+	out.Reset()
+	if err := Run(context.Background(), []string{"install"}, &out, &errOut); err != nil {
+		t.Fatalf("default install error = %v", err)
+	}
+	if !strings.Contains(out.String(), "Downloading the en voice") || strings.Contains(out.String(), "Downloading the fr voice") {
+		t.Fatalf("default install output = %q, want English alone", out.String())
+	}
+
+	out.Reset()
+	if err := Run(context.Background(), []string{"missing", "--languages", "es,zh"}, &out, &errOut); err != nil {
+		t.Fatalf("missing error = %v", err)
+	}
+	if got := out.String(); got != "es\nzh\n" {
+		t.Fatalf("missing output = %q", got)
+	}
+
+	out.Reset()
+	if err := Run(context.Background(), []string{"install", "--languages", "es"}, &out, &errOut); err != nil {
+		t.Fatalf("install error = %v", err)
+	}
+	if !strings.Contains(out.String(), "Downloading the es voice") || !strings.Contains(out.String(), "cached in") {
+		t.Fatalf("install output = %q", out.String())
+	}
+
+	out.Reset()
+	if err := Run(context.Background(), []string{"install", "--languages", "es"}, &out, &errOut); err != nil {
+		t.Fatalf("second install error = %v", err)
+	}
+	if !strings.Contains(out.String(), "already cached") {
+		t.Fatalf("second install output = %q", out.String())
+	}
+
+	out.Reset()
+	if err := Run(context.Background(), []string{"list"}, &out, &errOut); err != nil {
+		t.Fatalf("list error = %v", err)
+	}
+	if !strings.Contains(out.String(), "es es_ES-davefx-medium (cached") ||
+		!strings.Contains(out.String(), "spoken by piper") ||
+		!strings.Contains(out.String(), "fr fr_FR-siwis-medium (not downloaded") {
+		t.Fatalf("list output = %q", out.String())
+	}
+
+	out.Reset()
+	if err := Run(context.Background(), []string{"remove", "--languages", "es"}, &out, &errOut); err != nil {
+		t.Fatalf("remove error = %v", err)
+	}
+	if !strings.Contains(out.String(), "Removed the es voice") {
+		t.Fatalf("remove output = %q", out.String())
+	}
+
+	for _, args := range [][]string{{}, {"list", "--languages", "tlh"}, {"explode"}, {"list", "extra"}} {
+		if err := Run(context.Background(), args, &out, &errOut); !errors.Is(err, ErrUsage) {
+			t.Fatalf("Run(%v) error = %v, want a usage error", args, err)
+		}
+	}
+}
+
+func voiceStatus(t *testing.T, status Catalog, language string) VoiceStatus {
+	t.Helper()
+	for _, current := range status.Voices {
+		if current.Language == language {
+			return current
+		}
+	}
+	t.Fatalf("Status() has no entry for %s", language)
+	return VoiceStatus{}
+}

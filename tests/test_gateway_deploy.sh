@@ -1,0 +1,569 @@
+#!/usr/bin/env bash
+# Covers relay/gateway-deploy.sh: the bundle it writes and the SSH deployment it
+# drives. Every remote step runs against stub ssh/curl binaries, so the test
+# never touches a network or a real server.
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/herdr-gateway-deploy-test.XXXXXX")"
+trap 'status=$?; rm -rf "$WORK_DIR"; exit $status' EXIT
+
+export HOME="$WORK_DIR/home"
+STUB_DIR="$WORK_DIR/bin"
+mkdir -p "$STUB_DIR" "$HOME/.local/bin"
+for tool in launchctl systemctl cloudflared tailscale; do
+    printf '#!/bin/sh\necho "unexpected %s" >&2\nexit 1\n' "$tool" > "$HOME/.local/bin/$tool"
+    chmod +x "$HOME/.local/bin/$tool"
+done
+
+SSH_LOG="$WORK_DIR/ssh.log"
+export SSH_LOG
+cat > "$STUB_DIR/ssh" <<'EOF'
+#!/usr/bin/env bash
+# Records the remote command and answers the handful of probes the deployment
+# makes. The tar step must drain stdin or the local tar reports a broken pipe.
+set -uo pipefail
+target=""
+command=""
+skip_value=false
+for argument in "$@"; do
+    if [ "$skip_value" = true ]; then
+        skip_value=false
+        printf '%s\n' "$argument" > "$STUB_STATE/identity"
+        continue
+    fi
+    case "$argument" in
+        -i) skip_value=true ;;
+        -o | -O) continue ;;
+        -*) continue ;;
+        ControlMaster=* | ControlPath=* | ControlPersist=* | ConnectTimeout=* | exit) continue ;;
+        *)
+            if [ -z "$target" ]; then
+                target="$argument"
+            else
+                command="$argument"
+            fi
+            ;;
+    esac
+done
+[ -n "$command" ] || exit 0
+printf '%s\t%s\n' "$target" "$command" >> "$SSH_LOG"
+case "$command" in
+    'id -u') printf '1000\n'; exit 0 ;;
+    *'docker compose version'*)
+        if [ -f "$STUB_STATE/docker-missing" ]; then
+            exit 127
+        fi
+        exit 0
+        ;;
+    *'docker version'*)
+        if [ -f "$STUB_STATE/old-docker" ]; then
+            printf '24.0.7\n'
+        else
+            printf '29.7.2\n'
+        fi
+        exit 0
+        ;;
+    *'curl -6'*)
+        [ ! -f "$STUB_STATE/no-v6" ] || exit 7
+        exit 0
+        ;;
+    *get.docker.com*)
+        rm -f "$STUB_STATE/docker-missing"
+        exit 0
+        ;;
+    *'tar -xzf -'*)
+        cat > "$STUB_STATE/uploaded.tar.gz"
+        if [ -n "${REMOTE_FIXTURE_DIR:-}" ]; then
+            # Execute the actual upload command in an isolated local server directory.
+            bash -c "${command#sudo -n }" < "$STUB_STATE/uploaded.tar.gz"
+            exit $?
+        fi
+        exit 0
+        ;;
+    *'docker compose up -d --build'*)
+        if [ -n "${REMOTE_FIXTURE_DIR:-}" ]; then
+            env -u HERDR_GATEWAY_REGISTRATION_TOKEN -u HERDR_GATEWAY_ALLOWED_RELAY_IDS \
+                docker compose --project-directory "$REMOTE_FIXTURE_DIR" \
+                -f "$REMOTE_FIXTURE_DIR/docker-compose.yml" config --format json \
+                > "$STUB_STATE/recreated-environment.json" || exit $?
+        fi
+        : > "$STUB_STATE/started"
+        exit 0
+        ;;
+    *healthz*)
+        [ -f "$STUB_STATE/started" ] || exit 7
+        exit 0
+        ;;
+esac
+exit 0
+EOF
+chmod 700 "$STUB_DIR/ssh"
+
+STUB_STATE="$WORK_DIR/state"
+mkdir -p "$STUB_STATE"
+export STUB_STATE
+
+cat > "$STUB_DIR/curl" <<'EOF'
+#!/bin/sh
+# The public /healthz probe. Answers only once the stub server is "started", so
+# the script cannot record a gateway URL it never reached.
+for argument in "$@"; do
+    case "$argument" in
+        *"/healthz") [ -f "$STUB_STATE/started" ] || exit 7 ;;
+    esac
+done
+printf '{"ok":true,"relays":0,"clients":0,"uptime_seconds":1}\n'
+EOF
+chmod 700 "$STUB_DIR/curl"
+
+PATH="$STUB_DIR:$PATH"
+export PATH
+
+NORMALIZE_BIN="$STUB_DIR/herdr-mobile-relay"
+cat > "$NORMALIZE_BIN" <<'EOF'
+#!/bin/sh
+# Isolates this shell test from any relay binary in the developer's data dir.
+# Callers pass either a bare host or the https:// form the wss:// entries are
+# rewritten to, exactly as the compiled normalizer sees them.
+if [ "$1" = tailscale ] && [ "$2" = off ]; then
+    printf '%s\n' "$*" >> "$STUB_STATE/tailscale.log"
+    exit 0
+fi
+test "$1" = "normalize-origin" || exit 2
+test "$2" = "--allow-loopback-http" || exit 2
+host="${3#https://}"
+case "$host" in
+    gw.example.test | community-a.example.test | community-b.example.test)
+        printf 'https://%s\n' "$host"
+        ;;
+    *) exit 2 ;;
+esac
+EOF
+chmod 700 "$NORMALIZE_BIN"
+export HERDR_RELAY_BIN="$NORMALIZE_BIN"
+# A published community list, so the final subscription default has cold
+# fallbacks. The compiled default is a real hostname and must never be reached.
+export HERDR_COMMUNITY_GATEWAY_URL="wss://community-a.example.test,wss://community-b.example.test"
+
+HOSTNAME_UNDER_TEST="gw.example.test"
+export HERDR_GATEWAY_DEPLOY_HOST="$HOSTNAME_UNDER_TEST"
+export HERDR_GATEWAY_DEPLOY_EMAIL="ops@example.test"
+
+run_deploy() {
+    OUTPUT="$WORK_DIR/output.log"
+    set +e
+    (cd "$WORK_DIR" && bash "$REPO_DIR/relay/gateway-deploy.sh" </dev/null) \
+        > "$OUTPUT" 2>&1
+    STATUS=$?
+    set -e
+}
+
+fail() {
+    echo "FAIL: $1" >&2
+    sed -n '1,120p' "$OUTPUT" >&2
+    exit 1
+}
+
+# --- Bundle only: no server given, nothing deployed ---------------------------
+BUNDLE_DIR="$WORK_DIR/bundle-only"
+export HERDR_GATEWAY_DEPLOY_DIR="$BUNDLE_DIR"
+export HERDR_RELAY_ENV="$WORK_DIR/relay-bundle-only.env"
+: > "$HERDR_RELAY_ENV"
+run_deploy
+[ "$STATUS" -eq 0 ] || fail "bundle-only run exited $STATUS"
+
+for FILE in docker-compose.yml Caddyfile .env README.md; do
+    [ -f "$BUNDLE_DIR/$FILE" ] || fail "bundle is missing $FILE"
+done
+for SOURCE in Dockerfile.gateway go.mod go.sum \
+    cmd/herdr-gateway/main.go internal/gateway/server.go \
+    internal/gatewaywire/gatewaywire.go; do
+    [ -f "$BUNDLE_DIR/gateway-source/$SOURCE" ] ||
+        fail "bundle is missing gateway-source/$SOURCE"
+done
+
+# The server builds from the bundled source: no GitHub context, no Go toolchain.
+if grep -Fq 'github.com/0cv/herdr-mobile-relay.git' "$BUNDLE_DIR/docker-compose.yml"; then
+    fail "compose file still builds from a GitHub context"
+fi
+grep -Fq 'context: ${HERDR_GATEWAY_BUILD_CONTEXT:-./gateway-source}' \
+    "$BUNDLE_DIR/docker-compose.yml" || fail "compose file lost the bundled build context"
+grep -Fq 'HERDR_GATEWAY_BUILD_CONTEXT="./gateway-source"' "$BUNDLE_DIR/.env" ||
+    fail ".env lost the bundled build context"
+GATEWAY_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$REPO_DIR/herdr-plugin.toml")"
+grep -Fq "HERDR_GATEWAY_VERSION: \${HERDR_GATEWAY_VERSION:-$GATEWAY_VERSION}" \
+    "$BUNDLE_DIR/docker-compose.yml" || fail "compose file does not pass the gateway release to the build"
+grep -Fq "HERDR_GATEWAY_VERSION=$GATEWAY_VERSION" "$BUNDLE_DIR/.env" ||
+    fail ".env does not record the deployed gateway release"
+grep -Eq '^HERDR_GATEWAY_REVISION=[0-9a-f]{40}$' "$BUNDLE_DIR/.env" ||
+    fail ".env does not record the deployed gateway revision"
+grep -Fq 'ARG HERDR_GATEWAY_VERSION=dev' "$BUNDLE_DIR/gateway-source/Dockerfile.gateway" ||
+    fail "gateway image has no build-version input"
+grep -Fq "email ops@example.test" "$BUNDLE_DIR/Caddyfile" || fail "Caddyfile lost the ACME contact"
+
+# A published port answers on IPv6 only from a v6-enabled network, and Let's
+# Encrypt validates over IPv6 whenever the name has an AAAA record.
+grep -Fq 'enable_ipv6: true' "$BUNDLE_DIR/docker-compose.yml" ||
+    fail "compose file does not give the stack an IPv6 network"
+
+# Address discovery is published directly on the host: Caddy cannot carry raw
+# UDP, so a bundle that loses this port loses off-LAN direct connections.
+grep -Fq '"3478:3478/udp"' "$BUNDLE_DIR/docker-compose.yml" ||
+    fail "compose file does not publish the address discovery port"
+grep -Fq 'HERDR_GATEWAY_STUN_ADDR' "$BUNDLE_DIR/.env" ||
+    fail ".env lost the address discovery knob"
+
+# ":-" would fold an empty .env value back into ":3478", so the documented way to
+# switch address discovery off has to survive into the compose file as plain "-".
+grep -Fq 'HERDR_GATEWAY_STUN_ADDR: ${HERDR_GATEWAY_STUN_ADDR-:3478}' \
+    "$BUNDLE_DIR/docker-compose.yml" ||
+    fail "compose file does not default the address discovery listener on unset only"
+! grep -Fq '${HERDR_GATEWAY_STUN_ADDR:-' "$BUNDLE_DIR/docker-compose.yml" ||
+    fail "compose file turns an empty address discovery value back into :3478"
+
+# Registration controls must reach the container, not merely Compose's .env
+# interpolation scope. Empty/unset values keep community registration open.
+for KNOB in HERDR_GATEWAY_REGISTRATION_TOKEN HERDR_GATEWAY_ALLOWED_RELAY_IDS; do
+    grep -Fxq "$KNOB=" "$BUNDLE_DIR/.env" ||
+        fail ".env lost the optional $KNOB setting"
+    grep -Fq "$KNOB: \${$KNOB:-}" "$BUNDLE_DIR/docker-compose.yml" ||
+        fail "compose file does not pass $KNOB with an empty default"
+done
+
+# Config rendering needs no daemon, images, builds, or network. When available,
+# use real Compose interpolation rather than only inspecting template strings.
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 &&
+    command -v python3 >/dev/null 2>&1; then
+    for CASE in unset empty token-only allow-list-only configured; do
+        CONFIG_ENV="$WORK_DIR/registration-$CASE.env"
+        TOKEN=""
+        RELAY_IDS=""
+        : > "$CONFIG_ENV"
+        if [ "$CASE" = token-only ] || [ "$CASE" = configured ]; then
+            TOKEN="deployment-test-token"
+        fi
+        if [ "$CASE" = allow-list-only ] || [ "$CASE" = configured ]; then
+            RELAY_IDS="AAAAAAAAAAAAAAAAAAAAAA,BBBBBBBBBBBBBBBBBBBBBB CCCCCCCCCCCCCCCCCCCCCC"
+        fi
+        if [ "$CASE" != unset ]; then
+            printf 'HERDR_GATEWAY_REGISTRATION_TOKEN=%s\nHERDR_GATEWAY_ALLOWED_RELAY_IDS="%s"\n' \
+                "$TOKEN" "$RELAY_IDS" > "$CONFIG_ENV"
+        fi
+        env -u HERDR_GATEWAY_REGISTRATION_TOKEN -u HERDR_GATEWAY_ALLOWED_RELAY_IDS \
+            docker compose --project-directory "$BUNDLE_DIR" \
+            --env-file "$CONFIG_ENV" -f "$BUNDLE_DIR/docker-compose.yml" \
+            config --format json > "$WORK_DIR/compose-config.json" ||
+            fail "Compose could not render $CASE registration settings"
+        python3 - "$WORK_DIR/compose-config.json" "$TOKEN" "$RELAY_IDS" <<'PY' ||
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as config_file:
+    environment = json.load(config_file)["services"]["gateway"]["environment"]
+for key, expected in zip(
+    ("HERDR_GATEWAY_REGISTRATION_TOKEN", "HERDR_GATEWAY_ALLOWED_RELAY_IDS"),
+    sys.argv[2:],
+):
+    if environment.get(key) != expected:
+        sys.exit(f"{key} did not reach the gateway environment unchanged")
+PY
+            fail "Compose lost $CASE registration settings"
+    done
+else
+    echo "SKIP: Compose registration rendering requires docker compose and python3"
+fi
+
+# A shared instance needs whole-gateway ceilings; every other limit is per-relay
+# or per-IP and cannot bound total memory.
+for KNOB in HERDR_GATEWAY_MAX_RELAYS HERDR_GATEWAY_MAX_CLIENTS; do
+    grep -Fq "$KNOB" "$BUNDLE_DIR/.env" || fail ".env lost the $KNOB ceiling"
+done
+grep -Fq 'UDP 3478' "$BUNDLE_DIR/README.md" ||
+    fail "bundle README does not mention UDP 3478"
+
+# Nothing may be recorded until a gateway actually answers.
+if grep -q '^HERDR_GATEWAY_URL=' "$HERDR_RELAY_ENV"; then
+    fail "bundle-only run recorded a gateway URL"
+fi
+[ ! -s "$SSH_LOG" ] || fail "bundle-only run contacted a server"
+
+# --- Deploy over SSH ----------------------------------------------------------
+: > "$SSH_LOG"
+rm -f "$STUB_STATE/started" "$STUB_STATE/uploaded.tar.gz"
+BUNDLE_DIR="$WORK_DIR/bundle-deploy"
+export HERDR_GATEWAY_DEPLOY_DIR="$BUNDLE_DIR"
+export HERDR_GATEWAY_DEPLOY_SERVER="deploy@gw.example.test"
+export HERDR_GATEWAY_DEPLOY_REMOTE_DIR="/opt/herdr-gateway"
+export HERDR_RELAY_ENV="$WORK_DIR/relay-deploy.env"
+: > "$HERDR_RELAY_ENV"
+run_deploy
+[ "$STATUS" -eq 0 ] || fail "deploy run exited $STATUS"
+
+grep -Fq "deploy@gw.example.test	true" "$SSH_LOG" || fail "deployment never opened an SSH session"
+grep -Fq 'cd /opt/herdr-gateway && docker compose up -d --build --force-recreate gateway caddy' \
+    "$SSH_LOG" || fail "deployment did not recreate the gateway and proxy on one network"
+[ -s "$STUB_STATE/uploaded.tar.gz" ] || fail "no bundle archive reached the server"
+# Listed to a file, not piped into grep: `grep -q` exits at the first match and
+# `tar` then dies of SIGPIPE, which `pipefail` reports as a failed pipeline even
+# though the entry was found. That race made this assertion flake.
+tar -tzf "$STUB_STATE/uploaded.tar.gz" > "$WORK_DIR/uploaded.list"
+grep -Fq './gateway-source/Dockerfile.gateway' "$WORK_DIR/uploaded.list" ||
+    fail "uploaded archive carries no gateway source"
+
+# A non-root address must be verified for passwordless sudo, and every remote
+# command has to carry that prefix.
+grep -Fq 'sudo -n true' "$SSH_LOG" || fail "deployment never checked passwordless sudo"
+grep -Fq 'sudo -n sh -c ' "$SSH_LOG" || fail "remote commands dropped the sudo prefix"
+
+# Only a verified public /healthz may switch this relay onto the gateway, and it
+# lands ahead of the community entries rather than replacing them.
+grep -Fq "HERDR_GATEWAY_URL='wss://gw.example.test,wss://community-a.example.test,wss://community-b.example.test'" \
+    "$HERDR_RELAY_ENV" || fail "verified deployment did not record the ordered gateway list"
+grep -Fq "HERDR_GATEWAY_SELECTION='ordered'" "$HERDR_RELAY_ENV" ||
+    fail "verified deployment did not pin the ordered selection policy"
+grep -Fq 'Gateways this relay and phone may use, in priority order:' "$OUTPUT" ||
+    fail "deployment did not present the final gateway subscription list"
+
+# Real extraction plus Compose rendering must preserve operator configuration
+# before the deployment would recreate the public gateway.
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 &&
+    command -v python3 >/dev/null 2>&1; then
+    for CASE in fresh token-only allow-list-only combined; do
+        export REMOTE_FIXTURE_DIR="$WORK_DIR/remote-$CASE"
+        export HERDR_GATEWAY_DEPLOY_REMOTE_DIR="$REMOTE_FIXTURE_DIR"
+        mkdir -p "$REMOTE_FIXTURE_DIR"
+        TOKEN=""
+        RELAY_IDS=""
+        if [ "$CASE" = token-only ] || [ "$CASE" = combined ]; then
+            TOKEN="preserve-upgrade-token"
+        fi
+        if [ "$CASE" = allow-list-only ] || [ "$CASE" = combined ]; then
+            RELAY_IDS="AAAAAAAAAAAAAAAAAAAAAA BBBBBBBBBBBBBBBBBBBBBB"
+        fi
+        if [ "$CASE" != fresh ]; then
+            printf 'HERDR_GATEWAY_REGISTRATION_TOKEN=%s\nHERDR_GATEWAY_ALLOWED_RELAY_IDS="%s"\nHERDR_GATEWAY_MONTHLY_BYTES=123456\n' \
+                "$TOKEN" "$RELAY_IDS" > "$REMOTE_FIXTURE_DIR/.env"
+            cp "$REMOTE_FIXTURE_DIR/.env" "$WORK_DIR/expected-$CASE.env"
+            printf 'HERDR_GATEWAY_VERSION=0.0.1\nHERDR_GATEWAY_REVISION=obsolete\nHERDR_GATEWAY_IMAGE=herdr-gateway:old\nHERDR_CADDY_IMAGE=caddy:old\n' >> "$REMOTE_FIXTURE_DIR/.env"
+        fi
+        # Stale source and generated identity update; operator policy survives.
+        printf 'old source\n' > "$REMOTE_FIXTURE_DIR/docker-compose.yml"
+        run_deploy
+        [ "$STATUS" -eq 0 ] || fail "$CASE upgrade failed: $STATUS"
+        if [ "$CASE" != fresh ]; then
+            grep -vE '^HERDR_(GATEWAY_(VERSION|REVISION|IMAGE)|CADDY_IMAGE)=' "$REMOTE_FIXTURE_DIR/.env" > "$WORK_DIR/preserved.env"
+            cmp "$WORK_DIR/expected-$CASE.env" "$WORK_DIR/preserved.env" ||
+                fail "$CASE upgrade replaced operator configuration"
+        fi
+        docker compose --project-directory "$BUNDLE_DIR" -f "$BUNDLE_DIR/docker-compose.yml" config --format json > "$WORK_DIR/expected-release.json"
+        python3 - "$STUB_STATE/recreated-environment.json" "$TOKEN" "$RELAY_IDS" "$WORK_DIR/expected-release.json" <<'PY' ||
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    deployed = json.load(source)["services"]
+environment = deployed["gateway"]["environment"]
+assert environment["HERDR_GATEWAY_REGISTRATION_TOKEN"] == sys.argv[2]
+assert environment["HERDR_GATEWAY_ALLOWED_RELAY_IDS"] == sys.argv[3]
+with open(sys.argv[4], encoding="utf-8") as source:
+    expected = json.load(source)["services"]
+assert deployed["gateway"]["build"]["args"] == expected["gateway"]["build"]["args"]
+assert deployed["gateway"]["image"] == expected["gateway"]["image"]
+assert deployed["caddy"]["image"] == expected["caddy"]["image"]
+PY
+            fail "$CASE upgrade cleared registration restrictions before recreation"
+    done
+    # Invalid existing configuration must fail before any container recreation.
+    export REMOTE_FIXTURE_DIR="$WORK_DIR/remote-invalid"
+    export HERDR_GATEWAY_DEPLOY_REMOTE_DIR="$REMOTE_FIXTURE_DIR"
+    mkdir -p "$REMOTE_FIXTURE_DIR/.env"
+    rm -f "$STUB_STATE/started" "$STUB_STATE/recreated-environment.json"
+    run_deploy
+    [ "$STATUS" -ne 0 ] || fail "invalid server .env was accepted"
+    [ ! -e "$STUB_STATE/started" ] || fail "invalid server .env allowed a restart"
+    [ ! -e "$STUB_STATE/recreated-environment.json" ] ||
+        fail "invalid server .env reached container recreation"
+    [ -d "$REMOTE_FIXTURE_DIR/.env" ] || fail "invalid server .env was overwritten"
+    unset REMOTE_FIXTURE_DIR
+    export HERDR_GATEWAY_DEPLOY_REMOTE_DIR="/opt/herdr-gateway"
+else
+    echo "SKIP: real upgrade regression requires docker compose and python3"
+fi
+
+# Regenerating a local bundle must not erase settings prepared by its operator.
+printf 'HERDR_GATEWAY_REGISTRATION_TOKEN=local-private-token\nHERDR_GATEWAY_ALLOWED_RELAY_IDS=AAAAAAAAAAAAAAAAAAAAAA\n' > "$BUNDLE_DIR/.env"
+cp "$BUNDLE_DIR/.env" "$WORK_DIR/expected-local.env"
+run_deploy
+[ "$STATUS" -eq 0 ] || fail "local configuration preservation run failed"
+grep -vE '^HERDR_(GATEWAY_(VERSION|REVISION|IMAGE)|CADDY_IMAGE)=' "$BUNDLE_DIR/.env" > "$WORK_DIR/preserved-local.env"
+cmp "$WORK_DIR/expected-local.env" "$WORK_DIR/preserved-local.env" ||
+    fail "regenerating the bundle erased local registration settings"
+
+# --- Public endpoint never answers: keep the transport unchanged --------------
+: > "$SSH_LOG"
+rm -f "$STUB_STATE/started" "$STUB_STATE/uploaded.tar.gz"
+cat > "$STUB_DIR/curl" <<'EOF'
+#!/bin/sh
+exit 7
+EOF
+chmod 700 "$STUB_DIR/curl"
+BUNDLE_DIR="$WORK_DIR/bundle-unreachable"
+export HERDR_GATEWAY_DEPLOY_DIR="$BUNDLE_DIR"
+export HERDR_RELAY_ENV="$WORK_DIR/relay-unreachable.env"
+: > "$HERDR_RELAY_ENV"
+export HERDR_GATEWAY_DEPLOY_PUBLIC_TIMEOUT=0
+run_deploy
+unset HERDR_GATEWAY_DEPLOY_PUBLIC_TIMEOUT
+[ "$STATUS" -eq 0 ] || fail "unreachable-public run exited $STATUS"
+if grep -q '^HERDR_GATEWAY_URL=' "$HERDR_RELAY_ENV"; then
+    fail "unverified deployment recorded a gateway URL"
+fi
+grep -Fq 'did not' "$OUTPUT" || fail "unverified deployment printed no diagnosis"
+
+# --- Rerun with nothing configured reuses the remembered answers -------------
+# Redeploying after a source change must not mean re-typing a hostname, an SSH
+# address, and two paths, so a bare rerun repeats the last deployment.
+: > "$SSH_LOG"
+rm -f "$STUB_STATE/started" "$STUB_STATE/uploaded.tar.gz"
+cat > "$STUB_DIR/curl" <<'EOF'
+#!/bin/sh
+for argument in "$@"; do
+    case "$argument" in
+        *"/healthz") [ -f "$STUB_STATE/started" ] || exit 7 ;;
+    esac
+done
+printf '{"ok":true,"relays":0,"clients":0,"uptime_seconds":1,"stun_port":3478}\n'
+EOF
+chmod 700 "$STUB_DIR/curl"
+export HERDR_RELAY_ENV="$WORK_DIR/relay-remembered.env"
+: > "$HERDR_RELAY_ENV"
+
+REMEMBERED_BUNDLE="$WORK_DIR/bundle-remembered"
+REMEMBERED_BUNDLE="$(cd "$(dirname "$REMEMBERED_BUNDLE")" && pwd -P)/$(basename "$REMEMBERED_BUNDLE")"
+export HERDR_GATEWAY_DEPLOY_DIR="$REMEMBERED_BUNDLE"
+export HERDR_GATEWAY_DEPLOY_SERVER="deploy@gw.example.test"
+export HERDR_GATEWAY_DEPLOY_REMOTE_DIR="/srv/herdr-gateway"
+run_deploy
+[ "$STATUS" -eq 0 ] || fail "seeding run exited $STATUS"
+
+STATE_FILE="$WORK_DIR/gateway-deploy"
+[ -f "$STATE_FILE" ] || fail "answers were not remembered beside the relay environment"
+for EXPECTED in \
+    "HERDR_GATEWAY_DEPLOY_HOST='gw.example.test'" \
+    "HERDR_GATEWAY_DEPLOY_SERVER='deploy@gw.example.test'" \
+    "HERDR_GATEWAY_DEPLOY_REMOTE_DIR='/srv/herdr-gateway'" \
+    "HERDR_GATEWAY_DEPLOY_EMAIL='ops@example.test'" \
+    "HERDR_GATEWAY_DEPLOY_DIR='$REMEMBERED_BUNDLE'"; do
+    grep -Fq "$EXPECTED" "$STATE_FILE" || fail "remembered answers lack $EXPECTED"
+done
+
+# The bare rerun: every override unset, so only the remembered answers can drive
+# it. It must reach the same server and the same directory.
+: > "$SSH_LOG"
+rm -f "$STUB_STATE/started" "$STUB_STATE/uploaded.tar.gz"
+unset HERDR_GATEWAY_DEPLOY_HOST HERDR_GATEWAY_DEPLOY_EMAIL \
+    HERDR_GATEWAY_DEPLOY_DIR HERDR_GATEWAY_DEPLOY_SERVER \
+    HERDR_GATEWAY_DEPLOY_REMOTE_DIR
+run_deploy
+[ "$STATUS" -eq 0 ] || fail "remembered rerun exited $STATUS"
+grep -Fq 'Reusing the remembered hostname gw.example.test' "$OUTPUT" ||
+    fail "rerun did not reuse the remembered hostname"
+grep -Fq 'Reusing the remembered server deploy@gw.example.test' "$OUTPUT" ||
+    fail "rerun did not reuse the remembered server"
+grep -Fq "email ops@example.test" "$REMEMBERED_BUNDLE/Caddyfile" ||
+    fail "rerun did not reuse the remembered ACME contact"
+grep -Fq "HERDR_GATEWAY_URL='wss://gw.example.test,wss://community-a.example.test,wss://community-b.example.test'" \
+    "$HERDR_RELAY_ENV" || fail "remembered rerun did not record the verified gateway list"
+
+# --- The final subscription choice can keep only the deployed gateway --------
+: > "$SSH_LOG"
+rm -f "$STUB_STATE/started" "$STUB_STATE/uploaded.tar.gz"
+export HERDR_RELAY_ENV="$WORK_DIR/relay-custom-subscriptions.env"
+printf "HERDR_TAILSCALE_PORT='8443'\nHERDR_RELAY_PORT='8375'\n" > "$HERDR_RELAY_ENV"
+export HERDR_GATEWAY_SUBSCRIPTIONS="wss://gw.example.test"
+run_deploy
+[ "$STATUS" -ne 0 ] || fail "gateway deployment accepted Tailscale selection"
+grep -Fq "Always on Tailscale is selected. Choose Tailscale → Turn Always on Tailscale Off first." "$OUTPUT" || fail "missing refusal"
+if grep -q . "$SSH_LOG"; then fail "refused deployment contacted server"; fi
+if [ -e "$STUB_STATE/tailscale.log" ] && grep -q . "$STUB_STATE/tailscale.log"; then fail "refused deployment called Tailscale"; fi
+grep -Fxq "HERDR_TAILSCALE_PORT='8443'" "$HERDR_RELAY_ENV" || fail "selection changed"
+rm -f "$HERDR_RELAY_ENV"
+run_deploy
+[ "$STATUS" -eq 0 ] || fail "custom-subscription run exited $STATUS"
+grep -Fq "HERDR_GATEWAY_URL='wss://gw.example.test'" "$HERDR_RELAY_ENV" ||
+    fail "the explicit subscription list did not leave the deployed gateway alone"
+if grep -Fq 'community-a.example.test' "$HERDR_RELAY_ENV"; then
+    fail "the explicit subscription list still recorded community gateways"
+fi
+grep -Fq "HERDR_GATEWAY_SELECTION='ordered'" "$HERDR_RELAY_ENV" ||
+    fail "the explicit subscription list did not pin the ordered selection policy"
+unset HERDR_GATEWAY_SUBSCRIPTIONS
+
+# --- The name has an AAAA the server does not answer -------------------------
+# Let's Encrypt prefers IPv6, so this is the failure that looks like nothing at
+# all over IPv4: the deployment has to name it instead of waiting in silence.
+: > "$SSH_LOG"
+rm -f "$STUB_STATE/started" "$STUB_STATE/uploaded.tar.gz"
+: > "$STUB_STATE/no-v6"
+run_deploy
+rm -f "$STUB_STATE/no-v6"
+[ "$STATUS" -eq 0 ] || fail "unanswered-AAAA run exited $STATUS"
+grep -Fq 'publishes an AAAA record that answers nothing here' "$OUTPUT" ||
+    fail "deployment stayed silent about the unanswered AAAA record"
+
+# --- Docker too old to give the stack an IPv6 network ------------------------
+: > "$SSH_LOG"
+rm -f "$STUB_STATE/started" "$STUB_STATE/uploaded.tar.gz"
+: > "$STUB_STATE/old-docker"
+run_deploy
+rm -f "$STUB_STATE/old-docker"
+[ "$STATUS" -eq 0 ] || fail "old-docker run exited $STATUS"
+grep -Fq 'older than 27' "$OUTPUT" ||
+    fail "deployment did not warn that the server's Docker has no IPv6 network"
+
+# --- A key ssh would never offer on its own ---------------------------------
+# Hosts that only accept a key outside ~/.ssh/id_* are the common case for
+# rented servers. Naming the ssh command has to reach the server, and the next
+# run has to keep using it without being told again.
+: > "$SSH_LOG"
+rm -f "$STUB_STATE/started" "$STUB_STATE/uploaded.tar.gz" "$STUB_STATE/identity"
+NAMED_KEY="$WORK_DIR/named-key"
+printf 'not a real key\n' > "$NAMED_KEY"
+export HERDR_GATEWAY_DEPLOY_SSH="ssh -i $NAMED_KEY"
+run_deploy
+[ "$STATUS" -eq 0 ] || fail "named-key run exited $STATUS"
+test "$(cat "$STUB_STATE/identity")" = "$NAMED_KEY" ||
+    fail "the named key never reached ssh"
+grep -Fq "HERDR_GATEWAY_DEPLOY_SSH='ssh -i $NAMED_KEY'" "$STATE_FILE" ||
+    fail "the working ssh command was not remembered"
+
+: > "$SSH_LOG"
+rm -f "$STUB_STATE/started" "$STUB_STATE/uploaded.tar.gz" "$STUB_STATE/identity"
+unset HERDR_GATEWAY_DEPLOY_SSH
+run_deploy
+[ "$STATUS" -eq 0 ] || fail "remembered-key rerun exited $STATUS"
+grep -Fq "Reusing the remembered SSH command ssh -i $NAMED_KEY" "$OUTPUT" ||
+    fail "rerun did not reuse the remembered ssh command"
+test "$(cat "$STUB_STATE/identity")" = "$NAMED_KEY" ||
+    fail "rerun did not pass the remembered key to ssh"
+
+# --- Unreachable without a key: the diagnosis has to name both causes --------
+: > "$SSH_LOG"
+rm -f "$STUB_STATE/started" "$STUB_STATE/uploaded.tar.gz"
+cat > "$STUB_DIR/ssh" <<'EOF'
+#!/bin/sh
+exit 255
+EOF
+chmod 700 "$STUB_DIR/ssh"
+export HERDR_GATEWAY_DEPLOY_SSH="ssh"
+run_deploy
+[ "$STATUS" -ne 0 ] || fail "unreachable server reported success"
+grep -Fq 'Could not open an SSH session' "$OUTPUT" ||
+    fail "unreachable server printed no diagnosis"
+grep -Fq 'debian@' "$OUTPUT" ||
+    fail "diagnosis does not mention the non-root cloud-image accounts"
+grep -Fq 'HERDR_GATEWAY_DEPLOY_SSH="ssh -i ~/.ssh/yourkey"' "$OUTPUT" ||
+    fail "diagnosis does not show how to name a key"
+unset HERDR_GATEWAY_DEPLOY_SSH
+
+echo "gateway deploy tests passed"

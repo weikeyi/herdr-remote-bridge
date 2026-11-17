@@ -1,0 +1,782 @@
+package web
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	relayrelease "github.com/0cv/herdr-mobile-relay/internal/release"
+	"github.com/andybalholm/brotli"
+)
+
+func setupTestWebRoot(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+
+	os.MkdirAll(filepath.Join(dir, "assets"), 0o755)
+	os.MkdirAll(filepath.Join(dir, "icons"), 0o755)
+	os.MkdirAll(filepath.Join(dir, "fonts"), 0o755)
+
+	os.WriteFile(filepath.Join(dir, "index.html"), []byte("<html>hello</html>"), 0o644)
+	os.WriteFile(filepath.Join(dir, "assets", "app.js"), []byte("console.log('app')"), 0o644)
+	os.WriteFile(filepath.Join(dir, "assets", "app.css"), []byte("body{}"), 0o644)
+	os.WriteFile(
+		filepath.Join(dir, "assets", "attachment-hash.worker-D_WkX-nj.js"),
+		[]byte("self.onmessage = () => {}"),
+		0o644,
+	)
+	os.WriteFile(filepath.Join(dir, "sw.js"), []byte("// sw"), 0o644)
+	os.WriteFile(filepath.Join(dir, "manifest-loader.js"), []byte("// manifest loader"), 0o644)
+	os.WriteFile(filepath.Join(dir, "setup.webmanifest"), []byte("{}"), 0o644)
+	os.WriteFile(filepath.Join(dir, "icons", "icon-192.png"), []byte("png-data"), 0o644)
+	os.WriteFile(filepath.Join(dir, "fonts", "nerd-symbols.woff2"), []byte("font-data"), 0o644)
+	os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("secret"), 0o644)
+
+	// Create a .br sidecar
+	os.WriteFile(filepath.Join(dir, "assets", "app.js.br"), []byte("compressed"), 0o644)
+
+	return dir
+}
+
+func contentTestDigest(data []byte) string {
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
+}
+
+func contentTestIntegrity(data []byte) string {
+	digest := sha256.Sum256(data)
+	return "sha256-" + base64.StdEncoding.EncodeToString(digest[:])
+}
+
+func setupContentAddressedWebRoot(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	javascript := []byte("console.log('content-addressed');")
+	stylesheet := []byte("body{color:blue}")
+	javascriptPath := "assets/app-" + contentTestDigest(javascript) + ".js"
+	stylesheetPath := "assets/app-" + contentTestDigest(stylesheet) + ".css"
+	entryPath := "builds/0.20.10-363-0123456789abcdef/index.html"
+	entry := []byte(`<link rel="stylesheet" href="/` + stylesheetPath + `" integrity="` + contentTestIntegrity(stylesheet) + `"><script src="/` + javascriptPath + `" integrity="` + contentTestIntegrity(javascript) + `"></script>`)
+	for filename, data := range map[string][]byte{
+		javascriptPath: javascript,
+		stylesheetPath: stylesheet,
+		entryPath:      entry,
+	} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(root, filename)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, filename), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const build = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	descriptor := relayrelease.WebDescriptor{
+		Schema:  relayrelease.WebDescriptorSchema,
+		Version: "0.20.10",
+		Assets:  363,
+		Build:   build,
+		Entry:   "/" + entryPath,
+		Files: map[string]relayrelease.WebDescriptorFile{
+			"entry":      {Path: entryPath, SHA256: contentTestDigest(entry), Integrity: contentTestIntegrity(entry)},
+			"javascript": {Path: javascriptPath, SHA256: contentTestDigest(javascript), Integrity: contentTestIntegrity(javascript)},
+			"stylesheet": {Path: stylesheetPath, SHA256: contentTestDigest(stylesheet), Integrity: contentTestIntegrity(stylesheet)},
+		},
+	}
+	descriptorData, err := json.Marshal(descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "release.json"), descriptorData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	versionData, err := json.Marshal(map[string]any{
+		"version": "0.20.10",
+		"assets":  363,
+		"build":   build,
+		"entry":   "/" + entryPath,
+		"script":  "/" + javascriptPath,
+		"style":   "/" + stylesheetPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "version.json"), versionData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+func TestServesContentAddressedReleaseAndStableBootstrap(t *testing.T) {
+	root := setupContentAddressedWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	for _, requestURL := range []string{"/", "/index.html?herdr_reload=0.20.10-1"} {
+		request := httptest.NewRequest(http.MethodGet, requestURL, nil)
+		response := httptest.NewRecorder()
+		h.ServeHTTP(response, request)
+		if response.Code != http.StatusTemporaryRedirect {
+			t.Fatalf("%s status = %d", requestURL, response.Code)
+		}
+		if !strings.HasPrefix(response.Header().Get("Location"), "/builds/0.20.10-363-0123456789abcdef/index.html") {
+			t.Fatalf("%s location = %q", requestURL, response.Header().Get("Location"))
+		}
+		if got := response.Header().Get("Cache-Control"); got != "no-cache, no-store" {
+			t.Fatalf("%s cache control = %q", requestURL, got)
+		}
+	}
+	request := httptest.NewRequest(http.MethodGet, "/assets/app.js", nil)
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("stable JavaScript path status = %d, want 404", response.Code)
+	}
+	request = httptest.NewRequest(http.MethodGet, "/assets/app-"+contentTestDigest([]byte("console.log('content-addressed');"))+".js", nil)
+	response = httptest.NewRecorder()
+	h.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "public, max-age=31536000, immutable" {
+		t.Fatalf("content-addressed JavaScript response = %d cache=%q", response.Code, response.Header().Get("Cache-Control"))
+	}
+}
+
+func TestRejectsInvalidPresentWebDescriptor(t *testing.T) {
+	root := setupTestWebRoot(t)
+	if err := os.WriteFile(filepath.Join(root, "release.json"), []byte(`{"schema":1}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewHandler(root); err == nil {
+		t.Fatal("invalid release descriptor was silently downgraded to the legacy asset scheme")
+	}
+}
+
+func TestServesAllowedAsset(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/index.html", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if body := w.Body.String(); body != "<html>hello</html>" {
+		t.Errorf("body = %q", body)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
+		t.Errorf("content-type = %q", ct)
+	}
+	if etag := w.Header().Get("ETag"); etag == "" {
+		t.Error("missing ETag")
+	}
+}
+
+func TestServesOnlyVersionedAttachmentHashWorker(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	for _, requestPath := range []string{
+		"/assets/attachment-hash.worker-D_WkX-nj.js",
+		"/assets/attachment-hash.worker-.js",
+		"/assets/attachment-hash.worker-D.WkX.js",
+		"/assets/unrelated-worker-D_WkX-nj.js",
+	} {
+		req := httptest.NewRequest(http.MethodGet, requestPath, nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		want := http.StatusNotFound
+		if requestPath == "/assets/attachment-hash.worker-D_WkX-nj.js" {
+			want = http.StatusOK
+		}
+		if w.Code != want {
+			t.Errorf("%s status = %d, want %d", requestPath, w.Code, want)
+		}
+	}
+}
+
+// index.html loads manifest-loader.js, which selects one of the two
+// webmanifests at runtime. A relay that refuses any of the three serves an
+// app that can never register its manifest, so they belong to the allowlist
+// together.
+func TestServesManifestLoaderChain(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, contentType := range map[string]string{
+		"/manifest-loader.js": "text/javascript; charset=utf-8",
+		"/setup.webmanifest":  "application/manifest+json",
+	} {
+		req := httptest.NewRequest("GET", path, nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != 200 {
+			t.Fatalf("%s status = %d, want 200", path, w.Code)
+		}
+		if ct := w.Header().Get("Content-Type"); ct != contentType {
+			t.Errorf("%s content-type = %q, want %q", path, ct, contentType)
+		}
+	}
+}
+
+func TestServesRootAsIndex(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if body := w.Body.String(); body != "<html>hello</html>" {
+		t.Errorf("body = %q", body)
+	}
+}
+
+func TestRedirectsLegacyUpdateReloadToDistinctAppPath(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/?setup=preserved&herdr_reload=0.14.4-42", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusTemporaryRedirect)
+	}
+	if location := w.Header().Get("Location"); location != "/index.html?setup=preserved&herdr_reload=0.14.4-42" {
+		t.Fatalf("location = %q", location)
+	}
+}
+
+func TestRejectsDisallowedAsset(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/secret.txt", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != 404 {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestRejectsPathTraversal(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/../etc/passwd", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != 404 {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestServesBrotliWhenAccepted(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/assets/app.js", nil)
+	req.Header.Set("Accept-Encoding", "gzip, br")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if enc := w.Header().Get("Content-Encoding"); enc != "br" {
+		t.Errorf("content-encoding = %q, want br", enc)
+	}
+	if body := w.Body.String(); body != "compressed" {
+		t.Errorf("body = %q, want compressed", body)
+	}
+}
+
+func TestServesUncompressedWithoutBr(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/assets/app.js", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if enc := w.Header().Get("Content-Encoding"); enc != "" {
+		t.Errorf("content-encoding = %q, want empty", enc)
+	}
+	if body := w.Body.String(); body != "console.log('app')" {
+		t.Errorf("body = %q", body)
+	}
+}
+
+func TestConditionalRequest304(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First request to get ETag
+	req := httptest.NewRequest("GET", "/index.html", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	etag := w.Header().Get("ETag")
+
+	// Second request with If-None-Match
+	req2 := httptest.NewRequest("GET", "/index.html", nil)
+	req2.Header.Set("If-None-Match", etag)
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusNotModified {
+		t.Fatalf("status = %d, want 304", w2.Code)
+	}
+}
+
+func TestServesIconsWildcard(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest("GET", "/icons/icon-192.png", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+}
+
+func TestServesFontWithWebMIME(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/fonts/nerd-symbols.woff2", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if got := w.Header().Get("Content-Type"); got != "font/woff2" {
+		t.Fatalf("font MIME = %q", got)
+	}
+}
+
+func TestSPAFallbackAndUnsupportedMethod(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	req := httptest.NewRequest(http.MethodGet, "/settings/relay", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || w.Body.String() != "<html>hello</html>" {
+		t.Fatalf("SPA response = %d %q", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/index.html", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusMethodNotAllowed || w.Header().Get("Allow") != "GET, HEAD" {
+		t.Fatalf("POST response = %d, Allow=%q", w.Code, w.Header().Get("Allow"))
+	}
+}
+
+func TestSecurityCacheMIMEAndHEADContract(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	req := httptest.NewRequest(http.MethodHead, "/assets/app.js", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || w.Body.Len() != 0 {
+		t.Fatalf("HEAD response = %d with %d body bytes", w.Code, w.Body.Len())
+	}
+	if got := w.Header().Get("Content-Type"); got != "text/javascript; charset=utf-8" {
+		t.Fatalf("JavaScript MIME = %q", got)
+	}
+	if got := w.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Fatalf("asset cache control = %q", got)
+	}
+	for _, header := range []string{
+		"Content-Security-Policy",
+		"Permissions-Policy",
+		"Referrer-Policy",
+		"X-Content-Type-Options",
+		"X-Frame-Options",
+	} {
+		if w.Header().Get(header) == "" {
+			t.Errorf("missing security header %s", header)
+		}
+	}
+	csp := w.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "style-src 'self'; style-src-attr 'unsafe-inline'") {
+		t.Fatalf("Content-Security-Policy does not allow sanitized ANSI style attributes: %q", csp)
+	}
+}
+
+func TestBrotliQualityWildcardAndCanonicalPathParity(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	for _, header := range []string{"br;q=0.0", "BR;Q=invalid", "*;q=0"} {
+		req := httptest.NewRequest(http.MethodGet, "/assets/app.js", nil)
+		req.Header.Set("Accept-Encoding", header)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if got := w.Header().Get("Content-Encoding"); got != "" {
+			t.Errorf("%q selected encoding %q", header, got)
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, "/assets/app.js", nil)
+	req.Header.Set("Accept-Encoding", "*;q=0.5")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if got := w.Header().Get("Content-Encoding"); got != "br" {
+		t.Fatalf("wildcard selected encoding %q, want br", got)
+	}
+	for _, requestPath := range []string{"/assets/../index.html", "/assets//app.js", "/assets/./app.js"} {
+		req := httptest.NewRequest(http.MethodGet, requestPath, nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Errorf("%q status = %d, want 404", requestPath, w.Code)
+		}
+	}
+}
+
+func TestWeakETagMatches(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	first := httptest.NewRecorder()
+	h.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/index.html", nil))
+	req := httptest.NewRequest(http.MethodGet, "/index.html", nil)
+	req.Header.Set("If-None-Match", "W/"+first.Header().Get("ETag"))
+	second := httptest.NewRecorder()
+	h.ServeHTTP(second, req)
+	if second.Code != http.StatusNotModified {
+		t.Fatalf("weak ETag status = %d, want 304", second.Code)
+	}
+}
+
+func TestBrotliRepresentationHasDistinctETagAndHonorsQZero(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	plainRequest := httptest.NewRequest(http.MethodGet, "/assets/app.js", nil)
+	plain := httptest.NewRecorder()
+	h.ServeHTTP(plain, plainRequest)
+	compressedRequest := httptest.NewRequest(http.MethodGet, "/assets/app.js", nil)
+	compressedRequest.Header.Set("Accept-Encoding", "br")
+	compressed := httptest.NewRecorder()
+	h.ServeHTTP(compressed, compressedRequest)
+	if plain.Header().Get("ETag") == compressed.Header().Get("ETag") {
+		t.Fatal("plain and Brotli representations share an ETag")
+	}
+	if compressed.Header().Get("Vary") != "Accept-Encoding" {
+		t.Fatalf("Vary = %q", compressed.Header().Get("Vary"))
+	}
+
+	disabledRequest := httptest.NewRequest(http.MethodGet, "/assets/app.js", nil)
+	disabledRequest.Header.Set("Accept-Encoding", "gzip, br;q=0")
+	disabled := httptest.NewRecorder()
+	h.ServeHTTP(disabled, disabledRequest)
+	if disabled.Header().Get("Content-Encoding") != "" || disabled.Body.String() != "console.log('app')" {
+		t.Fatalf("br;q=0 response encoding=%q body=%q", disabled.Header().Get("Content-Encoding"), disabled.Body.String())
+	}
+}
+
+func TestErrorsAreNonStoring(t *testing.T) {
+	root := setupTestWebRoot(t)
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	if err := os.Remove(filepath.Join(root, "index.html")); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		method string
+		path   string
+		status int
+	}{
+		{http.MethodPost, "/index.html", http.StatusMethodNotAllowed},
+		{http.MethodGet, "/../index.html", http.StatusNotFound},
+		{http.MethodGet, "/secret.txt", http.StatusNotFound},
+		{http.MethodGet, "/fonts/missing.woff2", http.StatusNotFound},
+		{http.MethodGet, "/index.html", http.StatusNotFound},
+		{http.MethodGet, "/settings", http.StatusNotFound},
+		{http.MethodHead, "/assets/missing.js", http.StatusNotFound},
+	} {
+		t.Run(test.method+test.path, func(t *testing.T) {
+			request := httptest.NewRequest(test.method, test.path, nil)
+			request.Header.Set("If-None-Match", "*")
+			response := httptest.NewRecorder()
+			h.ServeHTTP(response, request)
+			if response.Code != test.status || response.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("error response = %d, cache=%q", response.Code, response.Header().Get("Cache-Control"))
+			}
+			if response.Header().Get("ETag") != "" || response.Header().Get("X-Content-Type-Options") != "nosniff" {
+				t.Fatalf("error headers = %v", response.Header())
+			}
+		})
+	}
+}
+
+func TestVerifiedReleaseMissesNeverServeShell(t *testing.T) {
+	root := setupContentAddressedWebRoot(t)
+	oldEntry := "builds/0.20.9-362-0123456789abcdef/index.html"
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(root, oldEntry)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, oldEntry), []byte("<html>old shell</html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	paths := []string{
+		"/assets/app.js", "/assets/app.css", "/assets/missing.js", "/assets/missing.css",
+		"/assets/ConversationHistory-362.js", "/assets/attachment-hash.worker-missing.js",
+		"/assets/missing", "/builds/missing", "/" + oldEntry,
+	}
+	for asset := range h.webFiles {
+		if err := os.Remove(filepath.Join(root, asset)); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, "/"+asset)
+	}
+	for _, encoding := range []string{"identity", "br"} {
+		for _, requestPath := range paths {
+			t.Run(encoding+requestPath, func(t *testing.T) {
+				request := httptest.NewRequest(http.MethodGet, requestPath, nil)
+				request.Header.Set("Accept-Encoding", encoding)
+				request.Header.Set("If-None-Match", "*")
+				response := httptest.NewRecorder()
+				h.ServeHTTP(response, request)
+				if response.Code != http.StatusNotFound || response.Header().Get("Cache-Control") != "no-store" {
+					t.Fatalf("miss = %d, cache=%q", response.Code, response.Header().Get("Cache-Control"))
+				}
+				if strings.Contains(response.Header().Get("Content-Type"), "html") || response.Header().Get("Content-Encoding") != "" {
+					t.Fatalf("miss headers = %v", response.Header())
+				}
+			})
+		}
+	}
+}
+
+func TestVerifiedResourcesMIMEBrotliAndRevalidation(t *testing.T) {
+	root := setupContentAddressedWebRoot(t)
+	descriptorData, err := os.ReadFile(filepath.Join(root, "release.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var descriptor relayrelease.WebDescriptor
+	if err := json.Unmarshal(descriptorData, &descriptor); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range descriptor.Files {
+		body, err := os.ReadFile(filepath.Join(root, file.Path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var compressed bytes.Buffer
+		writer := brotli.NewWriter(&compressed)
+		if _, err := writer.Write(body); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, file.Path+".br"), compressed.Bytes(), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	for kind, file := range descriptor.Files {
+		for _, encoding := range []string{"identity", "br"} {
+			t.Run(kind+"/"+encoding, func(t *testing.T) {
+				request := httptest.NewRequest(http.MethodGet, "/"+file.Path, nil)
+				request.Header.Set("Accept-Encoding", encoding)
+				response := httptest.NewRecorder()
+				h.ServeHTTP(response, request)
+				contentType := map[string]string{
+					"entry": "text/html; charset=utf-8", "javascript": "text/javascript; charset=utf-8", "stylesheet": "text/css; charset=utf-8",
+				}[kind]
+				if response.Code != http.StatusOK || response.Header().Get("Content-Type") != contentType {
+					t.Fatalf("resource = %d, MIME=%q", response.Code, response.Header().Get("Content-Type"))
+				}
+				body := response.Body.Bytes()
+				if encoding == "br" {
+					if response.Header().Get("Content-Encoding") != "br" {
+						t.Fatal("Brotli representation not selected")
+					}
+					decoded, err := io.ReadAll(brotli.NewReader(bytes.NewReader(body)))
+					if err != nil {
+						t.Fatal(err)
+					}
+					body = decoded
+				}
+				if contentTestDigest(body) != file.SHA256 {
+					t.Fatal("decoded resource differs from descriptor")
+				}
+				request.Header.Set("If-None-Match", response.Header().Get("ETag"))
+				conditional := httptest.NewRecorder()
+				h.ServeHTTP(conditional, request)
+				if conditional.Code != http.StatusNotModified || conditional.Body.Len() != 0 {
+					t.Fatalf("conditional response = %d, bytes=%d", conditional.Code, conditional.Body.Len())
+				}
+				for _, header := range []string{"ETag", "Cache-Control", "Vary", "Content-Type", "Content-Encoding"} {
+					if conditional.Header().Get(header) != response.Header().Get(header) {
+						t.Errorf("304 %s = %q, want %q", header, conditional.Header().Get(header), response.Header().Get(header))
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestRevalidationDoesNotReuseRepairedOrRemovedBody(t *testing.T) {
+	root := setupTestWebRoot(t)
+	script := filepath.Join(root, "assets", "app.js")
+	if err := os.WriteFile(script, []byte("<!doctype html>wrong body"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	request := httptest.NewRequest(http.MethodGet, "/assets/app.js", nil)
+	poison := httptest.NewRecorder()
+	h.ServeHTTP(poison, request)
+	if poison.Header().Get("Cache-Control") != "no-cache" {
+		t.Fatal("mutable resource must require revalidation")
+	}
+	if err := os.WriteFile(script, []byte("console.log('repaired')"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("If-None-Match", poison.Header().Get("ETag"))
+	repaired := httptest.NewRecorder()
+	h.ServeHTTP(repaired, request)
+	if repaired.Code != http.StatusOK || repaired.Body.String() != "console.log('repaired')" {
+		t.Fatalf("repair response = %d %q", repaired.Code, repaired.Body.String())
+	}
+	request.Header.Set("If-None-Match", repaired.Header().Get("ETag"))
+	unchanged := httptest.NewRecorder()
+	h.ServeHTTP(unchanged, request)
+	if unchanged.Code != http.StatusNotModified {
+		t.Fatalf("unchanged status = %d", unchanged.Code)
+	}
+	if err := os.Remove(script); err != nil {
+		t.Fatal(err)
+	}
+	removed := httptest.NewRecorder()
+	h.ServeHTTP(removed, request)
+	if removed.Code != http.StatusNotFound || removed.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("removed response = %d, cache=%q", removed.Code, removed.Header().Get("Cache-Control"))
+	}
+}
+
+func TestWebRootSymlinkEscapeIsRejected(t *testing.T) {
+	root := setupTestWebRoot(t)
+	outside := filepath.Join(t.TempDir(), "outside.js")
+	if err := os.WriteFile(outside, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "assets", "app.js")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "assets", "app.js")); err != nil {
+		t.Fatal(err)
+	}
+	h, err := NewHandler(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	req := httptest.NewRequest(http.MethodGet, "/assets/app.js", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("symlink escape status = %d, want 404", w.Code)
+	}
+}

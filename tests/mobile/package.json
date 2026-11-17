@@ -1,0 +1,31 @@
+{
+  "name": "herdr-mobile-device-ci",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "packageManager": "bun@1.4.4",
+  "engines": {
+    "bun": ">=1.4.4",
+    "node": "26.13.0"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "check": "tsc --noEmit",
+    "test:unit": "bun unit/run.ts",
+    "test:android-inspection": "bash unit/android-inspection-check.sh",
+    "test:android-attachment": "bun unit/android-retained-launch.ts --recorded-two-page",
+    "prepare:bundle": "bun prepare.ts",
+    "prepare:current": "bun prepare-current.ts",
+    "test:cache-recovery": "bun integration/cache-recovery.ts",
+    "test:phone-recovery": "bun integration/phone-recovery.ts",
+    "run": "bun run.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.6.5",
+    "eslint": "10.13.0",
+    "globals": "17.13.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.1"
+  }
+}

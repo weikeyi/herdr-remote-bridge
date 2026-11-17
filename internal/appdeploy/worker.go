@@ -1,0 +1,1173 @@
+package appdeploy
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"github.com/0cv/herdr-mobile-relay/internal/filelock"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/0cv/herdr-mobile-relay/internal/childenv"
+	"github.com/0cv/herdr-mobile-relay/internal/processgroup"
+	"github.com/0cv/herdr-mobile-relay/internal/release"
+	"github.com/0cv/herdr-mobile-relay/internal/setuphelper"
+	"github.com/andybalholm/brotli"
+)
+
+const (
+	// Keep this pinned for reproducible deployments, but refresh it when
+	// Wrangler's Pages uploader regresses. 4.114.0's differential asset
+	// upload path can fail with a generic exit status; 4.125.0 is the
+	// current tested release and the deployment below skips that cache path.
+	WranglerVersion           = "4.125.0"
+	deploymentStartupGrace    = 30 * time.Second
+	publicVerificationTimeout = 2 * time.Minute
+	publicRequestTimeout      = 20 * time.Second
+	deploymentTimeout         = 15 * time.Minute
+)
+
+var ansiEscapePattern = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
+
+var (
+	projectPattern             = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,57}[a-z0-9])?$`)
+	branchPattern              = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._/-]{0,118}[A-Za-z0-9])?$`)
+	errDeployLocked            = errors.New("another app deployment is already running")
+	errPublicOriginRedirect    = errors.New("public version check redirected to another origin")
+	errPublicCanonicalRedirect = errors.New("canonical public resource must not redirect")
+)
+
+type Job struct {
+	RuntimeDir string `json:"runtime_dir"`
+	WebRoot    string `json:"web_root"`
+	Origin     string `json:"origin"`
+	Project    string `json:"project"`
+	Branch     string `json:"branch"`
+	Version    string `json:"version"`
+	Revision   string `json:"revision"`
+	WebHash    string `json:"web_hash"`
+	NPXPath    string `json:"npx_path"`
+	NodeDir    string `json:"node_dir"`
+}
+
+type State struct {
+	State          string `json:"state"`
+	TargetVersion  string `json:"target_version,omitempty"`
+	TargetRevision string `json:"target_revision,omitempty"`
+	StartedAt      string `json:"started_at,omitempty"`
+	FinishedAt     string `json:"finished_at,omitempty"`
+	Error          string `json:"error,omitempty"`
+}
+
+func Run(ctx context.Context, jobPath string) error {
+	ctx, cancel := context.WithTimeout(ctx, deploymentTimeout)
+	defer cancel()
+	job, err := loadJob(jobPath)
+	if err != nil {
+		return err
+	}
+	// A job file has exactly one consumer: the worker handed its path. Nothing
+	// rescans the runtime directory, so a job that is not removed is garbage
+	// for good. Removing it only on success leaked one file per failed
+	// deployment, and a relay retrying a broken deployment accumulated
+	// thousands.
+	defer func() { _ = os.Remove(jobPath) }()
+	started := time.Now().UTC().Format(time.RFC3339)
+	statePath := filepath.Join(job.RuntimeDir, "app-deploy-state.json")
+	fail := func(deployErr error) error {
+		stateErr := writeState(statePath, State{
+			State:          "failed",
+			TargetVersion:  job.Version,
+			TargetRevision: job.Revision,
+			StartedAt:      started,
+			FinishedAt:     time.Now().UTC().Format(time.RFC3339),
+			Error:          safeError(deployErr),
+		})
+		if stateErr != nil {
+			return errors.Join(deployErr, fmt.Errorf("write failed app deployment state: %w", stateErr))
+		}
+		return deployErr
+	}
+	if !filepath.IsAbs(job.RuntimeDir) {
+		return errors.New("app deployment runtime directory must be absolute")
+	}
+	if err := os.MkdirAll(job.RuntimeDir, 0o700); err != nil {
+		return fail(err)
+	}
+	lock, err := lockFile(filepath.Join(job.RuntimeDir, "app-deploy.lock"))
+	if err != nil {
+		if errors.Is(err, errDeployLocked) {
+			return err
+		}
+		return fail(err)
+	}
+	defer lock.Close()
+
+	if err := validate(job); err != nil {
+		return fail(err)
+	}
+	write := func(state string, deployErr error) {
+		value := State{
+			State:          state,
+			TargetVersion:  job.Version,
+			TargetRevision: job.Revision,
+			StartedAt:      started,
+		}
+		if state == "succeeded" || state == "failed" {
+			value.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+		}
+		if deployErr != nil {
+			value.Error = safeError(deployErr)
+		}
+		_ = writeState(statePath, value)
+	}
+	write("deploying", nil)
+
+	if err := verifyWebBundle(job); err != nil {
+		write("failed", err)
+		return err
+	}
+	// launchd (macOS) and systemd-run (Linux) hand the worker an
+	// inherited working directory the deploy does not own: on macOS that is the
+	// read-only filesystem root. Wrangler resolves its account config cache at
+	// $PWD/.wrangler/cache and aborts the whole deployment when that mkdir
+	// fails, so pin every deployment to a relay-owned directory instead of
+	// inheriting one. --skip-caching below does not cover this: it only skips
+	// the Pages asset upload cache, not the config cache.
+	workDir := filepath.Join(job.RuntimeDir, "wrangler")
+	if err := os.MkdirAll(workDir, 0o700); err != nil {
+		deployErr := fmt.Errorf("create Wrangler working directory: %w", err)
+		write("failed", deployErr)
+		return deployErr
+	}
+	command := exec.Command(job.NPXPath, wranglerDeployArgs(job)...)
+	command.Dir = workDir
+	environment, credentialErr := commandEnvironmentWithCloudflareCredentials(job.NodeDir, childenv.WithoutReleaseCredentials(os.Environ()))
+	environment = replaceEnvironmentValue(environment, "NO_COLOR", "1")
+	if credentialErr != nil {
+		deployErr := fmt.Errorf("read Cloudflare credentials: %w", credentialErr)
+		write("failed", deployErr)
+		return deployErr
+	}
+	command.Env = environment
+	output, err := runCommandContext(ctx, command)
+	if err != nil {
+		deployErr := fmt.Errorf("Wrangler deployment failed: %w", err)
+		if diagnostic := compact(string(output), 500); diagnostic != "" {
+			deployErr = fmt.Errorf("Wrangler deployment failed: %w: %s", err, diagnostic)
+		}
+		write("failed", deployErr)
+		return deployErr
+	}
+	if err := verifyPublic(ctx, job); err != nil {
+		write("failed", err)
+		return err
+	}
+	write("succeeded", nil)
+	return nil
+}
+
+func wranglerDeployArgs(job Job) []string {
+	return []string{
+		"--yes",
+		"wrangler@" + WranglerVersion,
+		"pages",
+		"deploy",
+		job.WebRoot,
+		"--project-name",
+		job.Project,
+		"--branch",
+		job.Branch,
+		// Avoid Wrangler's differential asset upload path. It can fail with
+		// a generic exit status when an older deployment's cache is stale;
+		// this bundle is tiny and verified, so a complete asset upload is the
+		// safer deployment path.
+		"--skip-caching",
+	}
+}
+
+func runCommandContext(ctx context.Context, command *exec.Cmd) ([]byte, error) {
+	return processgroup.Run(ctx, command, processgroup.Options{
+		PostKillWait:         2 * time.Second,
+		ReturnOutputOnCancel: false,
+	})
+}
+
+var cloudflareCredentialKeys = [...]string{
+	"CLOUDFLARE_API_TOKEN",
+	"CLOUDFLARE_ACCOUNT_ID",
+}
+
+func commandEnvironmentWithCloudflareCredentials(nodeDir string, environment []string) ([]string, error) {
+	result := commandEnvironment(nodeDir, environment)
+	filename := strings.TrimSpace(os.Getenv("HERDR_RELAY_ENV"))
+	if filename == "" {
+		if directory := strings.TrimSpace(os.Getenv("HERDR_PLUGIN_CONFIG_DIR")); directory != "" {
+			filename = filepath.Join(directory, "relay.env")
+		}
+	}
+	values, err := readCloudflareCredentials(filename, result)
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range cloudflareCredentialKeys {
+		value := strings.TrimSpace(values[key])
+		if value == "" {
+			continue
+		}
+		existing, present := environmentValue(result, key)
+		if present && strings.TrimSpace(existing) != "" {
+			continue
+		}
+		result = replaceEnvironmentValue(result, key, value)
+	}
+	return result, nil
+}
+
+func readCloudflareCredentials(filename string, environment []string) (map[string]string, error) {
+	values := make(map[string]string, len(cloudflareCredentialKeys))
+	if filename == "" {
+		return values, nil
+	}
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return values, nil
+	}
+	assignments := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if !isShellVariableName(key) {
+			continue
+		}
+		assignments[key] = value
+	}
+	resolver := &shellVariableResolver{
+		assignments: assignments,
+		environment: environmentValues(environment),
+		states:      make(map[string]uint8),
+		values:      make(map[string]string),
+	}
+	for _, key := range cloudflareCredentialKeys {
+		value, err := resolver.resolve(key)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", key, err)
+		}
+		values[key] = value
+	}
+	return values, nil
+}
+
+type shellVariableResolver struct {
+	assignments map[string]string
+	environment map[string]string
+	states      map[string]uint8
+	values      map[string]string
+}
+
+func (r *shellVariableResolver) resolve(name string) (string, error) {
+	if value, ok := r.values[name]; ok {
+		return value, nil
+	}
+	if r.states[name] == 1 {
+		return "", fmt.Errorf("cyclic relay environment variable %q", name)
+	}
+	raw, ok := r.assignments[name]
+	if !ok {
+		value := r.environment[name]
+		r.values[name] = value
+		return value, nil
+	}
+	r.states[name] = 1
+	value, err := parseShellEnvironmentValue(raw, r.resolve)
+	if err != nil {
+		delete(r.states, name)
+		return "", err
+	}
+	r.states[name] = 2
+	r.values[name] = value
+	return value, nil
+}
+
+func environmentValues(environment []string) map[string]string {
+	values := make(map[string]string, len(environment))
+	for _, item := range environment {
+		key, value, ok := strings.Cut(item, "=")
+		if ok && isShellVariableName(key) {
+			values[key] = value
+		}
+	}
+	return values
+}
+
+func isShellVariableName(value string) bool {
+	if value == "" || !isShellVariableNameStart(value[0]) {
+		return false
+	}
+	for index := range len(value) - 1 {
+		if !isShellVariableNamePart(value[index+1]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isShellVariableNameStart(value byte) bool {
+	return value == '_' || value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z'
+}
+
+func isShellVariableNamePart(value byte) bool {
+	return isShellVariableNameStart(value) || value >= '0' && value <= '9'
+}
+
+func shellVariableReference(value string, index int) (string, int, bool) {
+	if index+1 >= len(value) {
+		return "", index + 1, false
+	}
+	if value[index+1] == '{' {
+		closing := strings.IndexByte(value[index+2:], '}')
+		if closing < 0 {
+			return "", index + 1, false
+		}
+		closing += index + 2
+		name := value[index+2 : closing]
+		if !isShellVariableName(name) {
+			return "", closing + 1, false
+		}
+		return name, closing + 1, true
+	}
+	if !isShellVariableNameStart(value[index+1]) {
+		return "", index + 1, false
+	}
+	end := index + 2
+	for end < len(value) && isShellVariableNamePart(value[end]) {
+		end++
+	}
+	return value[index+1 : end], end, true
+}
+
+func parseShellEnvironmentValue(value string, resolve func(string) (string, error)) (string, error) {
+	return unquoteShellWord(strings.TrimSpace(stripShellInlineComment(value)), resolve)
+}
+
+func stripShellInlineComment(value string) string {
+	quote := byte(0)
+	escaped := false
+	escapedWhitespace := false
+	for index := range len(value) {
+		char := value[index]
+		if escaped {
+			escaped = false
+			escapedWhitespace = char == ' ' || char == '\t'
+			continue
+		}
+		if char == '\\' && quote != '\'' {
+			escaped = true
+			escapedWhitespace = false
+			continue
+		}
+		if quote != 0 {
+			if char == quote {
+				quote = 0
+			}
+			escapedWhitespace = false
+			continue
+		}
+		if char == '\'' || char == '"' {
+			quote = char
+			escapedWhitespace = false
+			continue
+		}
+		if char == '#' && index > 0 &&
+			(value[index-1] == ' ' || value[index-1] == '\t') &&
+			!escapedWhitespace {
+			return value[:index]
+		}
+		escapedWhitespace = false
+	}
+	return value
+}
+
+func unquoteShellWord(value string, resolve func(string) (string, error)) (string, error) {
+	var result strings.Builder
+	quote := byte(0)
+	escaped := false
+	for index := 0; index < len(value); {
+		char := value[index]
+		if escaped {
+			if quote == '"' && char != '$' && char != '`' && char != '"' && char != '\\' {
+				result.WriteByte('\\')
+			}
+			result.WriteByte(char)
+			escaped = false
+			index++
+			continue
+		}
+		if char == '$' && quote != '\'' {
+			name, next, ok := shellVariableReference(value, index)
+			if !ok || resolve == nil {
+				return "", errors.New("unsupported shell variable expansion in relay.env")
+			}
+			expanded, err := resolve(name)
+			if err != nil {
+				return "", err
+			}
+			result.WriteString(expanded)
+			index = next
+			continue
+		}
+		if char == '`' && quote != '\'' {
+			return "", errors.New("unsupported command substitution in relay.env")
+		}
+		if quote == 0 {
+			switch char {
+			case ' ', '\t':
+				return "", errors.New("unquoted whitespace in relay.env value")
+			case ';', '&', '|', '<', '>', '(', ')', '*', '?', '[', '~':
+				return "", fmt.Errorf("unsupported shell syntax %q in relay.env value", char)
+			}
+		}
+		if quote == '\'' {
+			if char == '\'' {
+				quote = 0
+			} else {
+				result.WriteByte(char)
+			}
+			index++
+			continue
+		}
+		if quote == '"' {
+			if char == '\\' {
+				escaped = true
+			} else if char == '"' {
+				quote = 0
+			} else {
+				result.WriteByte(char)
+			}
+			index++
+			continue
+		}
+		if char == '\\' {
+			escaped = true
+		} else if char == '\'' || char == '"' {
+			quote = char
+		} else {
+			result.WriteByte(char)
+		}
+		index++
+	}
+	if escaped {
+		return "", errors.New("unterminated shell escape in relay.env value")
+	}
+	if quote != 0 {
+		return "", errors.New("unterminated shell quote in relay.env value")
+	}
+	return result.String(), nil
+}
+
+func environmentValue(environment []string, key string) (string, bool) {
+	prefix := key + "="
+	for _, value := range environment {
+		if strings.HasPrefix(value, prefix) {
+			return strings.TrimPrefix(value, prefix), true
+		}
+	}
+	return "", false
+}
+
+func replaceEnvironmentValue(environment []string, key, value string) []string {
+	prefix := key + "="
+	result := make([]string, 0, len(environment)+1)
+	for _, item := range environment {
+		if strings.HasPrefix(item, prefix) {
+			continue
+		}
+		result = append(result, item)
+	}
+	return append(result, key+"="+value)
+}
+
+func commandEnvironment(nodeDir string, environment []string) []string {
+	result := make([]string, 0, len(environment)+1)
+	pathValue := ""
+	for _, value := range environment {
+		if strings.HasPrefix(value, "PATH=") {
+			pathValue = strings.TrimPrefix(value, "PATH=")
+			continue
+		}
+		result = append(result, value)
+	}
+	result = append(result, "PATH="+nodeDir+string(os.PathListSeparator)+pathValue)
+	return result
+}
+
+func loadJob(filename string) (Job, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return Job{}, fmt.Errorf("read app deployment job: %w", err)
+	}
+	var job Job
+	if err := json.Unmarshal(data, &job); err != nil {
+		return Job{}, fmt.Errorf("parse app deployment job: %w", err)
+	}
+	return job, nil
+}
+
+func validate(job Job) error {
+	origin, err := setuphelper.NormalizeOrigin(job.Origin, false)
+	if err != nil || origin != job.Origin {
+		return errors.New("app deployment origin must be a canonical HTTPS origin")
+	}
+	if !projectPattern.MatchString(job.Project) {
+		return errors.New("app deployment project name is invalid")
+	}
+	if !branchPattern.MatchString(job.Branch) || strings.Contains(job.Branch, "..") || strings.HasPrefix(job.Branch, "/") {
+		return errors.New("app deployment branch is invalid")
+	}
+	if job.Version == "" || job.Revision == "" {
+		return errors.New("installed version and revision are required")
+	}
+	if info, err := os.Stat(job.WebRoot); err != nil || !info.IsDir() {
+		return errors.New("validated web bundle is unavailable")
+	}
+	if info, err := os.Stat(job.NPXPath); err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+		return errors.New("configured npx executable is unavailable")
+	}
+	if info, err := os.Stat(filepath.Join(job.NodeDir, "node")); err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+		return errors.New("configured Node.js executable is unavailable")
+	}
+	local, err := os.ReadFile(filepath.Join(job.WebRoot, "version.json"))
+	if err != nil {
+		return fmt.Errorf("read web bundle version: %w", err)
+	}
+	if err := verifyVersion(local, job.Version, job.Revision); err != nil {
+		return fmt.Errorf("web bundle identity: %w", err)
+	}
+	if err := verifyWebBundle(job); err != nil {
+		return err
+	}
+	if _, err := release.VerifyWebDescriptor(os.DirFS(job.WebRoot), job.Version); err != nil {
+		return fmt.Errorf("web release descriptor: %w", err)
+	}
+	return nil
+}
+
+func verifyWebBundle(job Job) error {
+	if job.WebHash == "" {
+		return errors.New("verified release web hash is required")
+	}
+	actual, err := release.WebHashFS(os.DirFS(job.WebRoot))
+	if err != nil {
+		return fmt.Errorf("hash web bundle: %w", err)
+	}
+	if actual != job.WebHash {
+		return errors.New("web bundle does not match the verified release manifest")
+	}
+	return nil
+}
+
+func VerifyPublic(ctx context.Context, webRoot, origin, version, revision string) error {
+	if webRoot == "" {
+		return errors.New("verified web release root is required for public verification")
+	}
+	normalizedOrigin, err := setuphelper.NormalizeOrigin(origin, false)
+	if err != nil {
+		return errors.New("public app origin must be a valid HTTPS origin without credentials, a path, query, or fragment")
+	}
+	descriptor, err := release.VerifyWebDescriptor(os.DirFS(webRoot), version)
+	if err != nil {
+		return fmt.Errorf("verify local web release descriptor: %w", err)
+	}
+	versionData, err := os.ReadFile(filepath.Join(webRoot, "version.json"))
+	if err != nil {
+		return fmt.Errorf("read local web version: %w", err)
+	}
+	if version == "" {
+		version = descriptor.Version
+	}
+	if revision == "" {
+		var identity struct {
+			Revision string `json:"revision"`
+		}
+		if err := json.Unmarshal(versionData, &identity); err != nil {
+			return fmt.Errorf("parse local web version: %w", err)
+		}
+		revision = identity.Revision
+	}
+	if err := verifyVersion(versionData, version, revision); err != nil {
+		return fmt.Errorf("local web version: %w", err)
+	}
+	return verifyPublic(ctx, Job{
+		WebRoot:  webRoot,
+		Origin:   normalizedOrigin,
+		Version:  version,
+		Revision: revision,
+	})
+}
+
+func verifyPublic(ctx context.Context, job Job) error {
+	verifyCtx, cancel := context.WithTimeout(ctx, publicVerificationTimeout)
+	defer cancel()
+	client := &http.Client{Timeout: publicRequestTimeout}
+	return verifyPublicWith(verifyCtx, job, client, publicRetryDelay)
+}
+
+type publicResourceFetchError struct {
+	resource string
+	cause    error
+}
+
+func (e *publicResourceFetchError) Error() string {
+	for _, err := range []error{errPublicOriginRedirect, errPublicCanonicalRedirect} {
+		if errors.Is(e.cause, err) {
+			return fmt.Sprintf("fetch public app resource /%s: %s", e.resource, err)
+		}
+	}
+	return fmt.Sprintf("fetch public app resource /%s failed", e.resource)
+}
+
+func (e *publicResourceFetchError) Unwrap() error {
+	return e.cause
+}
+
+type publicResponseError struct {
+	status int
+}
+
+func (e *publicResponseError) Error() string {
+	return fmt.Sprintf("verify public app: HTTP %d", e.status)
+}
+
+func samePublicOrigin(value, expected string) bool {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.User != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return false
+	}
+	return parsed.Scheme+"://"+parsed.Host == expected
+}
+
+func publicClient(client *http.Client, origin string) *http.Client {
+	if client == nil {
+		client = &http.Client{}
+	}
+	copy := *client
+	previousRedirect := copy.CheckRedirect
+	copy.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		if !samePublicOrigin(request.URL.String(), origin) {
+			return errPublicOriginRedirect
+		}
+		if previousRedirect != nil {
+			return previousRedirect(request, via)
+		}
+		return nil
+	}
+	return &copy
+}
+
+func verifyPublicWith(
+	ctx context.Context,
+	job Job,
+	client *http.Client,
+	retryDelay func(int) time.Duration,
+) error {
+	client = publicClient(client, job.Origin)
+	nonce := time.Now().UnixNano()
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		retryable, err := checkPublicBundle(ctx, job, client, nonce, attempt)
+		if err == nil {
+			return nil
+		}
+		if !retryable {
+			return err
+		}
+		lastErr = err
+
+		timer := time.NewTimer(retryDelay(attempt))
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return fmt.Errorf("public app did not publish the expected bundle before timeout: %w", lastErr)
+			}
+			return fmt.Errorf("verify public app: %w", ctx.Err())
+		}
+	}
+}
+
+const (
+	maxPublicResourceBytes = 32 * 1024 * 1024
+	longPublicAssetMaxAge  = 24 * time.Hour
+)
+
+func publicResourceURL(origin, resource, cacheBust string) (string, error) {
+	if resource == "" || strings.HasPrefix(resource, "/") || strings.ContainsAny(resource, "\\?#") ||
+		path.Clean(resource) != resource || resource == "." || resource == ".." || strings.HasPrefix(resource, "../") {
+		return "", errors.New("public app resource path is invalid")
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return "", err
+	}
+	parsed.Path = "/" + resource
+	parsed.RawQuery = ""
+	if cacheBust != "" {
+		parsed.RawQuery = "herdr_deploy_check=" + url.QueryEscape(cacheBust)
+	}
+	return parsed.String(), nil
+}
+
+func fetchPublicResource(
+	ctx context.Context,
+	client *http.Client,
+	origin, resource, cacheBust, acceptEncoding string,
+) ([]byte, http.Header, error) {
+	resourceURL, err := publicResourceURL(origin, resource, cacheBust)
+	if err != nil {
+		return nil, nil, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, resourceURL, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	request.Header.Set("Accept", "*/*")
+	request.Header.Set("Accept-Encoding", acceptEncoding)
+	if cacheBust != "" {
+		request.Header.Set("Cache-Control", "no-cache, no-store")
+	} else {
+		canonicalClient := *client
+		previousRedirect := client.CheckRedirect
+		canonicalClient.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+			if !samePublicOrigin(request.URL.String(), origin) {
+				return errPublicOriginRedirect
+			}
+			// Pages normalizes a build's index.html to its directory with a
+			// 308. Allow that one exact hop only for the verified build entry,
+			// without a query/fragment. The caller still checks MIME and digest
+			// of the returned bytes in both identity and Brotli probes.
+			if strings.HasPrefix(resource, "builds/") && strings.HasSuffix(resource, "/index.html") &&
+				len(via) == 1 && request.Response != nil && request.Response.StatusCode == http.StatusPermanentRedirect &&
+				request.URL.String() == strings.TrimSuffix(resourceURL, "index.html") {
+				if previousRedirect != nil {
+					return previousRedirect(request, via)
+				}
+				return nil
+			}
+			return errPublicCanonicalRedirect
+		}
+		client = &canonicalClient
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, nil, &publicResourceFetchError{resource: resource, cause: err}
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, response.Header, &publicResponseError{status: response.StatusCode}
+	}
+	if response.ContentLength > maxPublicResourceBytes {
+		return nil, response.Header, errors.New("public app resource exceeds verification limit")
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxPublicResourceBytes+1))
+	if err != nil {
+		return nil, response.Header, &publicResourceFetchError{resource: resource, cause: err}
+	}
+	if len(body) > maxPublicResourceBytes {
+		return nil, response.Header, errors.New("public app resource exceeds verification limit")
+	}
+	return body, response.Header, nil
+}
+
+func decodePublicRepresentation(body []byte, headers http.Header) ([]byte, error) {
+	encoding := strings.ToLower(strings.TrimSpace(headers.Get("Content-Encoding")))
+	switch encoding {
+	case "", "identity":
+		return body, nil
+	case "br":
+		reader := brotli.NewReader(bytes.NewReader(body))
+		decoded, err := io.ReadAll(io.LimitReader(reader, maxPublicResourceBytes+1))
+		if err != nil {
+			return nil, errors.New("decode Brotli public app resource failed")
+		}
+		if len(decoded) > maxPublicResourceBytes {
+			return nil, errors.New("decoded public app resource exceeds verification limit")
+		}
+		return decoded, nil
+	case "gzip":
+		reader, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return nil, errors.New("decode gzip public app resource failed")
+		}
+		defer reader.Close()
+		decoded, err := io.ReadAll(io.LimitReader(reader, maxPublicResourceBytes+1))
+		if err != nil {
+			return nil, errors.New("decode gzip public app resource failed")
+		}
+		if len(decoded) > maxPublicResourceBytes {
+			return nil, errors.New("decoded public app resource exceeds verification limit")
+		}
+		return decoded, nil
+	default:
+		return nil, errors.New("unsupported public app Content-Encoding")
+	}
+}
+
+func publicDigest(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func verifyPublicVersionMetadata(data []byte, job Job, descriptor release.WebDescriptor) error {
+	if err := verifyVersion(data, job.Version, job.Revision); err != nil {
+		return err
+	}
+	var identity struct {
+		Assets       int    `json:"assets"`
+		Build        string `json:"build"`
+		Entry        string `json:"entry"`
+		Script       string `json:"script"`
+		Style        string `json:"style"`
+		ScriptSHA256 string `json:"script_sha256"`
+		StyleSHA256  string `json:"style_sha256"`
+	}
+	if err := json.Unmarshal(data, &identity); err != nil {
+		return errors.New("public version metadata is invalid")
+	}
+	javascript := descriptor.Files["javascript"]
+	stylesheet := descriptor.Files["stylesheet"]
+	if identity.Assets != descriptor.Assets || identity.Build != descriptor.Build || identity.Entry != descriptor.Entry ||
+		identity.Script != "/"+javascript.Path || identity.Style != "/"+stylesheet.Path ||
+		identity.ScriptSHA256 != javascript.SHA256 || identity.StyleSHA256 != stylesheet.SHA256 {
+		return errors.New("public version metadata does not match the web release descriptor")
+	}
+	return nil
+}
+
+func verifiedTargetWebDescriptor(job Job) (release.WebDescriptor, error) {
+	if job.WebRoot == "" {
+		return release.WebDescriptor{}, errors.New("verified web release root is required for public verification")
+	}
+	descriptor, err := release.VerifyWebDescriptor(os.DirFS(job.WebRoot), job.Version)
+	if err != nil {
+		return release.WebDescriptor{}, fmt.Errorf("verify local web release descriptor: %w", err)
+	}
+	return descriptor, nil
+}
+
+func compareWebDescriptorIdentity(public, target release.WebDescriptor) error {
+	if public.Schema != target.Schema || public.Version != target.Version ||
+		public.Assets != target.Assets || public.Build != target.Build || public.Entry != target.Entry {
+		return errors.New("public release descriptor identity does not match the verified local target")
+	}
+	for _, name := range []string{"entry", "javascript", "stylesheet"} {
+		publicFile, publicOK := public.Files[name]
+		targetFile, targetOK := target.Files[name]
+		if !publicOK || !targetOK || publicFile != targetFile {
+			return fmt.Errorf("public %s digest does not match the verified local target", name)
+		}
+	}
+	return nil
+}
+
+func publicResourceMIMEValid(kind string, headers http.Header) bool {
+	contentType, _, err := mime.ParseMediaType(headers.Get("Content-Type"))
+	if err != nil {
+		return false
+	}
+	switch kind {
+	case "entry":
+		return contentType == "text/html"
+	case "javascript":
+		return contentType == "text/javascript" || contentType == "application/javascript"
+	case "stylesheet":
+		return contentType == "text/css"
+	default:
+		return false
+	}
+}
+
+func publicAssetCacheUnsafe(headers http.Header) bool {
+	for _, directive := range strings.Split(strings.Join(headers.Values("Cache-Control"), ","), ",") {
+		name, value, _ := strings.Cut(directive, "=")
+		switch strings.ToLower(strings.TrimSpace(name)) {
+		case "immutable":
+			return true
+		case "max-age", "s-maxage":
+			seconds, err := strconv.ParseUint(strings.Trim(strings.TrimSpace(value), `"`), 10, 64)
+			if err != nil || seconds >= uint64(longPublicAssetMaxAge/time.Second) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func checkCanonicalPublicBundle(
+	ctx context.Context,
+	job Job,
+	client *http.Client,
+	descriptor release.WebDescriptor,
+) (bool, error) {
+	for _, kind := range []string{"entry", "javascript", "stylesheet"} {
+		file := descriptor.Files[kind]
+		for _, encoding := range []string{"identity", "br"} {
+			body, headers, err := fetchPublicResource(ctx, client, job.Origin, file.Path, "", encoding)
+			if err != nil {
+				return publicErrorRetryable(err), fmt.Errorf("canonical public resource /%s: %w", file.Path, err)
+			}
+			if !publicResourceMIMEValid(kind, headers) {
+				return false, fmt.Errorf("canonical public resource /%s has an invalid Content-Type for %s", file.Path, kind)
+			}
+			if kind != "entry" && publicAssetCacheUnsafe(headers) {
+				return false, fmt.Errorf("canonical public resource /%s has an unsafe Cache-Control policy", file.Path)
+			}
+			body, err = decodePublicRepresentation(body, headers)
+			if err != nil {
+				return true, fmt.Errorf("decode canonical public resource /%s failed", file.Path)
+			}
+			if publicDigest(body) != file.SHA256 {
+				return false, fmt.Errorf("canonical public resource /%s does not match its descriptor digest", file.Path)
+			}
+		}
+	}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return false, errors.New("generate missing public asset probe failed")
+	}
+	missingPath := "assets/herdr-missing-" + hex.EncodeToString(nonce[:]) + ".js"
+	_, headers, err := fetchPublicResource(ctx, client, job.Origin, missingPath, "", "identity")
+	var responseErr *publicResponseError
+	if errors.As(err, &responseErr) {
+		return false, nil
+	}
+	if err != nil && headers == nil {
+		return publicErrorRetryable(err), fmt.Errorf("missing canonical public asset /%s: %w", missingPath, err)
+	}
+	return false, fmt.Errorf("missing canonical public asset /%s returned HTTP 200", missingPath)
+}
+
+func checkPublicBundle(
+	ctx context.Context,
+	job Job,
+	client *http.Client,
+	nonce int64,
+	attempt int,
+) (bool, error) {
+	targetDescriptor, err := verifiedTargetWebDescriptor(job)
+	if err != nil {
+		return false, err
+	}
+	cacheBust := fmt.Sprintf("%s-%d-%d", job.Revision, nonce, attempt)
+	descriptorData, descriptorHeaders, err := fetchPublicResource(ctx, client, job.Origin, "release.json", cacheBust, "identity")
+	if err != nil {
+		return publicErrorRetryable(err), err
+	}
+	descriptorData, err = decodePublicRepresentation(descriptorData, descriptorHeaders)
+	if err != nil {
+		return true, err
+	}
+	var rawDescriptor release.WebDescriptor
+	if err := json.Unmarshal(descriptorData, &rawDescriptor); err != nil {
+		return true, errors.New("decode public release descriptor failed")
+	}
+	if rawDescriptor.Files == nil {
+		return true, errors.New("public release descriptor has no files")
+	}
+	if err := compareWebDescriptorIdentity(rawDescriptor, targetDescriptor); err != nil {
+		return true, err
+	}
+	if retryable, err := checkCanonicalPublicBundle(ctx, job, client, targetDescriptor); err != nil {
+		return retryable, err
+	}
+	files := make(map[string][]byte, len(targetDescriptor.Files))
+	for _, name := range []string{"entry", "javascript", "stylesheet"} {
+		descriptorFile := targetDescriptor.Files[name]
+		identityBody, identityHeaders, fetchErr := fetchPublicResource(
+			ctx, client, job.Origin, descriptorFile.Path, cacheBust+"-"+name, "identity",
+		)
+		if fetchErr != nil {
+			return publicErrorRetryable(fetchErr), fetchErr
+		}
+		identityBody, decodeErr := decodePublicRepresentation(identityBody, identityHeaders)
+		if decodeErr != nil {
+			return true, decodeErr
+		}
+		files[descriptorFile.Path] = identityBody
+
+		compressedBody, compressedHeaders, fetchErr := fetchPublicResource(
+			ctx, client, job.Origin, descriptorFile.Path, cacheBust+"-br-"+name, "br",
+		)
+		if fetchErr != nil {
+			return publicErrorRetryable(fetchErr), fetchErr
+		}
+		compressedBody, decodeErr = decodePublicRepresentation(compressedBody, compressedHeaders)
+		if decodeErr != nil {
+			return true, decodeErr
+		}
+		if publicDigest(compressedBody) != descriptorFile.SHA256 {
+			return true, fmt.Errorf("public representation for %s does not match its descriptor", name)
+		}
+	}
+	if _, err := release.VerifyWebDescriptorData(descriptorData, files, job.Version); err != nil {
+		return true, errors.New("public web release descriptor verification failed")
+	}
+	versionData, versionHeaders, err := fetchPublicResource(
+		ctx, client, job.Origin, "version.json", cacheBust+"-version", "identity",
+	)
+	if err != nil {
+		return publicErrorRetryable(err), err
+	}
+	versionData, err = decodePublicRepresentation(versionData, versionHeaders)
+	if err != nil {
+		return true, err
+	}
+	if err := verifyPublicVersionMetadata(versionData, job, targetDescriptor); err != nil {
+		return true, fmt.Errorf("public web bundle identity: %w", err)
+	}
+	compressedVersionData, compressedVersionHeaders, err := fetchPublicResource(
+		ctx, client, job.Origin, "version.json", cacheBust+"-version-br", "br",
+	)
+	if err != nil {
+		return publicErrorRetryable(err), err
+	}
+	compressedVersionData, err = decodePublicRepresentation(compressedVersionData, compressedVersionHeaders)
+	if err != nil {
+		return true, err
+	}
+	if err := verifyPublicVersionMetadata(compressedVersionData, job, targetDescriptor); err != nil {
+		return true, fmt.Errorf("public compressed web bundle identity: %w", err)
+	}
+	return false, nil
+}
+
+func publicErrorRetryable(err error) bool {
+	if errors.Is(err, errPublicOriginRedirect) || errors.Is(err, errPublicCanonicalRedirect) {
+		return false
+	}
+	var responseErr *publicResponseError
+	if errors.As(err, &responseErr) {
+		return responseErr.status == http.StatusNotFound ||
+			responseErr.status == http.StatusRequestTimeout ||
+			responseErr.status == http.StatusTooEarly ||
+			responseErr.status == http.StatusTooManyRequests ||
+			responseErr.status >= http.StatusInternalServerError
+	}
+	return true
+}
+
+func publicRetryDelay(attempt int) time.Duration {
+	delay := time.Duration(attempt+1) * time.Second
+	return min(delay, 5*time.Second)
+}
+
+func verifyVersion(data []byte, version, revision string) error {
+	var identity struct {
+		Version        string `json:"version"`
+		ReleaseVersion string `json:"release_version"`
+		Revision       string `json:"revision"`
+	}
+	if err := json.Unmarshal(data, &identity); err != nil {
+		return errors.New("version metadata is invalid")
+	}
+	actualVersion := identity.ReleaseVersion
+	if actualVersion == "" {
+		actualVersion = identity.Version
+	}
+	if actualVersion != version || identity.Revision != revision {
+		return errors.New("version metadata does not match the expected version and revision")
+	}
+	return nil
+}
+
+func lockFile(filename string) (*os.File, error) {
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := filelock.Try(file); err != nil {
+		file.Close()
+		if errors.Is(err, filelock.ErrLocked) {
+			return nil, errDeployLocked
+		}
+		return nil, fmt.Errorf("lock app deployment: %w", err)
+	}
+	return file, nil
+}
+
+func writeState(filename string, state State) error {
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	directory := filepath.Dir(filename)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(directory, ".app-deploy-state.")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	if err := temp.Chmod(0o600); err != nil {
+		temp.Close()
+		return err
+	}
+	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempName, filename)
+}
+
+func compact(value string, limit int) string {
+	value = ansiEscapePattern.ReplaceAllString(value, "")
+	value = strings.Join(strings.Fields(value), " ")
+	if len(value) <= limit {
+		return value
+	}
+	const separator = " … "
+	if limit <= len(separator) {
+		return value[:limit]
+	}
+	head := (limit - len(separator)) / 2
+	tail := limit - len(separator) - head
+	return value[:head] + separator + value[len(value)-tail:]
+}
+
+func safeError(err error) string {
+	return compact(err.Error(), 500)
+}

@@ -1,0 +1,151 @@
+# Herdr Mobile Relay Quick Start
+
+Connect one Linux or macOS computer to your phone through a temporary Cloudflare
+tunnel, a gateway that needs no Cloudflare account (see **Skip Cloudflare**),
+or your Tailscale tailnet (see **Use Tailscale Instead**). You need Herdr 0.7.5
+or newer, Git, and `curl`. Herdr 0.9.0 is
+recommended for the complete live JSON inventory and workspace-management
+surface, but it is not the relay's minimum supported version.
+
+The relay shows the installed Herdr client separately from the running server
+version and protocol. If those differ, Settings reports the affected feature
+rather than treating the whole connection as unavailable.
+
+## 1. Install
+
+```bash
+herdr plugin install 0cv/herdr-mobile-relay
+```
+
+Choose **Cloudflare → Temporary Cloudflare Tunnel** when the setup menu opens.
+If it does not:
+
+```bash
+herdr plugin action invoke setup --plugin herdr-mobile-relay.events
+```
+
+Approve missing user-level tools if prompted. The plugin downloads the exact
+verified relay bundle; it does not require Python, Node.js, a Go toolchain, or
+`sudo`.
+
+## 2. Pair the Phone
+
+Each path prints the QR once it knows which origin serves the phone app.
+
+On the tunnel path, wait for the temporary tunnel, then choose:
+
+- **Use the app served by this temporary tunnel** for a quick one-computer trial.
+- **Use another Herdr app** to add this computer to an app you already use.
+
+Choosing the phone app does not change how your phone connects to this computer.
+WebRTC does not offer this chooser: the gateway serves no app. On that path the
+QR follows registration, and the app origin has to be an installed Herdr app.
+It reuses a recorded or `HERDR_PHONE_APP_URL` origin, and asks for one when
+neither exists.
+
+Scan the QR or open the complete HTTPS setup link. Keep it private: it contains
+the one-use bootstrap invitation in the URL fragment, which is never sent in
+the HTTP request. The installed app removes it after enrollment. iOS browser
+tabs retain it without redeeming it and direct you to the installed app, which
+prevents a disposable Safari tab from consuming the invitation. To use the tab
+itself as a device, choose **Pair this browser instead** in Settings. Each printed
+link pairs one phone within ten minutes; print it again for the next phone.
+
+Keep the pane open for a foreground Quick Start; Ctrl-C stops its relay. An
+installed background service keeps running. A new temporary tunnel gets a new
+hostname and setup link.
+
+## 3. Try It
+
+Run an agent in Herdr or tap **＋** in the phone app. You can inspect output,
+send prompts, answer approvals and plan questions, upload images, and manage the
+agent lifecycle.
+
+For Pi, enable **Settings → Pi Integration** for its computer, then run `/reload`
+in Pi or restart it. This is off until a controller enables it; the relay keeps
+owned copies current after updates. The CLI alternative is
+`bash relay/setup.sh --pi-install [agent-dir]`.
+
+On hosts with a published Piper runtime, setup downloads the engine and the
+English voice that reads responses aloud, cached outside the release so updates
+never fetch them again. Reading aloud turns itself on the first time. French,
+German, Spanish, and Chinese are downloaded on demand from the phone's Settings
+or with `relay/speech-voices.sh --languages fr`. Stock Apple Silicon uses
+macOS `say`; Settings does not offer neural voice downloads unless Piper is
+already installed.
+
+If a relay was updated after a failed Piper runtime extraction, reinstall only
+the cached engine with `relay/speech-voices.sh --reinstall-runtime`. The
+downloaded voices remain in place.
+
+## Skip Cloudflare
+
+Choose **WebRTC → Community WebRTC Gateway** in the setup menu. It checks the
+project's published gateways, saves the ordered list, then starts the relay and prints its
+QR. No account, no domain, no `cloudflared`. The gateways are run by the
+project: free, shared, best-effort.
+
+A gateway carries relay traffic only, so the phone app lives elsewhere: point
+`HERDR_PHONE_APP_URL` at an installed Herdr app, or host one with
+`make web-deploy`.
+
+A gateway cannot read your traffic — it copies frames that are already encrypted
+between the phone and the relay — and right after connecting both sides try to
+cut it out of the path with a direct WebRTC connection.
+
+[docs/transports.md](docs/transports.md) explains every choice and its settings;
+[docs/gateway-self-hosting.md](docs/gateway-self-hosting.md) covers running your
+own gateway.
+
+## Use Tailscale Instead
+
+Install Tailscale on your phone; the computer's Tailscale CLI must be 1.52 or
+newer. Sign in to the same tailnet and enable MagicDNS and HTTPS certificates in
+the tailnet DNS settings. On Linux or macOS with standalone or App Store
+Tailscale, open the plugin setup menu and choose **Tailscale → Always on
+Tailscale**; confirm the HTTPS port 8443 publication and background relay service. Scan the printed QR on your phone. The setup pane may
+close after setup; the service stays installed. To pair another phone, reopen
+setup and choose **Tailscale → Choose Phone App and Show QR**. If already
+configured, use that QR action rather than running setup again.
+
+If a WebRTC gateway is selected, **Always on Tailscale** replaces its selection
+after you confirm. Before choosing another transport later, choose **Tailscale →
+Turn Always on Tailscale Off**. Service reinstall, restart, and update do not
+require turning it off.
+See [Tailscale requirements and cleanup](docs/transports.md#tailscale-serve).
+
+## Make the Cloudflare Tunnel Permanent
+
+For a permanent Cloudflare tunnel, add a domain to Cloudflare, then run:
+
+```bash
+herdr plugin action invoke install-service --plugin herdr-mobile-relay.events
+```
+
+The wizard creates or resumes a dedicated tunnel, installs a background user
+service, verifies the public endpoint, and prints the stable QR. Repeat it on
+each computer with a different hostname and add every QR to the same phone app.
+
+[docs/cloudflare-tunnel.md](docs/cloudflare-tunnel.md) has the rest: hostname
+changes, the full action list, teardown, and uninstall.
+
+## Troubleshooting
+
+- **Port 8375 is busy:** stop the previous Quick Start or installed service.
+- **Temporary URL fails:** rerun Quick Start for a fresh hostname.
+- **Gateway registration times out:** check `HERDR_GATEWAY_URL` and outbound
+  HTTPS access; `curl -s localhost:8375/healthz` reports `gateway.registered`.
+- **App still shows the previous release after the relay updates:** open Settings,
+  choose **Check for Updates**, then **Load Update**. A separately hosted app
+  must be published by its configured deployment-owner relay first.
+- **Need the stable QR again:** invoke `setup-link`.
+- **Need relay log filtering:** see [Cloudflare tunnel logging](docs/cloudflare-tunnel.md#relay-logging).
+
+[README.md](README.md) indexes the rest of the documentation.
+
+## Add herdr-core
+
+To reach agents in herdr-app as well as the TUI, follow the
+[second-relay setup](docs/herdr-core.md): use `HERDR_RELAY_BACKEND=hc make
+stable-setup`, or `HERDR_RELAY_BACKEND=hc bash relay/tailscale-setup.sh`, to
+install and pair a separate background service without changing the TUI relay.

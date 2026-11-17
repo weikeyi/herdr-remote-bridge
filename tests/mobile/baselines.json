@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "candidate": {
+    "source": "release workflow artifact",
+    "mustBeExactArtifact": true
+  },
+  "baselines": [
+    {
+      "name": "0.25.0",
+      "version": "0.25.0",
+      "assets": 490,
+      "sourceRelease": "v0.25.0",
+      "sourceCommit": "ca2fa27c5aa46a4621568db462070715f0fc8193",
+      "archive": "herdr-mobile-relay_0.25.0_linux_amd64.tar.gz",
+      "url": "https://github.com/0cv/herdr-mobile-relay/releases/download/v0.25.0/herdr-mobile-relay_0.25.0_linux_amd64.tar.gz",
+      "archiveSha256": "8c7c87c479c148e743a5aa0c7e8af504da7fb2b4fec956a9fedf81db85fcfcca",
+      "webHash": "57c788f72c258cb569ad95baf6d2d48c4aa14d5d9dec71a6a652a59fb633fd89",
+      "revision": "ca2fa27c5aa46a4621568db462070715f0fc8193",
+      "entry": "/builds/0.25.0-490-d1262d57620f2e22/index.html",
+      "script": "/assets/app-c41dcc486755761ea1614ab4ac6ffa60e535d7ccd4d035d0d250da95de6e65e0.js",
+      "style": "/assets/app-b43b657a15ca3aad8c8181eab513263693022eab31dd59f37c875541b4f131c8.css",
+      "build": "d1262d57620f2e22448374ae6b0a22479b181c986fe4fbff560e371250e15037"
+    },
+    {
+      "name": "0.24.0",
+      "version": "0.24.0",
+      "assets": 485,
+      "sourceRelease": "v0.24.0",
+      "sourceCommit": "3aa3888a474f7ce4a5469fa9de15a463aeaf2c41",
+      "archive": "herdr-mobile-relay_0.24.0_linux_amd64.tar.gz",
+      "url": "https://github.com/0cv/herdr-mobile-relay/releases/download/v0.24.0/herdr-mobile-relay_0.24.0_linux_amd64.tar.gz",
+      "archiveSha256": "fa91a805e31df3dc3428d9f6e451be3784db9575dc5e6972e4280adb7ca7fd2a",
+      "webHash": "342e46d3d3dce513d08cabbafa95e2d07f7d0f34cd1b4175b0e96f8fe32697cf",
+      "revision": "3aa3888a474f7ce4a5469fa9de15a463aeaf2c41",
+      "entry": "/builds/0.24.0-485-5b76ce14c26ec65b/index.html",
+      "script": "/assets/app-a117555d3e8fa299206ed9e542af79e17a393af48abd43736e9da168a5c6b54e.js",
+      "style": "/assets/app-26918f6791a7740bd67b81af0c572f99ac2fa911d87d1eec46b41f1d0572ef4d.css",
+      "build": "5b76ce14c26ec65ba9d4b41020fd05f2d4ed9b0d556ac2f968c0d4b5bf58e944"
+    }
+  ]
+}

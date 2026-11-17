@@ -1,0 +1,505 @@
+name: mobile-device-ci
+
+on:
+  workflow_call:
+    outputs:
+      product_status:
+        value: ${{ jobs.environment_report.outputs.product_status }}
+      environment_status:
+        value: ${{ jobs.environment_report.outputs.environment_status }}
+      qualification_status:
+        value: ${{ jobs.gate.outputs.qualification_status }}
+    inputs:
+      artifact_run_id:
+        description: Calling workflow run containing the exact release artifact
+        required: true
+        type: string
+      artifact_name:
+        description: Exact artifact name produced by the calling workflow
+        required: false
+        default: release-bundles
+        type: string
+      candidate_commit:
+        description: Commit whose packaged bytes are being tested
+        required: false
+        default: ''
+        type: string
+      head_commit:
+        description: Workflow head commit, kept separate from the packaged build commit
+        required: false
+        default: ''
+        type: string
+      provenance_mode:
+        description: internal caller artifact or completed same-repository main push
+        required: false
+        default: internal
+        type: string
+      source_commit:
+        description: Exact source commit for external qualification
+        required: false
+        default: ''
+        type: string
+  workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: Successful check workflow run containing release-bundles
+        required: true
+        type: string
+      source_commit:
+        description: Exact commit from the completed main push
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: mobile-device-ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  provenance:
+    name: Validate exact artifact provenance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.validate.outputs.source_sha }}
+      head_sha: ${{ steps.validate.outputs.head_sha }}
+      artifact_run_id: ${{ steps.validate.outputs.artifact_run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26.13.0
+      - name: Assert shell Node runtime
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = v26.13.0
+          test "$(command -v node)" = "$(node -p 'process.execPath')"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+      - name: Validate source run and artifact
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_MODE: ${{ inputs.provenance_mode || '' }}
+          DISPATCH_EVENT: ${{ github.event_name == 'workflow_dispatch' }}
+          ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name || 'release-bundles' }}
+          CANDIDATE_COMMIT: ${{ inputs.candidate_commit }}
+          HEAD_COMMIT: ${{ inputs.head_commit }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          REPOSITORY: ${{ github.repository }}
+          CALLER_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          case "$ARTIFACT_RUN_ID" in *[!0-9]*|'') exit 1 ;; esac
+          case "$CALLER_RUN_ID" in *[!0-9]*|'') exit 1 ;; esac
+          if [ "$DISPATCH_EVENT" = true ]; then
+            MODE=external
+          else
+            MODE="${INPUT_MODE:-internal}"
+          fi
+          run_json="$(gh api "repos/$REPOSITORY/actions/runs/$ARTIFACT_RUN_ID")"
+          run_repository="$(jq -r '.repository.full_name // empty' <<<"$run_json")"
+          run_sha="$(jq -r '.head_sha // empty' <<<"$run_json")"
+          run_event="$(jq -r '.event // empty' <<<"$run_json")"
+          run_branch="$(jq -r '.head_branch // empty' <<<"$run_json")"
+          run_workflow="$(jq -r '.path // empty' <<<"$run_json")"
+          head_repository="$(jq -r '.head_repository.full_name // empty' <<<"$run_json")"
+          test "$run_repository" = "$REPOSITORY"
+          case "$run_sha" in *[!0-9a-f]*|'') exit 1 ;; esac
+          test "${#run_sha}" -eq 40
+          head_sha="${HEAD_COMMIT:-$run_sha}"
+          case "$head_sha" in *[!0-9a-f]*|'') exit 1 ;; esac
+          test "${#head_sha}" -eq 40
+          test "$head_sha" = "$run_sha"
+          artifact_json="$(gh api "repos/$REPOSITORY/actions/runs/$ARTIFACT_RUN_ID/artifacts" --paginate | jq -cs --arg name "$ARTIFACT_NAME" 'map(.artifacts[]) | map(select(.name == $name and .expired == false))')"
+          artifact_count="$(jq 'length' <<<"$artifact_json")"
+          test "$artifact_count" = 1
+          artifact_id="$(jq -r '.[0].id' <<<"$artifact_json")"
+          test -n "$artifact_id" && test "$artifact_id" != null
+          work_dir="$(mktemp -d)"
+          trap 'rm -rf "$work_dir"' EXIT
+          gh api "repos/$REPOSITORY/actions/artifacts/$artifact_id/zip" >"$work_dir/artifact.zip"
+          unzip -q "$work_dir/artifact.zip" -d "$work_dir/release"
+          mapfile -t checksum_files < <(find "$work_dir/release" -type f -name checksums.txt -print | sort)
+          test "${#checksum_files[@]}" -eq 1
+          checksums="${checksum_files[0]}"
+          checksum_count="$(awk 'NF { count++ } END { print count + 0 }' "$checksums")"
+          test "$checksum_count" -eq 4
+          mapfile -t archives < <(find "$work_dir/release" -type f -name 'herdr-mobile-relay_*.tar.gz' -print | sort)
+          test "${#archives[@]}" -eq 4
+          manifest_sha=
+          for archive in "${archives[@]}"; do
+            name="${archive##*/}"
+            expected_hash="$(awk -v name="$name" '$2 == name { count++; hash = $1 } END { if (count != 1) exit 1; print hash }' "$checksums")"
+            test "${#expected_hash}" -eq 64
+            case "$expected_hash" in *[!0-9a-f]*) exit 1 ;; esac
+            actual_hash="$(sha256sum "$archive" | awk '{print $1}')"
+            test "$actual_hash" = "$expected_hash"
+            extract_dir="$work_dir/${name%.tar.gz}"
+            mkdir -p "$extract_dir"
+            tar -xzf "$archive" --no-same-owner --no-same-permissions --no-overwrite-dir -C "$extract_dir" --
+            manifest="$extract_dir/release-manifest.json"
+            test -f "$manifest"
+            revision="$(jq -r '.revision // empty' "$manifest")"
+            test -n "$revision"
+            if [ -z "$manifest_sha" ]; then manifest_sha="$revision"; fi
+            test "$revision" = "$manifest_sha"
+          done
+          case "$manifest_sha" in *[!0-9a-f]*|'') exit 1 ;; esac
+          test "${#manifest_sha}" -eq 40
+          provenance_result="$(
+            PROVENANCE_MODE="$MODE" \
+            PROVENANCE_REPOSITORY="$REPOSITORY" \
+            PROVENANCE_ARTIFACT_RUN_ID="$ARTIFACT_RUN_ID" \
+            PROVENANCE_CALLER_RUN_ID="$CALLER_RUN_ID" \
+            PROVENANCE_CANDIDATE_COMMIT="$CANDIDATE_COMMIT" \
+            PROVENANCE_SOURCE_COMMIT="$SOURCE_COMMIT" \
+            PROVENANCE_MANIFEST_REVISION="$manifest_sha" \
+            PROVENANCE_RUN_REPOSITORY="$run_repository" \
+            PROVENANCE_HEAD_SHA="$head_sha" \
+            PROVENANCE_RUN_EVENT="$run_event" \
+            PROVENANCE_RUN_BRANCH="$run_branch" \
+            PROVENANCE_RUN_WORKFLOW="$run_workflow" \
+            PROVENANCE_HEAD_REPOSITORY="$head_repository" \
+            PROVENANCE_RUN_STATUS="$(jq -r '.status // empty' <<<"$run_json")" \
+            PROVENANCE_RUN_CONCLUSION="$(jq -r '.conclusion // empty' <<<"$run_json")" \
+            bun tests/mobile/provenance-check.ts
+          )"
+          source_sha="$(jq -r '.sourceSha' <<<"$provenance_result")"
+          validated_head_sha="$(jq -r '.headSha' <<<"$provenance_result")"
+          test "$validated_head_sha" = "$head_sha"
+          printf 'source_sha=%s\n' "$source_sha" >> "$GITHUB_OUTPUT"
+          printf 'head_sha=%s\n' "$head_sha" >> "$GITHUB_OUTPUT"
+          printf 'artifact_run_id=%s\n' "$ARTIFACT_RUN_ID" >> "$GITHUB_OUTPUT"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf 'build_sha=%s\nhead_sha=%s\nartifact_run_id=%s\n' "$source_sha" "$head_sha" "$ARTIFACT_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  prepare:
+    needs: provenance
+    if: needs.provenance.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      device_matrix: ${{ steps.matrix.outputs.device_matrix }}
+      candidate_web_hash: ${{ steps.artifact_identity.outputs.web_hash }}
+      candidate_identity: ${{ steps.artifact_identity.outputs.identity }}
+      baseline_identities: ${{ steps.artifact_identity.outputs.baseline_identities }}
+    steps:
+      - name: Check out the verified source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.provenance.outputs.source_sha }}
+          fetch-depth: 1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26.13.0
+      - name: Assert shell Node runtime
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = v26.13.0
+          test "$(command -v node)" = "$(node -p 'process.execPath')"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Verify mobile toolchain declarations
+        run: |
+          jq -e '
+            .schema == 1 and
+            .node == "26.13.0" and
+            .bun == "1.4.4" and
+            .appium == "3.7.0" and
+            .appiumLogger == "2.0.11" and
+            .wda == "16.12.8" and
+            .drivers.uiautomator2 == "8.7.0" and
+            .drivers.xcuitest == "12.12.4" and
+            .android.systemImage == "system-images;android-35;google_apis;x86_64" and
+            .android.systemImagePolicy == "owned-google-apis-emulator" and
+            .android.vendingPolicy == "absent-or-disabled-user-0" and
+            .android.browserPackage == "com.android.chrome" and
+            .android.browserVersion == "131.0.6778.200 (677820038)" and
+            .android.browserSha256 == "261439a1ed20090f9f2f9aeef64024c1cfb9f242d4770f8f7c8f2e777843a35a" and
+            (.android.browserSha256 | length == 64 and test("^[0-9a-f]{64}$")) and
+            .android.browserCertificateSha256 == "f0fd6c5b410f25cb25c3b53346c8972fae30f8ee7411df910480ad6b2d60db83" and
+            (.android.browserCertificateSha256 | length == 64 and test("^[0-9a-f]{64}$")) and
+            .android.browserCertificateSha1 == "38918a453d07199354f8b19af05ec6562ced5788" and
+            (.android.browserCertificateSha1 | length == 40 and test("^[0-9a-f]{40}$")) and
+            .android.trichromeLibraryPackage == "com.google.android.trichromelibrary" and
+            .android.trichromeLibraryVersion == "131.0.6778.200 (677820038)" and
+            .android.trichromeLibrarySha256 == "f7d82fa76a99f13980c4205484f4ae78742755d2e9b7276fd60c20e3cd7f9090" and
+            (.android.trichromeLibrarySha256 | length == 64 and test("^[0-9a-f]{64}$")) and
+            .android.trichromeLibraryCertificateSha256 == "b6198a8d5689b62b96a0aa3829ce2cc67d59497f78c469f8792b2cd9255490a1" and
+            (.android.trichromeLibraryCertificateSha256 | length == 64 and test("^[0-9a-f]{64}$")) and
+            .android.trichromeLibraryCertificateSha1 == "9524aa4a04aceeab425451e593ac639c942fb3cd" and
+            (.android.trichromeLibraryCertificateSha1 | length == 40 and test("^[0-9a-f]{40}$")) and
+            .ios.runner == "xcode-27" and
+            .ios.xcode == "/Applications/Xcode_27.app" and
+            .ios.xcodeVersion == "27.0" and
+            .ios.xcodeBuild == "27A266a" and
+            .ios.runtime == "iOS 27.0" and
+            .ios.deviceType == "iPhone 17"
+          ' tests/mobile/toolchains.json >/dev/null
+          test "$(bun --version)" = 1.4.4
+      - name: Select latest-release device matrix
+        id: matrix
+        run: |
+          set -euo pipefail
+          bun -e '
+            import { readFileSync } from "node:fs";
+            const manifest = JSON.parse(readFileSync("tests/mobile/baselines.json", "utf8"));
+            const candidate = JSON.parse(readFileSync("web/version.json", "utf8"));
+            if (manifest.schema !== 1 || !Array.isArray(manifest.baselines) || !manifest.baselines.length) throw new Error("release baseline manifest is empty or invalid");
+            if (manifest.baselines.some(entry => typeof entry.name !== "string" || !/^[A-Za-z0-9._-]{1,100}$/.test(entry.name))) throw new Error("invalid release baseline name");
+            const baseline = manifest.baselines.find(entry => entry.version !== candidate.version || entry.script !== candidate.script || entry.style !== candidate.style)?.name;
+            if (!baseline) throw new Error("no distinct release baseline: candidate matches every listed release");
+            const include = [
+              {platform: "android", runner: "ubuntu-24.04", baseline, scenario: "historical"},
+              {platform: "ios", runner: "xcode-27", baseline, scenario: "historical"}
+            ];
+            console.log(`baseline=${baseline}`);
+            console.log(`device_matrix=${JSON.stringify({include})}`);
+          ' >> "$GITHUB_OUTPUT"
+      - name: Install mobile harness dependencies
+        run: bun install --frozen-lockfile --cwd tests/mobile
+      - name: Download exact release artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact_name || 'release-bundles' }}
+          path: dist/release
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.provenance.outputs.artifact_run_id }}
+      - name: Prepare and verify Android bundle set
+        env:
+          CANDIDATE_REVISION: ${{ needs.provenance.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          version="$(jq -r '.version' web/version.json)"
+          assets="$(jq -r '.assets' web/version.json)"
+          archive="herdr-mobile-relay_${version}_linux_amd64.tar.gz"
+          test -f "dist/release/$archive"
+          hash="$(awk -v name="$archive" '$2 == name { print $1 }' dist/release/checksums.txt)"
+          test "${#hash}" -eq 64
+          bun run --cwd tests/mobile prepare:bundle -- \
+            --candidate "$GITHUB_WORKSPACE/dist/release/$archive" \
+            --candidate-version "$version" \
+            --candidate-assets "$assets" \
+            --candidate-revision "$CANDIDATE_REVISION" \
+            --candidate-sha256 "$hash" \
+            --baseline "${{ steps.matrix.outputs.baseline }}" \
+            --output "$GITHUB_WORKSPACE/dist/mobile-android"
+      - name: Prepare and verify iOS bundle set
+        env:
+          CANDIDATE_REVISION: ${{ needs.provenance.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          version="$(jq -r '.version' web/version.json)"
+          assets="$(jq -r '.assets' web/version.json)"
+          archive="herdr-mobile-relay_${version}_darwin_arm64.tar.gz"
+          test -f "dist/release/$archive"
+          hash="$(awk -v name="$archive" '$2 == name { print $1 }' dist/release/checksums.txt)"
+          test "${#hash}" -eq 64
+          bun run --cwd tests/mobile prepare:bundle -- \
+            --candidate "$GITHUB_WORKSPACE/dist/release/$archive" \
+            --candidate-version "$version" \
+            --candidate-assets "$assets" \
+            --candidate-revision "$CANDIDATE_REVISION" \
+            --candidate-sha256 "$hash" \
+            --baseline "${{ steps.matrix.outputs.baseline }}" \
+            --output "$GITHUB_WORKSPACE/dist/mobile-ios"
+          test "$(jq -r '.candidate.identity.webHash' dist/mobile-android/bundle-set.json)" = "$(jq -r '.candidate.identity.webHash' dist/mobile-ios/bundle-set.json)"
+      - name: Record validated candidate identity
+        id: artifact_identity
+        run: |
+          web_hash="$(jq -r '.candidate.identity.webHash' dist/mobile-android/bundle-set.json)"
+          candidate_identity="$(jq -c '.candidate.identity' dist/mobile-android/bundle-set.json)"
+          baseline_identities="$(jq -c '[.baselines[] | {name, identity}]' dist/mobile-android/bundle-set.json)"
+          test "${#web_hash}" -eq 64
+          echo "web_hash=$web_hash" >> "$GITHUB_OUTPUT"
+          echo "identity=$candidate_identity" >> "$GITHUB_OUTPUT"
+          echo "baseline_identities=$baseline_identities" >> "$GITHUB_OUTPUT"
+      - name: Publish verified bundle sets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mobile-bundles-android
+          path: dist/mobile-android
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mobile-bundles-ios
+          path: dist/mobile-ios
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 1
+
+  device:
+    name: Release upgrade (${{ matrix.platform }})
+    needs: [provenance, prepare]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.device_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Check out the verified source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.provenance.outputs.source_sha }}
+          fetch-depth: 1
+      - name: Run latest-release upgrade
+        uses: ./.github/actions/mobile-device-run
+        with:
+          platform: ${{ matrix.platform }}
+          baseline: ${{ matrix.baseline }}
+          scenario: ${{ matrix.scenario }}
+          suite: release
+          source_head_sha: ${{ needs.provenance.outputs.head_sha }}
+          evidence_prefix: mobile-evidence-device
+
+  environment_report:
+    name: Environment report and qualification
+    needs: [provenance, prepare, device]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      product_status: ${{ steps.report.outputs.product_status }}
+      environment_status: ${{ steps.report.outputs.environment_status }}
+    steps:
+      - name: Require source and prepared matrix
+        env:
+          PROVENANCE_RESULT: ${{ needs.provenance.result }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+        run: |
+          set -euo pipefail
+          test "$PROVENANCE_RESULT" = success
+          test "$PREPARE_RESULT" = success
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.provenance.outputs.source_sha }}
+          fetch-depth: 1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: mobile-evidence-device-*-${{ github.run_attempt }}
+          path: evidence
+          merge-multiple: false
+      - name: Publish bounded complete-row environment report
+        id: report
+        env:
+          DEVICE_MATRIX: ${{ needs.prepare.outputs.device_matrix }}
+          CANDIDATE_COMMIT: ${{ needs.provenance.outputs.source_sha }}
+          SOURCE_RUN_HEAD_SHA: ${{ needs.provenance.outputs.head_sha }}
+          CANDIDATE_WEB_HASH: ${{ needs.prepare.outputs.candidate_web_hash }}
+          CANDIDATE_IDENTITY: ${{ needs.prepare.outputs.candidate_identity }}
+          BASELINE_IDENTITIES: ${{ needs.prepare.outputs.baseline_identities }}
+        run: |
+          bun tests/mobile/validate-environment.ts --contract product --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --directory evidence --matrix "$DEVICE_MATRIX" --suite release \
+            --candidate-commit "$CANDIDATE_COMMIT" --source-run-head-sha "$SOURCE_RUN_HEAD_SHA" \
+            --candidate-web-hash "$CANDIDATE_WEB_HASH" --candidate-identity "$CANDIDATE_IDENTITY" \
+            --baseline-identities "$BASELINE_IDENTITIES" --output environment-summary.json
+      - name: Require strict environment qualification
+        env:
+          DEVICE_MATRIX: ${{ needs.prepare.outputs.device_matrix }}
+          CANDIDATE_COMMIT: ${{ needs.provenance.outputs.source_sha }}
+          SOURCE_RUN_HEAD_SHA: ${{ needs.provenance.outputs.head_sha }}
+          CANDIDATE_WEB_HASH: ${{ needs.prepare.outputs.candidate_web_hash }}
+          CANDIDATE_IDENTITY: ${{ needs.prepare.outputs.candidate_identity }}
+          BASELINE_IDENTITIES: ${{ needs.prepare.outputs.baseline_identities }}
+        run: |
+          bun tests/mobile/validate-environment.ts --require-pass --contract qualified --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --directory evidence --matrix "$DEVICE_MATRIX" --suite release \
+            --candidate-commit "$CANDIDATE_COMMIT" --source-run-head-sha "$SOURCE_RUN_HEAD_SHA" \
+            --candidate-web-hash "$CANDIDATE_WEB_HASH" --candidate-identity "$CANDIDATE_IDENTITY" \
+            --baseline-identities "$BASELINE_IDENTITIES"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: mobile-environment-summary-${{ github.run_attempt }}
+          path: environment-summary.json
+          if-no-files-found: error
+          retention-days: 1
+
+  gate:
+    needs: [provenance, prepare, device, environment_report]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      qualification_status: ${{ steps.qualification.outputs.qualification_status }}
+    steps:
+      - name: Check out the verified source for final evidence validation
+        if: needs.provenance.result == 'success' && needs.device.result == 'success'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.provenance.outputs.source_sha }}
+          fetch-depth: 1
+      - name: Download current-attempt device evidence artifacts
+        if: needs.provenance.result == 'success' && needs.device.result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: mobile-evidence-device-*-${{ github.run_attempt }}
+          path: evidence
+          merge-multiple: false
+      - name: Install Node for final evidence validation
+        if: needs.provenance.result == 'success' && needs.device.result == 'success'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26.13.0
+      - name: Assert shell Node runtime
+        if: needs.provenance.result == 'success' && needs.device.result == 'success'
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = v26.13.0
+          test "$(command -v node)" = "$(node -p 'process.execPath')"
+      - name: Install Bun for final evidence validation
+        if: needs.provenance.result == 'success' && needs.device.result == 'success'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+      - name: Reject skipped or failed stages
+        env:
+          PROVENANCE_RESULT: ${{ needs.provenance.result }}
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          DEVICE_RESULT: ${{ needs.device.result }}
+          REPORT_RESULT: ${{ needs.environment_report.result }}
+        run: |
+          set -euo pipefail
+          test "$PROVENANCE_RESULT" = success
+          test "$PREPARE_RESULT" = success
+          test "$DEVICE_RESULT" = success
+          test "$REPORT_RESULT" = success
+      - name: Validate device result contracts
+        if: needs.device.result == 'success'
+        env:
+          DEVICE_MATRIX: ${{ needs.prepare.outputs.device_matrix }}
+          CANDIDATE_COMMIT: ${{ needs.provenance.outputs.source_sha }}
+          SOURCE_RUN_HEAD_SHA: ${{ needs.provenance.outputs.head_sha }}
+          CANDIDATE_WEB_HASH: ${{ needs.prepare.outputs.candidate_web_hash }}
+          CANDIDATE_IDENTITY: ${{ needs.prepare.outputs.candidate_identity }}
+          BASELINE_IDENTITIES: ${{ needs.prepare.outputs.baseline_identities }}
+        run: |
+          bun tests/mobile/validate-evidence.ts --contract qualified --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --directory evidence --matrix "$DEVICE_MATRIX" --suite release \
+            --candidate-commit "$CANDIDATE_COMMIT" --source-run-head-sha "$SOURCE_RUN_HEAD_SHA" \
+            --candidate-web-hash "$CANDIDATE_WEB_HASH" --candidate-identity "$CANDIDATE_IDENTITY" \
+            --baseline-identities "$BASELINE_IDENTITIES"
+      - name: Publish qualified workflow outcome
+        id: qualification
+        run: echo 'qualification_status=PASS' >> "$GITHUB_OUTPUT"

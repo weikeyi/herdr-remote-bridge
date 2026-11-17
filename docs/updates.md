@@ -1,0 +1,198 @@
+# Updates and Herdr compatibility
+
+How relay releases are verified, activated, and rolled back, how phone-driven
+upgrades work, and which Herdr versions the relay supports. Read this before
+upgrading a relay or hosting the phone app separately.
+
+## How a release is installed
+
+The plugin installs a pre-built, checksum- and manifest-verified bundle for the
+exact version in `herdr-plugin.toml`. Updates atomically activate the
+executable, web app, and runtime wrappers, verify their exact version,
+revision, and web hash after restart, and roll back the complete release if
+verification fails.
+
+Phone-driven upgrades run `herdr plugin install` in a transient worker pinned
+to the release commit.
+
+## Upgrading to v0.23.0
+
+Conversation / Full history is the default when an agent has native history;
+saved view preferences and the Terminal fallback remain available. Pi's optional
+integration streams live text and tool progress without a launch flag. Codex,
+Claude Code, Cursor, Qoder and Oh My Pi deliver updates after native records are
+written; OpenCode and Hermes still refresh recorded history periodically.
+
+Restart the relay after upgrading; the verified updater does this as part of
+activation. Enable Pi's optional integration with **Settings → Pi Integration**
+on its computer (controller access required). It defaults to off. Startup
+refreshes only existing marker-owned installations in the relay's known Pi
+profiles; it never adopts an unowned directory. The setting reports per-profile
+results and also recognizes manual CLI installations.
+
+Run `/reload` in each affected Pi pane, or restart Pi, to load refreshed files;
+this is never sent automatically. The CLI remains available as
+`bash relay/setup.sh --pi-install /absolute/profile/agent` (or `--pi-remove`).
+Turning the setting off removes only owned integration files. Live partials are
+visible to authorized paired readers as well as controllers while Full history is open; completion-time redactions cannot
+retract earlier updates. See the [Pi privacy policy](conversation-activity.md#pi-privacy-policy).
+
+## Upgrading to v0.21.0
+
+Version 0.21.0 adds live Herdr compatibility reporting, JSON-backed workspace
+and linked-worktree management, and verified Android/iOS installed-PWA device
+coverage. Settings distinguishes the installed Herdr client from the running
+server and reports affected feature support instead of treating one mismatch
+as a total connection failure.
+
+A relay deployment can publish the hosted app, but the update screen remains
+incomplete until the new phone bundle initializes and reports its verified build
+identity. Relay-only updates do not claim to have updated the phone.
+
+Phone acknowledgement also requires the integrity-checked stylesheet to have
+loaded. This uses the browser's stylesheet state, not a readiness flag from
+the separately cached manifest bootstrap, so a cached older bootstrap cannot leave a
+successfully loaded phone app stuck at an incomplete progress value.
+
+Hosted releases use a build-specific entry and content-addressed JavaScript and
+CSS with integrity metadata. `/` and `/index.html` remain same-origin bootstrap
+URLs, so an installed app keeps its manifest identity, storage, pairings, and
+preferences while it crosses the cutover. Pending progress survives a restart;
+a failed or exhausted automatic reload is shown as an actionable phone-load
+failure rather than retried indefinitely.
+
+If the app cannot load the new bundle, leave the pending update item in place
+and use **Load Update** once more from the existing app. If the bounded recovery
+is exhausted, inspect the displayed version/build identity and deployment
+status; do not clear browser data or reinstall, because those actions discard
+the credentials and preferences the recovery is designed to preserve.
+
+## Upgrading from v0.19.1
+
+Version 0.20.0 replaces E2EE v1 and the shared relay key with E2EE v2 and
+per-device credentials. The phone updater intentionally refuses this transport
+boundary because neither an app-first nor a relay-first rollout can keep the
+old phone connected.
+
+Upgrade each relay manually, exactly as for a fresh install:
+
+```bash
+herdr plugin install 0cv/herdr-mobile-relay
+```
+
+The setup menu opens by itself a moment after the install finishes. If it does
+not, open it:
+
+```bash
+herdr plugin action invoke setup --plugin herdr-mobile-relay.events
+```
+
+If your phones load the app from a separately hosted origin — every gateway
+setup, and any tunnel setup that chose an installed app — that app is still
+0.19.1 and cannot talk to the new relay. The phone-driven updater would have
+published it first; a manual upgrade has to: on the deployment-owner computer
+choose **Cloudflare → Configure App Deployment** and answer
+**Y** to "Deploy app version 0.20.0 now?". The menu's status line says so as
+long as the hosted app is behind ("serves 0.19.1, this relay ships 0.20.0 —
+Cloudflare → Configure App Deployment"). Relays
+that serve the app themselves through a tunnel need nothing more.
+
+Then choose your connection option to print a fresh bootstrap QR. It pairs one
+phone; print it again (**Choose Phone App and Show QR** in the selected path's
+submenu) for each additional phone, or use **Settings → Devices → Invite Device** on a paired
+controller to create a reader or controller invitation from the phone.
+Previously paired phones cannot reuse their v0.19.1 key: pair them again with a
+freshly printed link.
+
+`HERDR_MOBILE_RELAY_NO_AUTO_SETUP=1` in front of the install command suppresses
+the automatic menu; it exists for unattended upgrades, not for this one.
+
+## The deployment-owner role
+
+The relay-hosted app updates with its relay. For a separately hosted Cloudflare
+Pages app, configure exactly one stable relay as deployment owner with the
+`configure-app-deploy` action. The worker deploys and verifies the target app
+before it installs and restarts the relay; a failed download, compatibility
+check, deployment, or public-origin check leaves the current relay running.
+
+Public verification waits for the target release descriptor, then checks the
+canonical entry, JavaScript, and stylesheet URLs without cache-busting queries.
+For a build entry only, a single same-origin HTTP 308 redirect from
+`/builds/<build>/index.html` to `/builds/<build>/` is accepted, matching Pages'
+normal URL normalization. It must not add a query or fragment, change builds,
+or redirect again. JavaScript and stylesheet redirects remain rejected, and
+the returned entry still has to match its expected MIME type and digest.
+Wrong MIME types or digests, immutable or day-long asset cache policies, and
+successful responses for missing assets fail immediately. If `verify-public`
+names a cached canonical resource, purge exactly that URL in Cloudflare and
+re-run verification; do not clear the phone's data.
+
+The optional deployment-owner role requires Node.js 22 or newer — Wrangler's own
+floor, and what the action verifies before it records a directory — plus
+Cloudflare credentials on that computer only. The action looks for `node` where
+nvm, fnm, volta, and asdf put it, not only on `PATH`.
+
+A Pages project can only deploy a domain it already serves. When the origin you
+enter is not one of them, and the account has exactly one Pages project, the
+action attaches it for you if `relay.env` carries a `CLOUDFLARE_API_TOKEN` with
+Pages:Edit — the updater pins Wrangler 4.125.0 and skips Wrangler's differential
+asset cache during deployment because that upload path can fail against stale
+Pages cache state. Set `HERDR_APP_DEPLOY_ATTACH_DOMAIN=true` to allow that
+without being asked, or `false` to refuse. Otherwise it names the credential to
+set and offers to take a different origin.
+
+## Release checks and app reloads
+
+Release checks use the GitHub API. When an unauthenticated request is rate
+limited, they fall back to the public `releases/latest` redirect for the stable
+tag and that tag's Atom commit feed for its revision. Loading a
+newly deployed phone app uses a versioned navigation, so a sleeping browser or
+installed PWA does not reuse a stale document.
+
+## Herdr version compatibility
+
+The relay continues to support Herdr 0.7.5 or newer.
+
+Herdr 0.8.0 and newer can resume restored agent sessions without a TUI
+attached ([#2064](https://github.com/herdrdev/herdr/issues/2064)) and keep the
+desktop user's focus when a background workspace closes
+([#1328](https://github.com/herdrdev/herdr/discussions/1328),
+[#1621](https://github.com/herdrdev/herdr/issues/1621)). Phone-driven **Stop**
+still cascades a single-tab workspace away; the workspace then reports
+`workspace_not_found`.
+
+Herdr releases newer than 0.8.2 add screen-based working-state fallbacks for
+Claude Code ([#1630](https://github.com/herdrdev/herdr/issues/1630),
+[#2241](https://github.com/herdrdev/herdr/issues/2241)): a visible turn,
+background shells, or background agents keep a pane reported as working when
+terminal titles are unavailable or disabled. That accuracy flows straight to
+the phone, which keys completion notifications and history capture off those
+status transitions.
+
+## Installed-PWA upgrade coverage
+
+The installed-device suite in `docs/mobile-device-ci.md` checks the executing
+phone build, not only `/version.json`, while preserving real encrypted relay
+credentials and preferences. It uses historical old bundles, a deterministic
+HTTPS fixture, bounded asset faults, and native Home Screen relaunches. A green
+simulator run does not replace the separate physical-device and deployed-origin
+signoff for a user-facing release.
+
+## Troubleshooting
+
+- **Phone app deployment failed with `canonical public resource must not redirect`
+  at a build's `index.html`:** versions 0.22.6–0.22.8 reject Pages' normal
+  directory redirect. Version 0.22.9 fixes this. The old deployment-owner
+  relay also uses its own verifier before a phone-driven relay upgrade, so
+  it can block installing the fix. On that computer, run
+  `HERDR_MOBILE_RELAY_NO_AUTO_SETUP=1 herdr plugin install 0cv/herdr-mobile-relay --yes`
+  to update the relay first, then retry the app update from Settings. Do not
+  clear phone storage or pair again. Other redirect errors still require
+  checking the hosted origin rather than bypassing verification.
+- **Update operation failed with `read canonical release: HTTP 403`:** an older
+  relay's unauthenticated GitHub release check was rate-limited. Run
+  `HERDR_MOBILE_RELAY_NO_AUTO_SETUP=1 herdr plugin install 0cv/herdr-mobile-relay --yes`
+  once on that computer as the signed-in user; current releases retry through
+  the public release redirect and commit feed.
+- **Updated app still shows the previous version:** open Settings, choose
+  **Check for Updates**, then **Load Update**.

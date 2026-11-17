@@ -1,0 +1,333 @@
+package config
+
+import (
+	"log/slog"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+)
+
+func TestLoadDefaults(t *testing.T) {
+	isolateLoadEnvironment(t)
+	t.Setenv("HERDR_RELAY_LOG_LEVEL", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Host != "127.0.0.1" {
+		t.Errorf("host = %q, want 127.0.0.1", cfg.Host)
+	}
+	if cfg.Port != 8375 {
+		t.Errorf("port = %d, want 8375", cfg.Port)
+	}
+	if cfg.PluginPort != 8376 {
+		t.Errorf("plugin port = %d, want 8376", cfg.PluginPort)
+	}
+	if cfg.PollInterval != 2.0 {
+		t.Errorf("poll interval = %f, want 2.0", cfg.PollInterval)
+	}
+	if cfg.LogLevel != slog.LevelInfo {
+		t.Errorf("log level = %v, want %v", cfg.LogLevel, slog.LevelInfo)
+	}
+}
+
+func TestParseLogLevel(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		raw   string
+		want  slog.Level
+		error bool
+	}{
+		{name: "empty", raw: "", want: slog.LevelInfo},
+		{name: "whitespace", raw: "  \t", want: slog.LevelInfo},
+		{name: "debug", raw: "debug", want: slog.LevelDebug},
+		{name: "info", raw: "info", want: slog.LevelInfo},
+		{name: "warn", raw: "warn", want: slog.LevelWarn},
+		{name: "error", raw: "error", want: slog.LevelError},
+		{name: "mixed case and whitespace", raw: "  WaRn  ", want: slog.LevelWarn},
+		{name: "verbose", raw: "verbose", error: true},
+		{name: "warning", raw: "warning", error: true},
+		{name: "off", raw: "off", error: true},
+		{name: "numeric", raw: "7", error: true},
+		{name: "level expression", raw: "INFO+1", error: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseLogLevel(test.raw)
+			if test.error {
+				if err == nil || !strings.Contains(err.Error(), "HERDR_RELAY_LOG_LEVEL") {
+					t.Fatalf("parseLogLevel(%q) error = %v", test.raw, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseLogLevel(%q) error = %v", test.raw, err)
+			}
+			if got != test.want {
+				t.Errorf("parseLogLevel(%q) = %v, want %v", test.raw, got, test.want)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidLogLevel(t *testing.T) {
+	isolateLoadEnvironment(t)
+	t.Setenv("HERDR_RELAY_LOG_LEVEL", "verbose")
+
+	cfg, err := Load()
+	if err == nil {
+		t.Fatal("expected invalid log-level error")
+	}
+	if cfg != nil {
+		t.Fatalf("config = %#v, want nil", cfg)
+	}
+	if !strings.Contains(err.Error(), "HERDR_RELAY_LOG_LEVEL") {
+		t.Errorf("error = %v, want setting name", err)
+	}
+}
+
+func TestLoadRejectsTokenlessNonLoopback(t *testing.T) {
+	isolateLoadEnvironment(t)
+	t.Setenv("HERDR_RELAY_HOST", "0.0.0.0")
+	t.Setenv("HERDR_RELAY_TOKEN", "")
+	t.Setenv("HERDR_RELAY_TOKEN_FILE", "")
+	t.Setenv("HERDR_GATEWAY_REGISTRATION_TOKEN", "")
+	t.Setenv("HERDR_GATEWAY_REGISTRATION_TOKEN_FILE", "")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for tokenless non-loopback bind")
+	}
+}
+
+func TestLoadRejectsShortRelayKey(t *testing.T) {
+	isolateLoadEnvironment(t)
+	t.Setenv("HERDR_RELAY_TOKEN", "predictable")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected error for relay key shorter than 16 bytes")
+	}
+}
+
+func TestLoadAllowedOrigins(t *testing.T) {
+	isolateLoadEnvironment(t)
+	t.Setenv("HERDR_ALLOWED_ORIGINS", "https://a.com, https://b.com ,")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.AllowedOrigins) != 2 {
+		t.Fatalf("origins = %v, want 2 entries", cfg.AllowedOrigins)
+	}
+	if cfg.AllowedOrigins[0] != "https://a.com" || cfg.AllowedOrigins[1] != "https://b.com" {
+		t.Errorf("origins = %v", cfg.AllowedOrigins)
+	}
+}
+
+func TestLoadIsolatesAllXDGPaths(t *testing.T) {
+	isolateLoadEnvironment(t)
+	root := privateTestDir(t)
+	configHome := filepath.Join(root, "config")
+	cacheHome := filepath.Join(root, "cache")
+	dataHome := filepath.Join(root, "data")
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	t.Setenv("XDG_CACHE_HOME", cacheHome)
+	t.Setenv("XDG_DATA_HOME", dataHome)
+	t.Setenv("HERDR_RELAY_ENV", "")
+	t.Setenv("HERDR_PLUGIN_CONFIG_DIR", "")
+	t.Setenv("HERDR_RELEASE_ROOT", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConfigHome != configHome {
+		t.Fatalf("config home = %q, want %q", cfg.ConfigHome, configHome)
+	}
+	if cfg.CacheDir != filepath.Join(cacheHome, "herdr-mobile-relay") {
+		t.Fatalf("cache dir = %q", cfg.CacheDir)
+	}
+	if cfg.DataHome != dataHome {
+		t.Fatalf("data home = %q, want %q", cfg.DataHome, dataHome)
+	}
+	if cfg.RuntimeDir != filepath.Join(configHome, "herdr-mobile-relay") {
+		t.Fatalf("runtime dir = %q", cfg.RuntimeDir)
+	}
+	if cfg.ReleaseRoot != filepath.Join(dataHome, "herdr-mobile-relay") {
+		t.Fatalf("release root = %q", cfg.ReleaseRoot)
+	}
+}
+
+func TestLoadGatewayDefaults(t *testing.T) {
+	isolateLoadEnvironment(t)
+	t.Setenv("HERDR_GATEWAY_URL", "")
+	t.Setenv("HERDR_WEBRTC_UDP_PORT", "")
+	t.Setenv("HERDR_TRANSPORT_FORCE_RELAY", "")
+	t.Setenv("HERDR_REACHABILITY_PORT_MAPPING", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GatewayURL != "" {
+		t.Errorf("gateway url = %q, want empty", cfg.GatewayURL)
+	}
+	if cfg.WebRTCUDPPort != 0 {
+		t.Errorf("webrtc udp port = %d, want 0", cfg.WebRTCUDPPort)
+	}
+	if cfg.ForceRelayTransport {
+		t.Error("force relay transport = true, want false")
+	}
+	if !cfg.PortMappingEnabled {
+		t.Error("port mapping enabled = false, want true")
+	}
+}
+
+func TestLoadGatewaySettings(t *testing.T) {
+	isolateLoadEnvironment(t)
+	t.Setenv("HERDR_RELAY_TOKEN", "0123456789abcdef0123456789abcdef")
+	t.Setenv("HERDR_GATEWAY_URL", "wss://gw.example.com/")
+	t.Setenv("HERDR_WEBRTC_UDP_PORT", "41234")
+	t.Setenv("HERDR_TRANSPORT_FORCE_RELAY", "true")
+	t.Setenv("HERDR_REACHABILITY_PORT_MAPPING", "false")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GatewayURL != "wss://gw.example.com" {
+		t.Errorf("gateway url = %q, want trailing slash trimmed", cfg.GatewayURL)
+	}
+	if cfg.WebRTCUDPPort != 41234 {
+		t.Errorf("webrtc udp port = %d, want 41234", cfg.WebRTCUDPPort)
+	}
+	if !cfg.ForceRelayTransport {
+		t.Error("force relay transport = false, want true")
+	}
+	if cfg.PortMappingEnabled {
+		t.Error("port mapping enabled = true, want false")
+	}
+}
+
+func TestLoadRejectsNonWebSocketGatewayURL(t *testing.T) {
+	isolateLoadEnvironment(t)
+	t.Setenv("HERDR_RELAY_TOKEN", "0123456789abcdef0123456789abcdef")
+	t.Setenv("HERDR_GATEWAY_URL", "https://gw.example.com")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for non-websocket gateway url")
+	}
+}
+
+func TestLoadRejectsTokenlessGateway(t *testing.T) {
+	isolateLoadEnvironment(t)
+	t.Setenv("HERDR_RELAY_TOKEN", "")
+	t.Setenv("HERDR_GATEWAY_URL", "wss://gw.example.com")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for tokenless gateway registration")
+	}
+}
+
+func TestLoadParsesOrderedGatewayList(t *testing.T) {
+	isolateLoadEnvironment(t)
+	t.Setenv("HERDR_RELAY_TOKEN", "0123456789abcdef0123456789abcdef")
+	t.Setenv("HERDR_GATEWAY_URL", " wss://a.example.com , wss://b.example.com/ ,")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"wss://a.example.com", "wss://b.example.com"}
+	if !slices.Equal(cfg.GatewayURLs, want) {
+		t.Errorf("gateway urls = %v, want %v", cfg.GatewayURLs, want)
+	}
+	if cfg.GatewayURL != want[0] {
+		t.Errorf("gateway url = %q, want the first list entry %q", cfg.GatewayURL, want[0])
+	}
+}
+
+// TestLoadNormalisesGatewaySelection pins the rule the gateway transport reads
+// without re-validating it. Only an explicit "latency" opts into RTT ranking,
+// so a typo or an env file from a newer release still honours the configured
+// order instead of silently ranking a hand-listed gateway away.
+func TestLoadNormalisesGatewaySelection(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "empty", want: GatewaySelectionOrdered},
+		{name: "ordered", value: "ordered", want: GatewaySelectionOrdered},
+		{name: "upper case latency", value: " LATENCY ", want: GatewaySelectionLatency},
+		{name: "unrecognised", value: "fastest-wins", want: GatewaySelectionOrdered},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateLoadEnvironment(t)
+			t.Setenv("HERDR_RELAY_TOKEN", "0123456789abcdef0123456789abcdef")
+			t.Setenv("HERDR_GATEWAY_URL", "wss://mine.example.com,wss://community.example.com")
+			t.Setenv("HERDR_GATEWAY_SELECTION", tc.value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.GatewaySelection != tc.want {
+				t.Errorf("gateway selection = %q, want %q", cfg.GatewaySelection, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidSecondGatewayURL(t *testing.T) {
+	isolateLoadEnvironment(t)
+	t.Setenv("HERDR_RELAY_TOKEN", "0123456789abcdef0123456789abcdef")
+	t.Setenv("HERDR_GATEWAY_URL", "wss://a.example.com,https://b.example.com")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected an error for a non-websocket second gateway url")
+	}
+	if !strings.Contains(err.Error(), "https://b.example.com") {
+		t.Errorf("error = %v, want the offending entry named", err)
+	}
+}
+
+func isolateLoadEnvironment(t *testing.T) {
+	t.Helper()
+	root := privateTestDir(t)
+	t.Setenv("HOME", root)
+	t.Setenv("HERDR_RELAY_BACKEND", "")
+	t.Setenv("HC_SESSION", "")
+	t.Setenv("HC_SOCKET_PATH", "")
+	t.Setenv("HC_SOCKET", "")
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("HERDR_RELAY_HOST", "127.0.0.1")
+	t.Setenv("HERDR_RELAY_PORT", "")
+	t.Setenv("HERDR_RELAY_PLUGIN_PORT", "")
+	t.Setenv("HERDR_RELAY_TOKEN", "")
+	t.Setenv("HERDR_RELAY_INSTANCE_ID", "")
+	t.Setenv("HERDR_WEB_ROOT", "")
+	t.Setenv("HERDR_BIN", "/bin/false")
+	t.Setenv("HERDR_SOCKET_PATH", "")
+	t.Setenv("HERDR_RELAY_POLL_INTERVAL", "")
+	t.Setenv("HERDR_RELAY_LOG_FORMAT", "")
+	t.Setenv("HERDR_RELAY_LOG_LEVEL", "")
+	t.Setenv("HERDR_RELAY_SERVICE_NAME", "")
+	t.Setenv("HERDR_ALLOWED_ORIGINS", "")
+	t.Setenv("HERDR_GATEWAY_URL", "")
+	t.Setenv("HERDR_GATEWAY_SELECTION", "")
+	t.Setenv("HERDR_WEBRTC_UDP_PORT", "")
+	t.Setenv("HERDR_TRANSPORT_FORCE_RELAY", "")
+	t.Setenv("HERDR_REACHABILITY_PORT_MAPPING", "")
+	t.Setenv("HERDR_RELAY_REARM_BOOTSTRAP", "")
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(root, "data"))
+	t.Setenv("HERDR_RELAY_ENV", "")
+	t.Setenv("HERDR_PLUGIN_CONFIG_DIR", "")
+	t.Setenv("HERDR_RELEASE_ROOT", "")
+}
