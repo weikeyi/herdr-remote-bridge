@@ -1,0 +1,728 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { AttachmentBatchController } from '$lib/attachments';
+import { dailyActivitySummary, formatWorkingDuration } from '$lib/daily-activity';
+import { fencedCodeText, linkifyPlainText, safeExternalUrl, safeMarkdownHtml, speakableText } from '$lib/markdown';
+import { detectTerminalMenu, terminalTextInputMode } from '$lib/terminal-menu';
+import { escapeHtml, linkifyTerminalText, renderTerminalContent } from '$lib/terminal';
+import type { Activity, Agent, RelayWorkspace } from '$lib/types';
+import { homeRelativePath, informativePath, relayWorkspaceTrees, workspaceGroups, workspaceProvenance, workspaceStateTone } from '$lib/workspaces';
+
+function agent(overrides: Partial<Agent>): Agent {
+  return {
+    relay_id: 'relay-a',
+    relay_label: 'Laptop',
+    raw_pane_id: 'pane-1',
+    pane_id: 'relay-a::pane-1',
+    status: 'idle',
+    ...overrides,
+  };
+}
+
+function workspace(overrides: Partial<RelayWorkspace>): RelayWorkspace {
+  return {
+    relay_id: 'relay-a',
+    relay_label: 'Laptop',
+    workspace_id: 'work-1',
+    number: 1,
+    label: 'Mobile Relay',
+    focused: false,
+    pane_count: 1,
+    tab_count: 1,
+    active_tab_id: 'tab-1',
+    agent_status: 'idle',
+    cwd: '/home/user/mobile',
+    worktree: null,
+    ...overrides,
+  };
+}
+
+function activity(overrides: Partial<Activity>): Activity {
+  return {
+    timestamp: 0,
+    relay_id: 'relay-a',
+    relay_label: 'Laptop',
+    activity_key: 'activity',
+    pane_id: 'pane-1',
+    ...overrides,
+  };
+}
+
+describe('workspace navigation', () => {
+  it('groups panes by relay and workspace, then preserves tab hierarchy', () => {
+    const groups = workspaceGroups([
+      agent({ pane_id: 'relay-a::pane-2', raw_pane_id: 'pane-2', workspace_id: 'work-1', tab_id: 'tab-2', tab_number: 2, tab_label: 'Tests', status: 'working', project: 'mobile' }),
+      agent({ workspace_id: 'work-1', tab_id: 'tab-1', tab_number: 1, tab_label: 'Code', project: 'mobile' }),
+      agent({ relay_id: 'relay-b', relay_label: 'Desktop', pane_id: 'relay-b::pane-1', workspace_id: 'work-1', project: 'server' }),
+    ]);
+
+    expect(groups).toHaveLength(2);
+    expect(groups.find((group) => group.relayId === 'relay-a')).toMatchObject({
+      label: 'mobile',
+      workingCount: 1,
+      tabs: [{ label: 'Code' }, { label: 'Tests' }],
+    });
+  });
+
+  it('keeps authoritative labels and empty shell-only workspaces', () => {
+    const groups = workspaceGroups([
+      agent({ workspace_id: 'work-1', tab_id: 'tab-1', project: 'fallback' }),
+    ], [
+      workspace({}),
+      workspace({
+        workspace_id: 'work-2',
+        number: 2,
+        label: 'Shell Only',
+        cwd: '/home/user/shell',
+        pane_count: 1,
+        tab_count: 1,
+      }),
+    ]);
+
+    expect(groups).toHaveLength(2);
+    expect(groups.find((group) => group.workspaceId === 'work-1')).toMatchObject({
+      label: 'Mobile Relay',
+      cwd: '/home/user/mobile',
+    });
+    expect(groups.find((group) => group.workspaceId === 'work-2')).toMatchObject({
+      label: 'Shell Only',
+      agents: [],
+      tabCount: 1,
+      paneCount: 1,
+    });
+  });
+
+  it('nests linked worktrees under their repository workspace', () => {
+    const repo = {
+      repo_key: 'repo-key',
+      repo_name: 'mobile',
+      repo_root: '/home/user/mobile',
+    };
+    const trees = relayWorkspaceTrees([
+      workspace({
+        worktree: {
+          ...repo,
+          checkout_path: '/home/user/mobile',
+          is_linked_worktree: false,
+        },
+      }),
+      workspace({
+        workspace_id: 'work-2',
+        number: 2,
+        label: 'fix/one',
+        cwd: '/home/user/worktrees/fix-one',
+        worktree: {
+          ...repo,
+          checkout_path: '/home/user/worktrees/fix-one',
+          is_linked_worktree: true,
+        },
+      }),
+      workspace({ workspace_id: 'work-3', number: 3, label: 'Other' }),
+    ]);
+
+    expect(trees).toHaveLength(2);
+    expect(trees[0]).toMatchObject({
+      workspace: { workspace_id: 'work-1' },
+      children: [{ workspace_id: 'work-2', label: 'fix/one' }],
+      workspaceIds: ['work-1', 'work-2'],
+    });
+    expect(trees[1].workspace.workspace_id).toBe('work-3');
+  });
+
+  it('shows workspace provenance and worktree paths only when informative', () => {
+    const repo = { repo_key: 'repo-key', repo_name: 'ibkr', repo_root: '/home/user/ibkr' };
+    const parent = { label: 'ibkr', worktree: { ...repo, checkout_path: '/home/user/ibkr', is_linked_worktree: false } };
+    const renamed = { ...parent, label: 'Trading' };
+    const linked = { label: 'fix/one', worktree: { ...repo, checkout_path: '/home/user/worktrees/fix-one', is_linked_worktree: true } };
+
+    // "Repository · ibkr" inside a card titled "ibkr" repeats the title.
+    expect(workspaceProvenance(parent)).toBe('');
+    expect(workspaceProvenance(renamed)).toBe('Repository · ibkr');
+    // Nested under the parent card the tree already says it is a worktree;
+    // orphaned at top level the repository name is the only provenance left.
+    expect(workspaceProvenance(linked, true)).toBe('');
+    expect(workspaceProvenance(linked)).toBe('Worktree of ibkr');
+    expect(workspaceProvenance({ label: 'Shell Only', worktree: null })).toBe('');
+
+    // A checkout named after its label carries no extra information.
+    expect(informativePath('/home/user/worktrees/fix-one', 'fix-one')).toBe('');
+    expect(informativePath('/home/user/worktrees/fix-one', 'fix/one')).toBe('/home/user/worktrees/fix-one');
+    expect(informativePath('', 'fix-one')).toBe('');
+  });
+
+  it('prints directories against the relay home directory', () => {
+    expect(homeRelativePath('/home/dev/code/app', '/home/dev')).toBe('~/code/app');
+    expect(homeRelativePath('/home/dev', '/home/dev')).toBe('~');
+    expect(homeRelativePath('/home/dev/code/app', '/home/dev/')).toBe('~/code/app');
+    // Outside the home directory, and for a relay that reported no home
+    // directory at all, the absolute path is all there is to show.
+    expect(homeRelativePath('/srv/deploy', '/home/dev')).toBe('/srv/deploy');
+    expect(homeRelativePath('/home/developer/app', '/home/dev')).toBe('/home/developer/app');
+    expect(homeRelativePath('/home/dev/code/app', '')).toBe('/home/dev/code/app');
+    expect(homeRelativePath('', '/home/dev')).toBe('');
+  });
+
+  it('uses relay activity order when workspace timestamps tie', () => {
+    const groups = workspaceGroups([
+      agent({ raw_pane_id: 'pane-old', pane_id: 'relay-a::pane-old', project: 'old', activity_seq: 4 }),
+      agent({ raw_pane_id: 'pane-new', pane_id: 'relay-a::pane-new', project: 'new', activity_seq: 9 }),
+    ]);
+
+    expect(groups.map((group) => group.label)).toEqual(['new', 'old']);
+  });
+
+  it('counts done sessions apart from idle and ranks the workspace state dot', () => {
+    const [group] = workspaceGroups([
+      agent({ workspace_id: 'work-1', status: 'done', project: 'mobile' }),
+      agent({ pane_id: 'relay-a::pane-2', raw_pane_id: 'pane-2', workspace_id: 'work-1', status: 'working' }),
+      agent({ pane_id: 'relay-a::pane-3', raw_pane_id: 'pane-3', workspace_id: 'work-1', status: 'idle' }),
+    ]);
+    expect(group).toMatchObject({ doneCount: 1, workingCount: 1, readyCount: 1 });
+    // done > working > ready (idle) > unknown
+    expect(workspaceStateTone(group)).toBe('success');
+    expect(workspaceStateTone({ ...group, doneCount: 0 })).toBe('warning');
+    expect(workspaceStateTone({ ...group, doneCount: 0, workingCount: 0 })).toBe('ready');
+    expect(workspaceStateTone({ ...group, doneCount: 0, workingCount: 0, readyCount: 0 })).toBe('muted');
+  });
+});
+
+describe('safe rich output', () => {
+  it('turns explicit terminal URLs into isolated external links', () => {
+    const html = linkifyTerminalText('Docs: https://example.com/a?q=1). Local: http://[::1]:8375/path');
+    expect(html).toContain('href="https://example.com/a?q=1"');
+    expect(html).toContain('</a>).');
+    expect(html).toContain('href="http://[::1]:8375/path"');
+    expect(html).toContain('rel="noopener noreferrer"');
+    expect(html).toContain('referrerpolicy="no-referrer"');
+    expect(renderTerminalContent('\x1b[32mhttps://example.com/build\x1b[0m', 'ansi').html)
+      .toContain('class="terminal-link"');
+  });
+
+  it('renders a bounded Markdown subset without trusting message HTML or schemes', () => {
+    const html = safeMarkdownHtml('# Result\n\n**Done**: [report](https://example.com/report)\n\n<script>alert(1)</script>\n\n[x](javascript:alert(1))');
+    expect(html).toContain('<h3>Result</h3>');
+    expect(html).toContain('<strong>Done</strong>');
+    expect(html).toContain('href="https://example.com/report"');
+    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    expect(html).not.toContain('<script>');
+    expect(html).not.toContain('href="javascript:');
+  });
+
+  it('renders a GFM table with per-column alignment inside a scroll container', () => {
+    const html = safeMarkdownHtml([
+      'Comparison:',
+      '',
+      '| Model | Speed | Cost |',
+      '| --- | :---: | ---: |',
+      '| `fast` | high | $1 |',
+      '| slow | low | $2 |',
+      '',
+      'After.',
+    ].join('\n'));
+
+    expect(html).toContain('<div class="conversation-table"><table><thead><tr>');
+    expect(html).toContain('<th>Model</th>');
+    expect(html).toContain('<th style="text-align:center">Speed</th>');
+    expect(html).toContain('<th style="text-align:right">Cost</th>');
+    expect(html).toContain('<tbody><tr><td><code>fast</code></td>');
+    expect(html).toContain('<td style="text-align:right">$2</td></tr></tbody></table></div>');
+    expect(html).toContain('<p>After.</p>');
+  });
+
+  it('accepts bare and left-aligned delimiter rows without outer pipes', () => {
+    const html = safeMarkdownHtml('Name | Value\n:-- | -\nalpha | 1');
+
+    expect(html).toContain('<th style="text-align:left">Name</th><th>Value</th>');
+    expect(html).toContain('<tbody><tr><td style="text-align:left">alpha</td><td>1</td></tr></tbody>');
+  });
+
+  it('keeps escaped pipes literal and still escapes table cell content', () => {
+    const html = safeMarkdownHtml('| a \\| b | c |\n|---|---|\n| <img src=x> | y \\| z |');
+
+    expect(html).toContain('<th>a | b</th>');
+    expect(html).toContain('<td>&lt;img src=x&gt;</td>');
+    expect(html).toContain('<td>y | z</td>');
+    expect(html).not.toContain('<img');
+  });
+
+  it('pads ragged rows and drops cells past the header width', () => {
+    const html = safeMarkdownHtml('| a | b |\n|---|---|\n| 1 |\n| 1 | 2 | 3 |');
+
+    expect(html).toContain('<tr><td>1</td><td></td></tr>');
+    expect(html).toContain('<tr><td>1</td><td>2</td></tr>');
+    expect(html).not.toContain('<td>3</td>');
+  });
+
+  it('leaves delimiter-looking lines alone when no header row precedes them', () => {
+    expect(safeMarkdownHtml('|---|')).toBe('<p>|---|</p>');
+    expect(safeMarkdownHtml('| a | b |\n| --- |\n| 1 | 2 |')).not.toContain('<table>');
+    expect(safeMarkdownHtml('---')).toBe('<hr>');
+  });
+
+  it('copies only complete nonempty fenced code blocks', () => {
+    expect(fencedCodeText('before\n```ts\nconst value = 1;\n```\nafter\n```\nsecond()\n```'))
+      .toBe('const value = 1;\n\nsecond()');
+    expect(fencedCodeText('```\n\n```\n```ts\nunfinished')).toBeNull();
+  });
+
+  it('reduces markdown to prose worth hearing', () => {
+    // A speech engine reads formatting characters aloud - backticks were
+    // literally spoken on a phone - and a fenced block read character by
+    // character is noise.
+    expect(speakableText('Committed as `2c0060d`, gate **green**.'))
+      .toBe('Committed as 2c0060d, gate green.');
+    expect(speakableText('# Done\n\n- first *step*\n- see [the docs](https://example.com/x)\n\n```ts\nconst noise = 1;\n```\n\n---\n\nAfter.'))
+      .toBe('Done\nfirst step\nsee the docs\nCode block omitted.\nAfter.');
+    expect(speakableText('| Name | Value |\n| --- | --- |\n| a | 1 |'))
+      .toBe('Name, Value\na, 1');
+  });
+});
+
+describe('rendering without Intl.Segmenter', () => {
+  afterEach(() => {
+    vi.resetModules();
+  });
+
+  it('measures code points when the WebView ships no grapheme segmenter', async () => {
+    const intl = Intl as unknown as { Segmenter?: typeof Intl.Segmenter };
+    const segmenter = intl.Segmenter;
+    const grid = '┌───┬──┐\n│ ab │漢 │';
+    const expected = renderTerminalContent(grid, 'ansi', true).rows;
+    delete intl.Segmenter;
+    try {
+      vi.resetModules();
+      // Static import cannot work: the module must be evaluated again with
+      // Intl.Segmenter absent to exercise the feature-detected fallback.
+      const terminal = await import('$lib/terminal');
+      const rows = terminal.renderTerminalContent(grid, 'ansi', true).rows;
+
+      expect(rows.map((row) => [row.text, row.columns, row.fixedGrid]))
+        .toEqual(expected.map((row) => [row.text, row.columns, row.fixedGrid]));
+      expect(rows.map((row) => row.html)).toEqual(expected.map((row) => row.html));
+      expect(terminal.renderTerminalContent('ab漢字 👍', 'text').rows[0].columns).toBe(9);
+    } finally {
+      intl.Segmenter = segmenter;
+    }
+  });
+});
+
+describe('terminal key-hint fallback', () => {
+  it('derives only explicitly named keys and actions from the terminal footer', () => {
+    const menu = detectTerminalMenu([
+      'Choose a model',
+      'Current: balanced',
+      '↑/↓ to navigate · Enter to select · Esc to cancel',
+    ].join('\n'));
+
+    expect(menu?.title).toBe('Current: balanced');
+    expect(menu?.actions).toEqual([
+      { label: 'Up', keys: ['Up'], cancel: false },
+      { label: 'Down', keys: ['Down'], cancel: false },
+      { label: 'Select', keys: ['Enter'], cancel: false },
+      { label: 'Cancel', keys: ['Escape'], cancel: true },
+    ]);
+    expect(detectTerminalMenu('Press Enter when the build is done.')).toBeNull();
+  });
+
+  it('places previous and next around vertical plan navigation', () => {
+    const menu = detectTerminalMenu([
+      'Ask',
+      'Other (type your own)',
+      'Enter select · n note · ↑/↓ move · Tab/←/→ · Esc cancel',
+    ].join('\n'));
+
+    expect(menu?.actions.map((action) => action.label)).toEqual([
+      'Previous', 'Up', 'Down', 'Next', 'Select', 'Cancel',
+    ]);
+  });
+
+  it('enables terminal text only while an editor is asking for submission', () => {
+    expect(terminalTextInputMode([
+      'Custom answer: Which weekend?',
+      '>',
+      'enter or ctrl+q submit  esc cancel  ctrl+g external editor',
+    ].join('\n'))).toBe('submit');
+    expect(terminalTextInputMode([
+      'Other (type your own)',
+      'Enter select · n note · ↑/↓ move · Tab/←/→ · Esc cancel',
+    ].join('\n'))).toBeNull();
+  });
+});
+
+describe('daily activity summary', () => {
+  it('measures observed working intervals and counts retained outcomes', () => {
+    const now = Date.UTC(2026, 7, 12, 12);
+    const current = agent({ project: 'mobile', status: 'idle' });
+    const summary = dailyActivitySummary([
+      activity({ activity_key: '1', kind: 'working', timestamp: now - 120 * 60_000 }),
+      activity({ activity_key: '2', kind: 'blocked', timestamp: now - 90 * 60_000 }),
+      activity({ activity_key: '3', kind: 'working', timestamp: now - 60 * 60_000 }),
+      activity({ activity_key: '4', kind: 'finished', timestamp: now - 10 * 60_000 }),
+      activity({ activity_key: '5', kind: 'prompt', timestamp: now - 5 * 60_000 }),
+    ], [current], now);
+
+    expect(summary).toMatchObject({
+      workingMs: 80 * 60_000,
+      attention: 1,
+      completions: 1,
+      actions: 1,
+      relays: 1,
+    });
+    expect(summary.agents[0]).toMatchObject({ label: 'mobile', workingMs: 80 * 60_000 });
+    expect(formatWorkingDuration(summary.workingMs)).toBe('1h 20m');
+  });
+
+  it('bounds an already-running agent to the 24-hour summary window', () => {
+    const now = Date.UTC(2026, 7, 12, 12);
+    const summary = dailyActivitySummary([
+      activity({ kind: 'working', timestamp: now - 26 * 60 * 60_000 }),
+    ], [agent({ status: 'working' })], now);
+
+    expect(summary.workingMs).toBe(24 * 60 * 60_000);
+    expect(summary.relays).toBe(1);
+  });
+});
+
+describe('attachment batches', () => {
+  it('uses one monotonically increasing sequence across every file', async () => {
+    const sequences: number[] = [];
+    const names = ['first.txt', 'second.txt'];
+    const controller = new AttachmentBatchController({
+      server_session_id: 'server-session',
+      pane_id: 'pane',
+      terminal_id: 'terminal',
+      agent_session_id: 'session',
+      generation: 1,
+    }, {
+      begin: async () => ({
+        upload_id: 'upload',
+        chunk_bytes: 2,
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        limits: { max_files: 8, max_file_bytes: 1024, max_batch_bytes: 2048 },
+      }),
+      chunk: async (request) => {
+        sequences.push(request.sequence);
+        return {
+          file_index: request.file_index,
+          next_sequence: request.sequence + 1,
+          received_bytes: request.data.byteLength,
+        };
+      },
+      finish: async (request) => ({
+        attachments: request.files.map((file, index) => ({
+          ref: `ref-${index}`,
+          name: names[index],
+          media_type: 'text/plain',
+          bytes: 2,
+          sha256: file.sha256,
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
+        })),
+      }),
+      cancel: async () => undefined,
+    }, {
+      maxFiles: 8,
+      maxFileBytes: 1024,
+      maxBatchBytes: 2048,
+      maxChunkBytes: 2,
+    });
+    controller.select([
+      new File(['ab'], names[0], { type: 'text/plain' }),
+      new File(['cd'], names[1], { type: 'text/plain' }),
+    ]);
+
+    await expect(controller.upload()).resolves.toHaveLength(2);
+    expect(sequences).toEqual([0, 1]);
+  });
+
+  it('falls back to incremental hashing when the worker fails after construction', async () => {
+    const terminate = vi.fn();
+    class FailingWorker {
+      private errorListener?: EventListenerOrEventListenerObject;
+      addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+        if (type === 'error') this.errorListener = listener;
+      }
+      postMessage() {
+        queueMicrotask(() => {
+          if (typeof this.errorListener === 'function') this.errorListener(new Event('error'));
+          else this.errorListener?.handleEvent(new Event('error'));
+        });
+      }
+      terminate() { terminate(); }
+    }
+    vi.stubGlobal('Worker', FailingWorker);
+    const finish = vi.fn(async (request) => ({
+      attachments: [{
+        ref: 'ref-fallback',
+        name: 'note.txt',
+        media_type: 'text/plain',
+        bytes: 4,
+        sha256: request.files[0].sha256,
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+      }],
+    }));
+    const controller = new AttachmentBatchController({
+      server_session_id: 'server-session', pane_id: 'pane', terminal_id: 'terminal', generation: 1,
+    }, {
+      begin: async () => ({
+        upload_id: 'upload-fallback',
+        chunk_bytes: 2,
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        limits: { max_files: 1, max_file_bytes: 1024, max_batch_bytes: 1024 },
+      }),
+      chunk: async (request) => ({
+        file_index: request.file_index,
+        next_sequence: request.sequence + 1,
+        received_bytes: (request.sequence + 1) * request.data.byteLength,
+      }),
+      finish,
+      cancel: async () => undefined,
+    }, {
+      maxFiles: 1, maxFileBytes: 1024, maxBatchBytes: 1024, maxChunkBytes: 2,
+    });
+    controller.select([new File(['note'], 'note.txt', { type: 'text/plain' })]);
+    try {
+      await expect(controller.upload()).resolves.toHaveLength(1);
+      expect(finish).toHaveBeenCalledOnce();
+      expect(finish.mock.calls[0][0].files[0].sha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(terminate).toHaveBeenCalledOnce();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('terminates and settles every queued worker hash when cancelled', async () => {
+    const terminate = vi.fn();
+    let posted = 0;
+    class WaitingWorker {
+      addEventListener() {}
+      postMessage() { posted += 1; }
+      terminate() { terminate(); }
+    }
+    vi.stubGlobal('Worker', WaitingWorker);
+    const cancel = vi.fn(async () => undefined);
+    const finish = vi.fn(async () => ({ attachments: [] }));
+    const controller = new AttachmentBatchController({
+      server_session_id: 'server-session', pane_id: 'pane', terminal_id: 'terminal', generation: 1,
+    }, {
+      begin: async () => ({
+        upload_id: 'upload-cancel-hash',
+        chunk_bytes: 4,
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        limits: { max_files: 2, max_file_bytes: 1024, max_batch_bytes: 2048 },
+      }),
+      chunk: async (request) => ({
+        file_index: request.file_index,
+        next_sequence: request.sequence + 1,
+        received_bytes: request.data.byteLength,
+      }),
+      finish,
+      cancel,
+    }, {
+      maxFiles: 2, maxFileBytes: 1024, maxBatchBytes: 2048, maxChunkBytes: 4,
+    });
+    controller.select([
+      new File(['one'], 'one.txt', { type: 'text/plain' }),
+      new File(['two'], 'two.txt', { type: 'text/plain' }),
+    ]);
+    const upload = controller.upload();
+    try {
+      await vi.waitFor(() => expect(posted).toBe(2));
+      await expect(controller.cancel()).resolves.toBeUndefined();
+      await expect(upload).resolves.toEqual([]);
+      expect(terminate).toHaveBeenCalledOnce();
+      expect(cancel).toHaveBeenCalledWith(expect.objectContaining({ upload_id: 'upload-cancel-hash' }));
+      expect(finish).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('shows overflow files and accepts iOS photo MIME types', () => {
+    const controller = new AttachmentBatchController({
+      server_session_id: 'server-session',
+      pane_id: 'pane',
+      terminal_id: 'terminal',
+      generation: 1,
+    }, {
+      begin: async () => { throw new Error('unused'); },
+      chunk: async () => { throw new Error('unused'); },
+      finish: async () => { throw new Error('unused'); },
+      cancel: async () => undefined,
+    }, {
+      maxFiles: 1,
+      maxFileBytes: 1024,
+      maxBatchBytes: 2048,
+      maxChunkBytes: 1024,
+    });
+
+    const snapshot = controller.select([
+      new File(['photo'], 'photo.heic', { type: 'image/heic' }),
+      new File(['note'], 'note.txt', { type: 'text/plain' }),
+    ]);
+
+    expect(snapshot.items).toHaveLength(2);
+    expect(snapshot.items[0]).toMatchObject({ state: 'selected', mediaType: 'image/heic' });
+    expect(snapshot.items[1]).toMatchObject({ state: 'rejected', issue: { code: 'attachment_batch_limit' } });
+  });
+
+  it('restarts from the beginning after upload_begin fails', async () => {
+    const begin = vi.fn()
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValue({
+        upload_id: 'upload-retry',
+        chunk_bytes: 1024,
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        limits: { max_files: 1, max_file_bytes: 1024, max_batch_bytes: 1024 },
+      });
+    const controller = new AttachmentBatchController({
+      server_session_id: 'server-session',
+      pane_id: 'pane',
+      terminal_id: 'terminal',
+      generation: 1,
+    }, {
+      begin,
+      chunk: async (request) => ({
+        file_index: request.file_index,
+        next_sequence: request.sequence + 1,
+        received_bytes: request.data.byteLength,
+      }),
+      finish: async (request) => ({
+        attachments: [{
+          ref: 'ref',
+          name: 'note.txt',
+          media_type: 'text/plain',
+          bytes: 4,
+          sha256: request.files[0].sha256,
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
+        }],
+      }),
+      cancel: async () => undefined,
+    }, {
+      maxFiles: 1,
+      maxFileBytes: 1024,
+      maxBatchBytes: 1024,
+      maxChunkBytes: 1024,
+    });
+    controller.select([new File(['note'], 'note.txt', { type: 'text/plain' })]);
+
+    await expect(controller.upload()).rejects.toMatchObject({ code: 'attachment_upload_failed' });
+    expect(controller.snapshot().canRestart).toBe(true);
+    await expect(controller.restart()).resolves.toHaveLength(1);
+  });
+
+  it('cancels the relay session when cleared during upload_begin', async () => {
+    let resolveBegin!: (result: {
+      upload_id: string;
+      chunk_bytes: number;
+      expires_at: string;
+      limits: { max_files: number; max_file_bytes: number; max_batch_bytes: number };
+    }) => void;
+    const begin = new Promise<{
+      upload_id: string;
+      chunk_bytes: number;
+      expires_at: string;
+      limits: { max_files: number; max_file_bytes: number; max_batch_bytes: number };
+    }>((resolve) => { resolveBegin = resolve; });
+    const cancel = vi.fn(async () => undefined);
+    const controller = new AttachmentBatchController({
+      server_session_id: 'server-session',
+      pane_id: 'pane',
+      terminal_id: 'terminal',
+      generation: 1,
+    }, {
+      begin: async () => begin,
+      chunk: async () => { throw new Error('unused'); },
+      finish: async () => { throw new Error('unused'); },
+      cancel,
+    }, {
+      maxFiles: 1,
+      maxFileBytes: 1024,
+      maxBatchBytes: 1024,
+      maxChunkBytes: 1024,
+    });
+    controller.select([new File(['note'], 'note.txt', { type: 'text/plain' })]);
+    const upload = controller.upload();
+    await Promise.resolve();
+    const clearing = controller.cancel();
+    resolveBegin({
+      upload_id: 'pending-upload',
+      chunk_bytes: 1024,
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+      limits: { max_files: 1, max_file_bytes: 1024, max_batch_bytes: 1024 },
+    });
+
+    await expect(upload).resolves.toEqual([]);
+    await expect(clearing).resolves.toBeUndefined();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledWith(expect.objectContaining({ upload_id: 'pending-upload' }));
+  });
+});
+
+describe('rich output public-consumer characterization', () => {
+  it('preserves all five entities and double escaping through public consumers', () => {
+    expect(escapeHtml('&<>"\' &amp;')).toBe('&amp;&lt;&gt;&quot;&#39; &amp;amp;');
+    expect(linkifyPlainText('&<>"\' &amp;')).toBe('&amp;&lt;&gt;&quot;&#39; &amp;amp;');
+    expect(safeMarkdownHtml('&<>"\' &amp;')).toBe('<p>&amp;&lt;&gt;&quot;&#39; &amp;amp;</p>');
+  });
+
+  it.each([
+    [null, ''], [undefined, ''], [0, '0'], [false, 'false'],
+    [{ toString: () => '<value>' }, '&lt;value&gt;'],
+  ])('retains terminal coercion for %s', (value, expected) => {
+    expect(escapeHtml(value)).toBe(expected);
+  });
+
+  it('propagates terminal string-conversion exceptions', () => {
+    const error = new Error('conversion failed');
+    expect(() => escapeHtml({ toString: () => { throw error; } })).toThrow(error);
+  });
+
+  it.each([
+    ['HTTPS://ExAmPlE.COM:443/café/%2F?q=é&x=%20#été', 'https://example.com/caf%C3%A9/%2F?q=%C3%A9&x=%20#%C3%A9t%C3%A9'],
+    ['http://[2001:DB8::1]:80/a%20b#x', 'http://[2001:db8::1]/a%20b#x'],
+    ['http://user:p%40ss@ExAmPlE.COM:80/a', 'http://user:p%40ss@example.com/a'],
+    ['http://localhost:8375/a', 'http://localhost:8375/a'],
+    ['https:example.com/a', 'https://example.com/a'],
+  ])('retains native HTTP(S) serialization of %s', (value, expected) => {
+    expect(safeExternalUrl(value)).toBe(expected);
+  });
+
+  it.each(['javascript:alert(1)', 'data:text/plain,x', 'ftp://example.com/a', '/relative', '//example.com/a', 'https://', 'http://[::1', 'https://%'])('rejects %s at the public URL boundary', (value) => {
+    expect(safeExternalUrl(value)).toBe('');
+  });
+
+  it('does not extend link recognition to every native URL-accepted form', () => {
+    expect(linkifyPlainText('https:example.com/a')).toBe('https:example.com/a');
+    expect(linkifyTerminalText('https:example.com/a')).toBe('https:example.com/a');
+    expect(safeMarkdownHtml('https:example.com/a')).toBe('<p>https:example.com/a</p>');
+  });
+
+  // Counts, not nesting order; a balanced final closer also stops trimming punctuation inside it.
+  it.each([
+    ['https://example.com/a(b.)', '<a href="https://example.com/a(b.)" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">https://example.com/a(b.)</a>', '<a class="terminal-link" href="https://example.com/a(b.)" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">https://example.com/a(b.)</a>'],
+    ['https://example.com/a[b]', '<a href="https://example.com/a[b]" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">https://example.com/a[b]</a>', '<a class="terminal-link" href="https://example.com/a[b]" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">https://example.com/a[b]</a>'],
+    ['https://example.com/a([)]', '<a href="https://example.com/a([)]" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">https://example.com/a([)]</a>', '<a class="terminal-link" href="https://example.com/a([)]" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">https://example.com/a([)]</a>'],
+    ['https://example.com/a(b))].,;:!?', '<a href="https://example.com/a(b)" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">https://example.com/a(b)</a>)].,;:!?', '<a class="terminal-link" href="https://example.com/a(b)" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">https://example.com/a(b)</a>)].,;:!?'],
+  ])('preserves punctuation bytes for %s across consumers', (value, markdown, terminal) => {
+    expect(linkifyPlainText(value)).toBe(markdown);
+    expect(safeMarkdownHtml(value)).toBe(`<p>${markdown}</p>`);
+    expect(linkifyTerminalText(value)).toBe(terminal);
+  });
+
+  it('separates canonical encoded hrefs from escaped original display text', () => {
+    const value = 'HTTPS://ExAmPlE.COM:443/café/%2F?q=é&x=%20#été';
+    expect(linkifyPlainText(value)).toBe('<a href="https://example.com/caf%C3%A9/%2F?q=%C3%A9&amp;x=%20#%C3%A9t%C3%A9" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">HTTPS://ExAmPlE.COM:443/café/%2F?q=é&amp;x=%20#été</a>');
+    expect(safeMarkdownHtml(value)).toBe('<p><a href="https://example.com/caf%C3%A9/%2F?q=%C3%A9&amp;x=%20#%C3%A9t%C3%A9" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">HTTPS://ExAmPlE.COM:443/café/%2F?q=é&amp;x=%20#été</a></p>');
+    expect(linkifyTerminalText(value)).toBe('<a class="terminal-link" href="https://example.com/caf%C3%A9/%2F?q=%C3%A9&amp;x=%20#%C3%A9t%C3%A9" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">HTTPS://ExAmPlE.COM:443/café/%2F?q=é&amp;x=%20#été</a>');
+  });
+
+  it('escapes href attributes and preserves explicit labels and suffix highlighting', () => {
+    expect(safeMarkdownHtml('[<&label>](HTTPS://EXAMPLE.COM:443/a?x=1&y=2)', 'label')).toBe('<p><a href="https://example.com/a?x=1&amp;y=2" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">&lt;&amp;<mark>label</mark>&gt;</a></p>');
+    expect(safeMarkdownHtml('https://example.com/a).', ').')).toBe('<p><a href="https://example.com/a" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">https://example.com/a</a><mark>).</mark></p>');
+    expect(linkifyTerminalText('http://user:p%40ss@ExAmPlE.COM:80/a')).toBe('<a class="terminal-link" href="http://user:p%40ss@example.com/a" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">http://user:p%40ss@ExAmPlE.COM:80/a</a>');
+  });
+
+  it('retains exact plain and ANSI renderer markup around terminal links', () => {
+    expect(renderTerminalContent('https://example.com/a). &', 'text').html).toBe('<a class="terminal-link" href="https://example.com/a" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">https://example.com/a</a>). &amp;');
+    expect(renderTerminalContent('\x1b[1mhttps://example.com/a). &\x1b[0m', 'ansi').html).toBe('<span class="ansi-line"><span style="font-weight:700"><a class="terminal-link" href="https://example.com/a" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">https://example.com/a</a>). &amp;</span></span>');
+  });
+});

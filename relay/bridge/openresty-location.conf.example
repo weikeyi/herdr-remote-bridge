@@ -1,0 +1,27 @@
+# Include inside the EXISTING HTTPS server for the dedicated Bridge hostname.
+# Keep 1Panel's certificate configuration. HTTP must redirect to HTTPS.
+# Do not add another location / if 1Panel already generated one: replace it.
+location / {
+    # Host-network OpenResty only. Container mode: change to
+    # http://herdr-bridge-http:8080 (same dedicated Docker network).
+    proxy_pass http://127.0.0.1:18080;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Upgrade $http_upgrade;
+    # No http{} map dependency, suitable for a 1Panel server snippet.
+    proxy_set_header Connection "upgrade";
+    # Overwrite, never append client-supplied forwarding headers.
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Real-IP "";
+    proxy_set_header Forwarded "";
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_connect_timeout 10s;
+    # Do not log pairing/query data or enable body/header debug logging.
+    access_log off;
+}

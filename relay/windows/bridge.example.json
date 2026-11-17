@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "relayPath": "C:\\Users\\YOUR_USER\\Apps\\HerdrBridge\\herdr-mobile-relay.exe",
+  "gatewayUrl": "wss://bridge.example.com",
+  "phoneAppUrl": "https://bridge.example.com",
+  "corePipe": "\\\\.\\pipe\\herdr-core-YOUR_USER-default.sock",
+  "dataDir": "C:\\Users\\YOUR_USER\\AppData\\Local\\HerdrRemoteBridge",
+  "registrationCredentialPath": "C:\\Users\\YOUR_USER\\AppData\\Local\\HerdrRemoteBridge\\gateway.dpapi",
+  "relayKeyCredentialPath": "C:\\Users\\YOUR_USER\\AppData\\Local\\HerdrRemoteBridge\\relay.dpapi"
+}

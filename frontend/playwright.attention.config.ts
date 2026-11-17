@@ -1,0 +1,41 @@
+import { defineConfig, devices } from '@playwright/test';
+import { resolve } from 'node:path';
+
+const webRoot = resolve(process.env.HERDR_WEB_ROOT || 'dist');
+const webkitEndpoint = process.env.HERDR_WEBKIT_WS_ENDPOINT;
+
+export default defineConfig({
+  testDir: './tests/browser',
+  testMatch: ['attention-relay.spec.ts', 'terminal-input.spec.ts'],
+  timeout: 45_000,
+  expect: { timeout: 8_000 },
+  fullyParallel: false,
+  workers: 1,
+  // WebKit crashes mid-test on GitHub's shared runners, as described in playwright.config.ts.
+  // The same retries apply here: a deterministic failure still fails every attempt, and local
+  // runs keep zero retries.
+  retries: process.env.GITHUB_ACTIONS ? 2 : 0,
+  globalSetup: './tests/browser/attention-relay.setup.ts',
+  use: {
+    baseURL: 'http://127.0.0.1:4173',
+    serviceWorkers: 'block',
+    trace: 'retain-on-failure',
+  },
+  projects: [
+    { name: 'chromium-attention', use: { ...devices['Pixel 7'] } },
+    {
+      name: 'webkit-attention',
+      use: {
+        ...devices['iPhone 15'],
+        ...(webkitEndpoint ? {
+          connectOptions: { wsEndpoint: webkitEndpoint, exposeNetwork: '<loopback>' },
+        } : {}),
+      },
+    },
+  ],
+  webServer: {
+    command: `node scripts/browser-server.mjs ${JSON.stringify(webRoot)}`,
+    port: 4173,
+    reuseExistingServer: false,
+  },
+});

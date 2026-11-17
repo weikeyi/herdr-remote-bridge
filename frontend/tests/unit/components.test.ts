@@ -1,0 +1,1757 @@
+import { tick } from 'svelte';
+import { get } from 'svelte/store';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
+import userEvent from '@testing-library/user-event';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import AgentList from '$components/AgentList.svelte';
+import ConversationHistory from '$components/ConversationHistory.svelte';
+import WorkspaceManager from '$components/WorkspaceManager.svelte';
+import ActivityView from '$components/ActivityView.svelte';
+import QuestionForm from '$components/QuestionForm.svelte';
+import TerminalView from '$components/TerminalView.svelte';
+import LaunchView from '$components/LaunchView.svelte';
+import { CommandError, relayStore } from '$lib/store';
+import { AttachmentBatchController } from '$lib/attachments';
+import { clearPromptDraft } from '$lib/prompt-drafts';
+import { reloadRisk } from '$lib/reload-guard';
+import { targetRefForAgent } from '$lib/resource-id';
+import { hiddenServers, setHomeLayout, setServerHidden } from '$lib/preferences';
+import type { Agent, AgentProfile, CommandResult, QuestionInteraction, RelayConnectionView, RelayWorkspace, SlashCommandCatalog, WorktreeListing } from '$lib/types';
+
+const INCOMPLETE_CATALOG_NOTICE = 'Command suggestions may be incomplete because a discovery limit was reached. Typing searches only loaded suggestions; you can still send a command manually.';
+
+class SlashCommandWebSocket {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSING = 2;
+  static CLOSED = 3;
+  static instances: SlashCommandWebSocket[] = [];
+  readyState = SlashCommandWebSocket.CONNECTING;
+  protocol = '';
+  sent: string[] = [];
+  onopen: (() => void) | null = null;
+  onclose: ((event?: { code: number }) => void) | null = null;
+  onerror: (() => void) | null = null;
+  onmessage: ((event: { data: string }) => void) | null = null;
+  constructor(readonly url: string) { SlashCommandWebSocket.instances.push(this); }
+  send(payload: string) { this.sent.push(payload); }
+  close() { this.readyState = SlashCommandWebSocket.CLOSED; }
+  open() { this.readyState = SlashCommandWebSocket.OPEN; this.onopen?.(); }
+  message(payload: unknown) { this.onmessage?.({ data: JSON.stringify(payload) }); }
+}
+
+const blockedAgent: Agent = {
+  relay_id: 'fedora', relay_label: 'Fedora', raw_pane_id: 'w1:p1', pane_id: 'fedora::w1:p1',
+  server_session_id: 'primary', terminal_id: 'terminal', generation: 1,
+  project: 'relay', agent: 'codex', status: 'blocked',
+  attention_kind: 'approval', attention_capable: true,
+  command: 'Run make check?', options: ['Approve once', 'Always allow', 'Deny'],
+};
+
+// A ready relay for LaunchView tests: the directory browser capability is what
+// lets the form finish its initial listing and enable Start Agent.
+function launchConnection(agentProfiles: AgentProfile[], hermesProfiles: string[]): RelayConnectionView {
+  return {
+    status: 'connected',
+    inventory: { state: 'ready' },
+    capabilities: ['tab_rename', 'agent_launch', 'directory_browser'],
+    agentProfiles,
+    hermesProfiles,
+  } as unknown as RelayConnectionView;
+}
+
+describe('accessible Svelte interactions', () => {
+  it('offers explicit browser pairing in the deferred agent-list empty state', async () => {
+    const user = userEvent.setup();
+    const relay = { id: 'invited', label: 'Invited', url: 'wss://invited.example', token: '' };
+    const connection = {
+      status: 'disconnected', pairingDeferred: true,
+    } as RelayConnectionView;
+    const pair = vi.spyOn(relayStore, 'pairDeferredRelay').mockReturnValue(true);
+    try {
+      render(AgentList, {
+        agents: [], relays: [relay], connections: new Map([[relay.id, connection]]),
+        responding: new Set<string>(), onopen: vi.fn(),
+      });
+      expect(screen.getByText('Add Herdr to the Home Screen, then open it there to finish pairing.')).toBeInTheDocument();
+      expect(screen.getByText('This browser tab keeps the setup link unused so the installed app can redeem it.')).toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: 'Pair this browser instead' }));
+      expect(pair).not.toHaveBeenCalled();
+      expect(screen.getByRole('alert')).toHaveTextContent(/This browser becomes its own device/);
+      expect(screen.getByRole('alert')).toHaveTextContent(/one-use secret is spent here/);
+      expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus();
+      await user.click(screen.getByRole('button', { name: 'Cancel' }));
+      expect(pair).not.toHaveBeenCalled();
+      await user.click(screen.getByRole('button', { name: 'Pair this browser instead' }));
+      await user.click(screen.getByRole('button', { name: 'Confirm' }));
+      expect(pair).toHaveBeenCalledExactlyOnceWith(relay.id);
+    } finally {
+      pair.mockRestore();
+    }
+  });
+
+  it('requires confirmation before deleting all activity', async () => {
+    const user = userEvent.setup();
+    relayStore.activities.set([{
+      id: 'activity-1', timestamp: 123, summary: 'Prompt sent',
+      relay_id: 'fedora', relay_label: 'Fedora', activity_key: 'fedora:activity-1',
+    }]);
+    const clear = vi.spyOn(relayStore, 'clearActivities').mockResolvedValue();
+    render(ActivityView);
+
+    await user.click(screen.getByRole('button', { name: 'Delete all' }));
+    const dialog = screen.getByRole('dialog', { name: 'Delete all activity?' });
+    expect(dialog).toHaveTextContent('permanently deletes the activity history');
+    expect(clear).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole('button', { name: 'Delete all' }));
+    expect(clear).toHaveBeenCalledOnce();
+
+    relayStore.activities.set([]);
+  });
+
+  it('hides generic working transitions from the activity list', () => {
+    relayStore.activities.set([
+      {
+        timestamp: 123,
+        kind: 'working',
+        status: 'working',
+        summary: 'omp started working',
+        relay_id: 'fedora',
+        relay_label: 'Fedora',
+        activity_key: 'fedora:working',
+      },
+      {
+        timestamp: 124,
+        kind: 'finished',
+        status: 'completed',
+        summary: 'omp completed',
+        extract: 'The complete response',
+        relay_id: 'fedora',
+        relay_label: 'Fedora',
+        activity_key: 'fedora:finished',
+      },
+    ]);
+    render(ActivityView);
+
+    expect(screen.queryByText('omp started working')).not.toBeInTheDocument();
+    expect(screen.getByText('omp completed')).toBeInTheDocument();
+    relayStore.activities.set([]);
+  });
+
+  it('filters slash commands and fills the composer without submitting', async () => {
+    const user = userEvent.setup();
+    const agent: Agent = {
+      relay_id: 'fedora', relay_label: 'Fedora', raw_pane_id: 'w1:p2', pane_id: 'fedora::w1:p2',
+      server_session_id: 'primary', terminal_id: 'terminal-p2', generation: 1,
+      project: 'relay', agent: 'codex', status: 'working', cwd: '/home/test/relay',
+    };
+    vi.spyOn(relayStore, 'readPane').mockImplementation(() => undefined);
+    vi.spyOn(relayStore, 'loadSlashCommands').mockResolvedValue({
+      commands: [
+        { command: '/model', description: 'Choose the active model', source: 'builtin' },
+        { command: '/plan', description: 'Enter plan mode', argument_hint: '[prompt]', source: 'builtin' },
+      ],
+      truncated: false,
+    });
+    const send = vi.spyOn(relayStore, 'sendToAgent').mockResolvedValue({
+      type: 'command_result', request_id: 'prompt-1', ok: true,
+    });
+    render(TerminalView, {
+      agent,
+      allAgents: [agent],
+      frame: { paneId: agent.pane_id, content: 'ready', format: 'plain' },
+      responding: new Set<string>(),
+    });
+
+    const composer = screen.getByRole('combobox', { name: 'Prompt' });
+    await user.type(composer, '/pl');
+    expect(screen.getByRole('listbox', { name: 'Slash commands' })).toBeVisible();
+    expect(screen.getByRole('option', { name: /\/plan/ })).toBeVisible();
+    expect(screen.queryByRole('option', { name: /\/model/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(INCOMPLETE_CATALOG_NOTICE, { exact: true })).not.toBeInTheDocument();
+    await user.keyboard('{Enter}');
+    expect(composer).toHaveValue('/plan ');
+    expect(send).not.toHaveBeenCalled();
+
+    await user.type(composer, 'Review the migration');
+    await user.click(screen.getByRole('button', { name: 'Send prompt' }));
+    expect(send).toHaveBeenCalledWith(agent, {
+      type: 'submit_prompt', text: '/plan Review the migration',
+    });
+    vi.restoreAllMocks();
+  });
+
+  it('keeps incomplete-catalog guidance for empty matches and manual submission', async () => {
+    const user = userEvent.setup();
+    const agent: Agent = {
+      relay_id: 'fedora', relay_label: 'Fedora', raw_pane_id: 'w1:p3', pane_id: 'fedora::w1:p3',
+      server_session_id: 'primary', terminal_id: 'terminal-p3', generation: 1,
+      project: 'relay', agent: 'codex', status: 'working', cwd: '/home/test/relay',
+    };
+    vi.spyOn(relayStore, 'readPane').mockImplementation(() => undefined);
+    const load = vi.spyOn(relayStore, 'loadSlashCommands').mockResolvedValue({
+      commands: [{ command: '/present', description: 'Present command', source: 'project' }],
+      truncated: true,
+    });
+    const send = vi.spyOn(relayStore, 'sendToAgent').mockResolvedValue({
+      type: 'command_result', request_id: 'prompt-2', ok: true,
+    });
+    render(TerminalView, {
+      agent,
+      allAgents: [agent],
+      frame: { paneId: agent.pane_id, content: 'ready', format: 'plain' },
+      responding: new Set<string>(),
+    });
+
+    const composer = screen.getByRole('combobox', { name: 'Prompt' });
+    await user.type(composer, '/pre');
+    expect(screen.getByText(INCOMPLETE_CATALOG_NOTICE, { exact: true })).toBeVisible();
+    await user.clear(composer);
+    await user.type(composer, '/absent');
+    expect(screen.getByText(INCOMPLETE_CATALOG_NOTICE, { exact: true })).toBeVisible();
+    expect(screen.getByText('No matching command — you can still send it.')).toBeVisible();
+    expect(load).toHaveBeenCalledTimes(2);
+    expect(send).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('button', { name: 'Send prompt' }));
+    expect(send).toHaveBeenCalledWith(agent, {
+      type: 'submit_prompt', text: '/absent',
+    });
+    vi.restoreAllMocks();
+  });
+
+  it('filters the full real-store catalog and revalidates each palette opening', async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal('WebSocket', SlashCommandWebSocket);
+    relayStore.destroy();
+    relayStore.relayConfigs.set([]);
+    relayStore.addRelay({ label: 'Fedora', url: 'ws://127.0.0.1:8871', token: '' });
+    const socket = SlashCommandWebSocket.instances.at(-1)!;
+    socket.open();
+    socket.message({
+      type: 'push_config', protocol: 3, version: 'abc123', host: 'fedora',
+      capabilities: ['slash_commands'], agent_profiles: [],
+    });
+    const relay = get(relayStore.relayConfigs)[0];
+    const agent: Agent = {
+      relay_id: relay.id, relay_label: relay.label, raw_pane_id: 'w1:late', pane_id: `${relay.id}::w1:late`,
+      project: 'relay', agent: 'codex', status: 'working', cwd: '/home/test/relay',
+      server_session_id: 'primary', terminal_id: 'terminal-w1:late', generation: 1, agent_session_id: '',
+    };
+    vi.spyOn(relayStore, 'readPane').mockImplementation(() => undefined);
+    const first = render(TerminalView, {
+      agent,
+      allAgents: [agent],
+      frame: { paneId: agent.pane_id, content: 'ready', format: 'plain' },
+      responding: new Set<string>(),
+    });
+    const composer = screen.getByRole('combobox', { name: 'Prompt' });
+    await user.type(composer, '/late');
+    await waitFor(() => expect(socket.sent.map((payload) => JSON.parse(payload))
+      .filter((message) => message.type === 'list_slash_commands')).toHaveLength(1));
+    const request = JSON.parse(socket.sent.at(-1)!);
+    const commands = Array.from({ length: 401 }, (_, index) => ({
+      command: `/catalog-${String(index).padStart(4, '0')}`,
+      description: `Catalog command ${index}`,
+      source: 'project',
+    }));
+    commands[350] = { command: '/late-command', description: 'Late command', source: 'project' };
+    socket.message({
+      type: 'command_result', request_id: request.request_id, ok: true, phase: 'completed',
+      data: { commands, truncated: false },
+    });
+
+    await waitFor(() => expect(screen.getByRole('option', { name: /\/late-command/ })).toBeVisible());
+    const send = vi.spyOn(relayStore, 'sendToAgent').mockResolvedValue({
+      type: 'command_result', request_id: 'not-sent', ok: true,
+    });
+    await user.click(screen.getByRole('option', { name: /\/late-command/ }));
+    expect(composer).toHaveValue('/late-command');
+    expect(send).not.toHaveBeenCalled();
+    expect((await relayStore.loadSlashCommands(agent)).commands).toHaveLength(401);
+    await user.clear(composer);
+    first.unmount();
+    expect((await relayStore.loadSlashCommands(agent)).commands).toHaveLength(401);
+    send.mockRestore();
+
+    render(TerminalView, {
+      agent,
+      allAgents: [agent],
+      frame: { paneId: agent.pane_id, content: 'ready', format: 'plain' },
+      responding: new Set<string>(),
+    });
+    const reopenedComposer = screen.getByRole('combobox', { name: 'Prompt' });
+    await user.clear(reopenedComposer);
+    await user.type(reopenedComposer, '/late');
+    const reopenedRequests = socket.sent.map((payload) => JSON.parse(payload))
+      .filter((message) => message.type === 'list_slash_commands');
+    expect(reopenedRequests).toHaveLength(2);
+    socket.message({
+      type: 'command_result', request_id: reopenedRequests[1].request_id, ok: true, phase: 'completed',
+      data: { commands, truncated: false },
+    });
+    await waitFor(() => expect(screen.getByRole('option', { name: /\/late-command/ })).toBeVisible());
+    const reopenedSend = vi.spyOn(relayStore, 'sendToAgent').mockResolvedValue({
+      type: 'command_result', request_id: 'not-sent', ok: true,
+    });
+    await user.keyboard('{Enter}');
+    expect(reopenedComposer).toHaveValue('/late-command');
+    expect(reopenedSend).not.toHaveBeenCalled();
+
+    relayStore.destroy();
+    relayStore.relayConfigs.set([]);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  describe('catalog request lifecycle', () => {
+    afterEach(() => vi.restoreAllMocks());
+
+    it.each(['success', 'failure'] as const)('ignores superseded catalog %s without clearing newer loading state', async (outcome) => {
+      const user = userEvent.setup();
+      const agent: Agent = {
+        relay_id: 'freshness', relay_label: 'Freshness', raw_pane_id: 'pane', pane_id: 'freshness::pane',
+        server_session_id: 'primary', terminal_id: 'terminal', generation: 1,
+        agent: 'pi', cwd: '/tmp/project', agent_session_id: 'first',
+      };
+      const requests: { resolve: (catalog: SlashCommandCatalog) => void; reject: (error: Error) => void }[] = [];
+      vi.spyOn(relayStore, 'readPane').mockImplementation(() => undefined);
+      const load = vi.spyOn(relayStore, 'loadSlashCommands').mockImplementation(() => new Promise((resolve, reject) => {
+        requests.push({ resolve, reject });
+      }));
+      const props = { agent, allAgents: [agent], responding: new Set<string>() };
+      const view = render(TerminalView, props);
+      const composer = screen.getByRole('combobox', { name: 'Prompt' });
+      await user.type(composer, '/orches');
+      expect(load).toHaveBeenCalledTimes(1);
+      const replacement = { ...agent, cwd: '/tmp/other-project' };
+      expect(targetRefForAgent(agent)).not.toBeNull();
+      expect(targetRefForAgent(replacement)).toEqual(targetRefForAgent(agent));
+      await view.rerender({ ...props, agent: replacement, allAgents: [replacement] });
+      const replacementComposer = screen.getByRole('combobox', { name: 'Prompt' });
+      expect(replacementComposer).toBe(composer);
+      expect(replacementComposer).toHaveValue('');
+      expect(screen.queryByRole('listbox', { name: 'Slash commands' })).not.toBeInTheDocument();
+      expect(load).toHaveBeenCalledTimes(1);
+      await user.type(replacementComposer, '/orches');
+      await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
+      expect(load).toHaveBeenLastCalledWith(replacement, true);
+      if (outcome === 'success') {
+        requests[0].resolve({ commands: [{ command: '/orchestrate-old', description: 'Old session', source: 'project' }], truncated: false });
+      } else {
+        requests[0].reject(new Error('Old request failed'));
+      }
+      await tick();
+      await waitFor(() => expect(screen.getByText('Loading commands…')).toBeVisible());
+      expect(screen.queryByText('Suggestions unavailable — you can still send this command.')).not.toBeInTheDocument();
+      expect(screen.queryByRole('option', { name: /orchestrate-old/ })).not.toBeInTheDocument();
+      requests[1].resolve({ commands: [{ command: '/orchestrate', description: 'Current session', source: 'project' }], truncated: false });
+      await waitFor(() => expect(screen.getByRole('option', { name: /orchestrate/ })).toBeVisible());
+      await user.click(screen.getByRole('button', { name: 'Refresh commands' }));
+      expect(load).toHaveBeenCalledTimes(3);
+      expect(screen.getByText('Refreshing commands…')).toBeVisible();
+      requests[2].resolve({ commands: [], truncated: false });
+      await waitFor(() => expect(screen.queryByRole('option')).not.toBeInTheDocument());
+      await user.clear(replacementComposer);
+      await user.type(replacementComposer, '/orches');
+      expect(load).toHaveBeenCalledTimes(4);
+      view.unmount();
+      requests[3].resolve({ commands: [{ command: '/orchestrate', description: 'After unmount', source: 'project' }], truncated: false });
+      await Promise.resolve();
+      expect(screen.queryByRole('listbox', { name: 'Slash commands' })).not.toBeInTheDocument();
+      clearPromptDraft(agent);
+    });
+
+    it('revalidates an open palette on reconnect without fetching for each keystroke', async () => {
+      const user = userEvent.setup();
+      const agent: Agent = {
+        relay_id: 'reconnect', relay_label: 'Reconnect', raw_pane_id: 'pane', pane_id: 'reconnect::pane',
+        agent: 'pi', cwd: '/tmp/project',
+      };
+      const connected = { status: 'connected', capabilities: ['slash_commands'] };
+      relayStore.connections.set(new Map([['reconnect', connected as never]]));
+      vi.spyOn(relayStore, 'readPane').mockImplementation(() => undefined);
+      const load = vi.spyOn(relayStore, 'loadSlashCommands').mockResolvedValue({
+        commands: [{ command: '/orchestrate', description: 'Orchestrate', source: 'project' }], truncated: false,
+      });
+      const view = render(TerminalView, { agent, allAgents: [agent], responding: new Set<string>() });
+      const composer = screen.getByRole('combobox', { name: 'Prompt' });
+      await user.type(composer, '/orches');
+      expect(load).toHaveBeenCalledTimes(1);
+      relayStore.connections.set(new Map([['reconnect', { ...connected, status: 'disconnected' } as never]]));
+      await waitFor(() => expect(screen.getByText('Suggestions unavailable — you can still send this command.')).toBeVisible());
+      expect(load).toHaveBeenCalledTimes(1);
+      relayStore.connections.set(new Map([['reconnect', connected as never]]));
+      await waitFor(() => expect(load).toHaveBeenCalledTimes(2));
+      await user.type(composer, 'trate');
+      expect(load).toHaveBeenCalledTimes(2);
+      await user.keyboard('{Escape}');
+      await user.type(composer, '-');
+      await waitFor(() => expect(load).toHaveBeenCalledTimes(3));
+      view.unmount();
+      clearPromptDraft(agent);
+      relayStore.connections.set(new Map());
+    });
+  });
+
+  it.each([
+    ['partial', 'Runtime command discovery is incomplete.'],
+    ['loading', 'Pi is loading command resources.'],
+    ['unavailable', 'Runtime command discovery is unavailable.'],
+  ] as const)('distinguishes runtime %s from size truncation', async (status, message) => {
+    const user = userEvent.setup();
+    const agent: Agent = { relay_id: 'status', relay_label: 'Status', raw_pane_id: 'pane', pane_id: 'status::pane', agent: 'pi' };
+    vi.spyOn(relayStore, 'readPane').mockImplementation(() => undefined);
+    vi.spyOn(relayStore, 'loadSlashCommands').mockResolvedValue({ commands: [], truncated: false, status });
+    const view = render(TerminalView, { agent, allAgents: [agent], responding: new Set<string>() });
+    await user.type(screen.getByRole('combobox', { name: 'Prompt' }), '/orches');
+    expect(screen.getByText(text => text.startsWith(message))).toBeVisible();
+    expect(screen.queryByText(INCOMPLETE_CATALOG_NOTICE, { exact: true })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Refresh commands' })).toBeEnabled();
+    view.unmount();
+    clearPromptDraft(agent);
+    vi.restoreAllMocks();
+  });
+
+  it('opens agents and submits approval buttons by role', async () => {
+    const user = userEvent.setup();
+    const onopen = vi.fn();
+    const respond = vi.spyOn(relayStore, 'respond').mockResolvedValue(true);
+    render(AgentList, { agents: [blockedAgent], relays: [{ id: 'fedora', label: 'Fedora', url: 'wss://fedora', token: '' }], responding: new Set<string>(), onopen });
+    expect(screen.getByRole('heading', { name: 'Needs input' })).toBeInTheDocument();
+    expect(screen.getByText('Run make check?')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Approve once' }));
+    expect(respond).toHaveBeenCalledWith(blockedAgent, 0, 3, 'Approve once');
+    await user.click(screen.getByRole('button', { name: /Open relay on Fedora/ }));
+    expect(onopen).toHaveBeenCalledWith(blockedAgent);
+    respond.mockRestore();
+  });
+
+  it.each(['filter', 'prompt'] as const)('restores a refused %s draft after a same-target agent update, but not replacement or navigation', async (route) => {
+    const user = userEvent.setup();
+    vi.spyOn(relayStore, 'readPane').mockImplementation(() => undefined);
+    vi.spyOn(relayStore, 'loadSlashCommands').mockResolvedValue({ commands: [], truncated: false });
+    let rejectSend!: (error: unknown) => void;
+    vi.spyOn(relayStore, 'sendToAgent').mockImplementation(() => new Promise((_, reject) => { rejectSend = reject; }));
+    const initial: Agent = {
+      ...blockedAgent, agent: 'cursor', attention_kind: 'unknown', options: undefined,
+      server_session_id: 'server-1', terminal_id: 'terminal-1', generation: 1, agent_session_id: 'agent-1',
+      status: route === 'prompt' ? 'done' : 'blocked',
+    };
+    const content = route === 'filter' ? 'Available models\nType to filter • Enter to select • Tab to edit'
+      : 'Ready';
+    for (const update of [
+      {},
+      { generation: 2 },
+      { server_session_id: 'server-2' },
+      { terminal_id: 'terminal-2' },
+      { agent_session_id: 'agent-2' },
+      { relay_id: 'other-relay' },
+      { pane_id: 'fedora::w1:p2', raw_pane_id: 'w1:p2' },
+    ]) {
+      const view = render(TerminalView, {
+        agent: initial, allAgents: [initial], responding: new Set<string>(),
+        frame: { paneId: initial.pane_id, content, format: 'plain' },
+      });
+      const input = screen.getByRole('combobox', { name: 'Prompt' });
+      await user.type(input, 'draft');
+      await user.keyboard('{Control>}{Enter}{/Control}');
+      expect(input).toHaveValue('');
+      const updated = { ...initial, project: 'Inventory updated', ...update };
+      await view.rerender({ agent: updated });
+      rejectSend({ data: { not_started: true } });
+      await waitFor(() => expect(screen.queryByRole('button', { name: 'Submitting input' })).not.toBeInTheDocument());
+      expect(input).toHaveValue(Object.keys(update).length === 0 ? 'draft' : '');
+      view.unmount();
+    }
+    vi.restoreAllMocks();
+  });
+
+  it('validates filter drafts and locks keys until delivery is settled', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(relayStore, 'readPane').mockImplementation(() => undefined);
+    vi.spyOn(relayStore, 'loadSlashCommands').mockResolvedValue({ commands: [], truncated: false });
+    let settle!: () => void;
+    const send = vi.spyOn(relayStore, 'sendToAgent').mockImplementation(() => new Promise((resolve) => {
+      settle = () => resolve({ type: 'command_result', request_id: 'filter-busy', ok: true });
+    }));
+    const agent: Agent = { ...blockedAgent, agent: 'cursor', attention_kind: 'unknown', options: undefined };
+    const view = render(TerminalView, {
+      agent, allAgents: [agent], responding: new Set<string>(),
+      frame: { paneId: agent.pane_id, content: 'Available models\nType to filter • Enter to select • Tab to edit', format: 'plain' },
+    });
+    const input = screen.getByRole('combobox', { name: 'Prompt' });
+    for (const draft of ['g ', 'g😀', 'g'.repeat(33)]) {
+      await user.clear(input);
+      await user.type(input, draft);
+      await user.keyboard('{Control>}{Enter}{/Control}');
+      expect(send).not.toHaveBeenCalled();
+      expect(input).toHaveValue(draft);
+    }
+    await user.clear(input);
+    await user.type(input, 'grok');
+    await user.click(screen.getByRole('button', { name: 'Send filter text' }));
+    for (const name of ['Esc', 'Tab', 'Enter', 'Shift', 'Ctrl']) {
+      expect(screen.getByRole('button', { name })).toBeDisabled();
+    }
+    await user.keyboard('{Control>}{Enter}{/Control}');
+    expect(send).toHaveBeenCalledOnce();
+    settle();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Enter' })).toBeEnabled());
+    view.unmount();
+    vi.restoreAllMocks();
+  });
+
+  it('sends Cursor filter text without selecting a model', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(relayStore, 'readPane').mockImplementation(() => undefined);
+    vi.spyOn(relayStore, 'loadSlashCommands').mockResolvedValue({ commands: [], truncated: false });
+    const send = vi.spyOn(relayStore, 'sendToAgent').mockResolvedValue({
+      type: 'command_result', request_id: 'filter-1', ok: true,
+    });
+    const agent: Agent = {
+      ...blockedAgent, attention_kind: 'unknown', options: undefined,
+      server_session_id: 'server-1', terminal_id: 'terminal-1', generation: 1, agent_session_id: 'agent-1',
+    };
+    const view = render(TerminalView, {
+      agent, allAgents: [agent], responding: new Set<string>(),
+      frame: { paneId: agent.pane_id, content: 'Available models\nType to filter • Enter to select • Tab to edit', format: 'plain' },
+    });
+    const input = screen.getByRole('combobox', { name: 'Prompt' });
+    await user.type(input, 'grok');
+    expect(send).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Send filter text' }));
+    expect(send).toHaveBeenCalledExactlyOnceWith(agent, {
+      type: 'send_filter_text', text: 'grok', activity_label: 'Sent filter text',
+    }, 15_000);
+    expect(input).toHaveValue('');
+    expect(screen.getByPlaceholderText('Type filter text…')).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: 'Arrow keys' }));
+    await user.click(screen.getByRole('button', { name: 'Down' }));
+    await user.click(screen.getByRole('button', { name: 'Enter' }));
+    expect(send.mock.calls.slice(1).map(([, command]) => command)).toEqual([
+      expect.objectContaining({ type: 'send_keys', keys: ['Down'] }),
+      expect.objectContaining({ type: 'send_keys', keys: ['Enter'] }),
+    ]);
+    for (const modifier of ['Control', 'Meta']) {
+      send.mockClear();
+      await user.type(input, 'opus');
+      await user.keyboard(`{${modifier}>}{Enter}{/${modifier}}`);
+      expect(send).toHaveBeenCalledExactlyOnceWith(agent, {
+        type: 'send_filter_text', text: 'opus', activity_label: 'Sent filter text',
+      }, 15_000);
+    }
+    send.mockRejectedValueOnce({ data: { not_started: true } });
+    await user.type(input, 'retry');
+    await user.click(screen.getByRole('button', { name: 'Send filter text' }));
+    expect(input).toHaveValue('retry');
+    send.mockRejectedValueOnce({ data: { dispatched_unknown: true } });
+    await user.click(screen.getByRole('button', { name: 'Send filter text' }));
+    expect(input).toHaveValue('');
+    await view.rerender({ readOnly: true });
+    expect(input).toBeDisabled();
+    for (const attention_kind of ['approval', 'question'] as const) {
+      await view.rerender({ readOnly: false, agent: { ...agent, attention_kind } });
+      expect(input).toBeEnabled();
+      expect(screen.getByRole('button', { name: 'Send filter text' })).toBeDisabled();
+    }
+    await view.rerender({ agent, frame: { paneId: agent.pane_id, content: 'Available models', format: 'plain' } });
+    expect(input).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Send prompt' })).toBeDisabled();
+    await view.rerender({
+      agent,
+      frame: {
+        paneId: agent.pane_id, format: 'plain',
+        content: 'Type to filter • Enter to select • Tab to edit\nNeeds inspection\n>',
+      },
+    });
+    expect(input).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Send prompt' })).toBeDisabled();
+    view.unmount();
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ['done', 'done'],
+    ['blocked', 'done'],
+    ['blocked', 'working'],
+  ])('keeps Cursor filters text-only across %s to %s updates and restores prompts after closing', async (status, nextStatus) => {
+    const user = userEvent.setup();
+    vi.spyOn(relayStore, 'readPane').mockImplementation(() => undefined);
+    vi.spyOn(relayStore, 'loadSlashCommands').mockResolvedValue({
+      commands: [{ command: '/model', description: 'Choose the active model', source: 'builtin' }],
+      truncated: false,
+    });
+    const send = vi.spyOn(relayStore, 'sendToAgent').mockResolvedValue({
+      type: 'command_result', request_id: 'filter-status-1', ok: true,
+    });
+    const agent: Agent = { ...blockedAgent, agent: 'cursor', status, attention_kind: 'unknown', options: undefined };
+    const view = render(TerminalView, {
+      agent, allAgents: [agent], responding: new Set<string>(),
+      frame: { paneId: agent.pane_id, content: 'Available models\nType to filter • Enter to select • Tab to edit', format: 'plain' },
+    });
+    const input = screen.getByPlaceholderText('Type filter text…');
+    await user.type(input, 'grok');
+    const updatedAgent = { ...agent, status: nextStatus };
+    await view.rerender({ agent: updatedAgent });
+    expect(screen.getByPlaceholderText('Type filter text…')).toBeEnabled();
+    expect(input).toHaveValue('grok');
+    expect(screen.getByRole('button', { name: 'Attach files' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Attach photos' })).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: 'Send filter text' }));
+    expect(send).toHaveBeenCalledExactlyOnceWith(updatedAgent, {
+      type: 'send_filter_text', text: 'grok', activity_label: 'Sent filter text',
+    }, 15_000);
+    send.mockClear();
+    await user.type(input, '/mo');
+    expect(screen.queryByRole('listbox', { name: 'Slash commands' })).not.toBeInTheDocument();
+    await user.keyboard('{Control>}{Enter}{/Control}');
+    expect(send).toHaveBeenCalledExactlyOnceWith(updatedAgent, {
+      type: 'send_filter_text', text: '/mo', activity_label: 'Sent filter text',
+    }, 15_000);
+    await view.rerender({ readOnly: true });
+    expect(input).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Send filter text' })).toBeDisabled();
+    await view.rerender({
+      readOnly: false,
+      frame: {
+        paneId: agent.pane_id, format: 'plain',
+        content: 'Type to filter • Enter to select • Tab to edit\nSelected model: Grok Fast\n>',
+      },
+    });
+    expect(screen.getByPlaceholderText('Type a reply…')).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Attach files' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Attach photos' })).toBeEnabled();
+    await user.type(input, '/mo');
+    expect(screen.getByRole('listbox', { name: 'Slash commands' })).toBeVisible();
+    await user.clear(input);
+    send.mockClear();
+    await user.type(input, 'Continue');
+    await user.click(screen.getByRole('button', { name: 'Send prompt' }));
+    expect(send).toHaveBeenCalledExactlyOnceWith(updatedAgent, {
+      type: 'submit_prompt', text: 'Continue',
+    });
+    view.unmount();
+    vi.restoreAllMocks();
+  });
+
+  it('holds automatic app reloads until a sent prompt settles, even after its view closes', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(relayStore, 'readPane').mockImplementation(() => undefined);
+    vi.spyOn(relayStore, 'loadSlashCommands').mockResolvedValue({ commands: [], truncated: false });
+    let settle: (result: CommandResult) => void = () => {};
+    vi.spyOn(relayStore, 'sendToAgent').mockImplementation(() => new Promise((resolve) => { settle = resolve; }));
+    const agent: Agent = { ...blockedAgent, agent: 'codex', status: 'done', attention_kind: undefined, options: undefined };
+    const view = render(TerminalView, {
+      agent, allAgents: [agent], responding: new Set<string>(),
+      frame: { paneId: agent.pane_id, content: 'Ready for the next request.', format: 'plain' },
+    });
+    try {
+      await user.type(screen.getByPlaceholderText('Type a reply…'), 'Continue');
+      await user.click(screen.getByRole('button', { name: 'Send prompt' }));
+      expect(relayStore.sendToAgent).toHaveBeenCalledExactlyOnceWith(agent, { type: 'submit_prompt', text: 'Continue' });
+      view.unmount();
+      expect(reloadRisk()).toBe('delivery');
+      settle({ type: 'command_result', request_id: 'held-reload', ok: true });
+      await waitFor(() => expect(reloadRisk()).not.toBe('delivery'));
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it.each(['cursor', 'codex'])('submits normal prompts when %s output mentions filtering', async (agentName) => {
+    const user = userEvent.setup();
+    vi.spyOn(relayStore, 'readPane').mockImplementation(() => undefined);
+    vi.spyOn(relayStore, 'loadSlashCommands').mockResolvedValue({
+      commands: [{ command: '/model', description: 'Choose the active model', source: 'builtin' }],
+      truncated: false,
+    });
+    const send = vi.spyOn(relayStore, 'sendToAgent').mockResolvedValue({
+      type: 'command_result', request_id: 'normal-prompt', ok: true,
+    });
+    const agent: Agent = { ...blockedAgent, agent: agentName, status: 'done', attention_kind: undefined, options: undefined };
+    const view = render(TerminalView, {
+      agent, allAgents: [agent], responding: new Set<string>(),
+      frame: {
+        paneId: agent.pane_id,
+        content: 'Implemented the search field with placeholder "Type to filter".\nReady for the next request.',
+        format: 'plain',
+      },
+    });
+    try {
+      const input = screen.getByPlaceholderText('Type a reply…');
+      expect(input).toBeEnabled();
+      expect(screen.getByRole('button', { name: 'Attach files' })).toBeEnabled();
+      await user.type(input, '/mo');
+      expect(screen.getByRole('listbox', { name: 'Slash commands' })).toBeVisible();
+      await user.clear(input);
+      await user.type(input, 'Continue');
+      await user.keyboard('{Control>}{Enter}{/Control}');
+      expect(send).toHaveBeenCalledExactlyOnceWith(agent, { type: 'submit_prompt', text: 'Continue' });
+    } finally {
+      view.unmount();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it.each(['done', 'blocked'])('blocks attachment paste, selection, and restart in a %s Cursor picker', async (status) => {
+    const user = userEvent.setup();
+    vi.spyOn(relayStore, 'readPane').mockImplementation(() => undefined);
+    vi.spyOn(relayStore, 'loadSlashCommands').mockResolvedValue({ commands: [], truncated: false });
+    const begin = vi.fn().mockRejectedValue(new Error('Offline'));
+    const controller = new AttachmentBatchController({
+      server_session_id: 'server-session', pane_id: 'w1:p1', terminal_id: 'terminal', generation: 1,
+    }, {
+      begin,
+      chunk: async () => { throw new Error('Unexpected chunk'); },
+      finish: async () => { throw new Error('Unexpected finish'); },
+      cancel: async () => undefined,
+    }, { maxFiles: 1, maxFileBytes: 1024, maxBatchBytes: 1024, maxChunkBytes: 1024 });
+    const createUpload = vi.spyOn(relayStore, 'attachmentController').mockReturnValue(controller);
+    const agent: Agent = { ...blockedAgent, agent: 'cursor', status, attention_kind: 'unknown', options: undefined };
+    const picker = {
+      paneId: agent.pane_id, content: 'Available models\nType to filter • Enter to select • Tab to edit', format: 'plain',
+    };
+    const ready = { paneId: agent.pane_id, content: 'Ready for a prompt', format: 'plain' };
+    const view = render(TerminalView, {
+      agent, allAgents: [agent], responding: new Set<string>(), frame: picker,
+    });
+    try {
+      const input = screen.getByPlaceholderText('Type filter text…');
+      const image = new File(['image'], 'screenshot.png', { type: 'image/png' });
+      const pasteImage = () => fireEvent.paste(input, {
+        clipboardData: { items: [{ kind: 'file', type: image.type, getAsFile: () => image }] },
+      });
+      await user.type(input, 'grok');
+      expect(screen.getByRole('button', { name: 'Attach photos' })).toBeDisabled();
+      await pasteImage();
+      for (const fileInput of view.container.querySelectorAll('input[type="file"]')) {
+        await fireEvent.change(fileInput, { target: { files: [image] } });
+      }
+      expect(createUpload).not.toHaveBeenCalled();
+      expect(begin).not.toHaveBeenCalled();
+      expect(input).toHaveValue('grok');
+      await user.paste(' fast');
+      expect(input).toHaveValue('grok fast');
+
+      await view.rerender({ agent: { ...agent, status: 'done' }, frame: ready });
+      expect(screen.getByRole('button', { name: 'Attach photos' })).toBeEnabled();
+      await pasteImage();
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Restart interrupted files' })).toBeEnabled());
+      expect(createUpload).toHaveBeenCalledOnce();
+      expect(begin).toHaveBeenCalledOnce();
+
+      await view.rerender({ frame: picker });
+      const restart = screen.getByRole('button', { name: 'Restart interrupted files' });
+      expect(restart).toBeDisabled();
+      await user.click(restart);
+      expect(begin).toHaveBeenCalledOnce();
+      expect(input).toHaveValue('grok fast');
+
+      await view.rerender({ frame: ready });
+      expect(restart).toBeEnabled();
+      await user.click(restart);
+      await waitFor(() => expect(begin).toHaveBeenCalledTimes(2));
+    } finally {
+      view.unmount();
+      clearPromptDraft(agent);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('keeps blocked terminal drafts editable and offers explicit manual input for custom controls', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(relayStore, 'readPane').mockImplementation(() => undefined);
+    vi.spyOn(relayStore, 'loadSlashCommands').mockResolvedValue({ commands: [], truncated: false });
+    const send = vi.spyOn(relayStore, 'sendToAgent').mockResolvedValue({
+      type: 'command_result', request_id: 'text-1', ok: true,
+    });
+    const chat: Agent = {
+      ...blockedAgent,
+      attention_kind: 'chat',
+      options: undefined,
+    };
+    const { unmount } = render(TerminalView, {
+      agent: chat,
+      allAgents: [chat],
+      frame: { paneId: chat.pane_id, content: 'Hello!', format: 'plain' },
+      responding: new Set<string>(),
+    });
+    expect(screen.getByRole('combobox', { name: 'Prompt' })).toBeEnabled();
+    expect(screen.getByPlaceholderText('Type a reply…')).toBeEnabled();
+    expect(screen.queryByRole('button', { name: 'Approve once' })).not.toBeInTheDocument();
+    unmount();
+
+    const unknown: Agent = {
+      ...blockedAgent,
+      attention_kind: 'unknown',
+      options: ['must not render', 'reject'],
+    };
+    const choiceView = render(TerminalView, {
+      agent: unknown,
+      allAgents: [unknown],
+      frame: {
+        paneId: unknown.pane_id,
+        content: 'Other (type your own)\nEnter select · ↑/↓ move · Tab/←/→ · Esc cancel',
+        format: 'plain',
+      },
+      responding: new Set<string>(),
+    });
+    expect(screen.getByLabelText('Prompt')).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Send prompt' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Keyboard' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Attach files' })).toBeDisabled();
+    choiceView.unmount();
+
+    const unknownView = render(TerminalView, {
+      agent: unknown,
+      allAgents: [unknown],
+      frame: {
+        paneId: unknown.pane_id,
+        content: 'Custom answer: Which weekend?\n>\nenter or ctrl+q submit  esc cancel  ctrl+g external editor',
+        format: 'plain',
+      },
+      responding: new Set<string>(),
+    });
+    const terminalInput = screen.getByLabelText('Prompt');
+    expect(terminalInput).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Attach files' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Enter' })).toBeEnabled();
+    expect(screen.queryByText('must not render')).not.toBeInTheDocument();
+    await user.type(terminalInput, 'custom weekend');
+    expect(screen.getByRole('button', { name: 'Send prompt' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Keyboard' })).toBeVisible();
+    expect(send).not.toHaveBeenCalled();
+    unknownView.unmount();
+    vi.restoreAllMocks();
+  });
+
+  it('shows degraded inventory, keeps stale agents visible, and disables approvals', () => {
+    const connections = new Map([['fedora', {
+      status: 'connected',
+      inventory: {
+        state: 'error',
+        errorCode: 'protocol_mismatch',
+        message: 'Run `herdr server live-handoff` on this computer, then refresh.',
+        lastAttemptAt: 123,
+        lastSuccessAt: 100,
+        stale: true,
+      },
+    } as any]]);
+    const { container } = render(AgentList, {
+      agents: [blockedAgent],
+      relays: [{ id: 'fedora', label: 'Fedora', url: 'wss://fedora', token: '' }],
+      connections,
+      responding: new Set<string>(),
+      onopen: vi.fn(),
+    });
+
+    expect(screen.getByRole('status', { name: 'Fedora agent inventory unavailable' })).toHaveTextContent('live-handoff');
+    expect(screen.getByRole('button', { name: 'Approve once' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Open relay on Fedora/ })).toBeDisabled();
+    expect(container.querySelector('.agent-card')).toHaveClass('stale');
+    expect(screen.queryByText('No chat agents are running.')).not.toBeInTheDocument();
+  });
+
+  it('distinguishes successful empty inventory from loading inventory', () => {
+    const relay = { id: 'fedora', label: 'Fedora', url: 'wss://fedora', token: '' };
+    const readyConnections = new Map([['fedora', {
+      status: 'connected', inventory: { state: 'ready' },
+    } as any]]);
+    const { unmount } = render(AgentList, {
+      agents: [], relays: [relay], connections: readyConnections,
+      responding: new Set<string>(), onopen: vi.fn(),
+    });
+    expect(screen.getByText('No chat agents are running.')).toBeInTheDocument();
+    unmount();
+
+    const loadingConnections = new Map([['fedora', {
+      status: 'connected', inventory: { state: 'starting' },
+    } as any]]);
+    render(AgentList, {
+      agents: [], relays: [relay], connections: loadingConnections,
+      responding: new Set<string>(), onopen: vi.fn(),
+    });
+    expect(screen.getByText('Loading agents…')).toBeInTheDocument();
+  });
+
+  it('groups working agents by workspace while keeping inactive workspaces separate', () => {
+    // The by-state sections are opt-in since 0.17.10; this defends their
+    // grouping when selected.
+    setHomeLayout('state');
+    const named: Agent = {
+      relay_id: 'fedora', relay_label: 'Fedora', raw_pane_id: 'w2:p1', pane_id: 'fedora::w2:p1',
+      workspace_id: 'work-1', project: 'relay', agent: 'codex', status: 'working',
+      tab_id: 'tab-1', tab_number: 1, tab_label: 'my-tab', session: 'my-session',
+    };
+    const peer: Agent = {
+      ...named, raw_pane_id: 'w2:p2', pane_id: 'fedora::w2:p2', session: '',
+      tab_id: 'tab-2', tab_number: 2, tab_label: 'review',
+    };
+    const ready: Agent = {
+      relay_id: 'fedora', relay_label: 'Fedora', raw_pane_id: 'w3:p1', pane_id: 'fedora::w3:p1',
+      workspace_id: 'work-2', project: 'docs', agent: 'codex', status: 'idle',
+    };
+    const { container } = render(AgentList, { agents: [named, peer, ready], relays: [], responding: new Set<string>(), onopen: vi.fn() });
+    const working = screen.getByRole('heading', { name: 'Working' }).closest('section')!;
+    const workspaces = screen.getByRole('heading', { name: 'Idle' }).closest('section')!;
+    expect(within(working).getAllByText('relay', { selector: 'summary strong' })).toHaveLength(1);
+    expect(within(working).getByRole('heading', { name: 'my-tab' })).toBeInTheDocument();
+    expect(within(working).getByRole('heading', { name: 'review' })).toBeInTheDocument();
+    expect(within(working).getByText('my-session')).toBeInTheDocument();
+    expect(within(workspaces).getByText('docs', { selector: 'summary strong' })).toBeInTheDocument();
+    expect(container.querySelectorAll('.agent-logo')).toHaveLength(3);
+    setHomeLayout('mixed');
+  });
+
+  it('orders tabs by Herdr position and reorders with Alt+arrow keys on a card', async () => {
+    // tab_number contradicts tab_order on purpose: numbers are stable Herdr
+    // identities while tab_order carries the visual position.
+    const first: Agent = {
+      relay_id: 'fedora', relay_label: 'Fedora', raw_pane_id: 'w2:p1', pane_id: 'fedora::w2:p1',
+      workspace_id: 'work-1', project: 'relay', agent: 'codex', status: 'working',
+      tab_id: 'tab-1', tab_number: 7, tab_order: 1, tab_label: 'First',
+    };
+    const second: Agent = {
+      ...first, raw_pane_id: 'w2:p2', pane_id: 'fedora::w2:p2',
+      tab_id: 'tab-2', tab_number: 3, tab_order: 2, tab_label: 'Second',
+    };
+    // AgentList reads only connection readiness and capabilities in this fixture.
+    const connection = {
+      status: 'connected', inventory: { state: 'ready' }, capabilities: ['tab_reorder'],
+    } as unknown as RelayConnectionView;
+    const connections = new Map([['fedora', connection]]);
+    const reorder = vi.spyOn(relayStore, 'reorderTab').mockResolvedValue({
+      type: 'command_result', request_id: 'move-1', ok: true,
+    });
+    render(AgentList, {
+      agents: [second, first], relays: [], connections,
+      responding: new Set<string>(), onopen: vi.fn(),
+    });
+    const headings = screen.getAllByRole('heading', { level: 3 }).map((heading) => heading.textContent);
+    expect(headings).toEqual(['First', 'Second']);
+    const cards = screen.getAllByRole('button', { name: 'Open relay on Fedora' });
+    await fireEvent.keyDown(cards[0], { key: 'ArrowDown', altKey: true });
+    expect(reorder).toHaveBeenCalledWith(first, 2);
+    // The new arrangement shows immediately, before the relay confirms.
+    expect(screen.getAllByRole('heading', { level: 3 }).map((heading) => heading.textContent))
+      .toEqual(['Second', 'First']);
+    await fireEvent.keyDown(cards[0], { key: 'ArrowDown' });
+    expect(reorder).toHaveBeenCalledTimes(1);
+    reorder.mockRestore();
+  });
+
+  it('uses the logo instead of an agent text suffix when card metadata is empty', () => {
+    const plain: Agent = {
+      relay_id: 'fedora', relay_label: 'Fedora', raw_pane_id: 'w2:p2', pane_id: 'fedora::w2:p2',
+      project: 'relay', agent: 'codex', status: 'working',
+    };
+    const { container } = render(AgentList, { agents: [plain], relays: [], responding: new Set<string>(), onopen: vi.fn() });
+    expect(container.querySelector('.agent-meta')).not.toBeInTheDocument();
+    expect(screen.getByRole('img', { name: 'Codex' })).toBeInTheDocument();
+    expect(screen.queryByText('codex')).not.toBeInTheDocument();
+  });
+
+  it('maps supported agent aliases to logos and labels custom fallbacks', () => {
+    const identities = [
+      ['claude-code', 'Claude Code'],
+      ['codex', 'Codex'],
+      ['open_code', 'OpenCode'],
+      ['pi-coding-agent', 'Pi'],
+      ['oh my pi', 'Oh My Pi'],
+      ['kimi-code', 'Kimi'],
+      ['qodercli', 'Qoder'],
+      ['custom-agent', 'custom-agent'],
+    ] as const;
+    const agents: Agent[] = identities.map(([agent], index) => ({
+      relay_id: 'fedora',
+      relay_label: 'Fedora',
+      raw_pane_id: `w3:p${index}`,
+      pane_id: `fedora::w3:p${index}`,
+      project: `project-${index}`,
+      agent,
+      status: 'working',
+    }));
+    const { container } = render(AgentList, { agents, relays: [], responding: new Set<string>(), onopen: vi.fn() });
+    for (const [, label] of identities) {
+      expect(screen.getByRole('img', { name: label })).toBeInTheDocument();
+    }
+    expect(container.querySelectorAll('.agent-logo')).toHaveLength(identities.length);
+    expect(container.querySelectorAll('.agent-meta')).toHaveLength(1);
+    expect(container.querySelector('.agent-meta')).toHaveTextContent('custom-agent');
+  });
+
+  it('names Devin panes without a dedicated logo', () => {
+    const agents: Agent[] = ['devin', 'devin-cli'].map((agent, index) => ({
+      relay_id: 'fedora',
+      relay_label: 'Fedora',
+      raw_pane_id: `w4:p${index}`,
+      pane_id: `fedora::w4:p${index}`,
+      project: `devin-${index}`,
+      agent,
+      status: 'working',
+    }));
+    const { container } = render(AgentList, { agents, relays: [], responding: new Set<string>(), onopen: vi.fn() });
+    expect(screen.getAllByRole('img', { name: 'Devin' })).toHaveLength(2);
+    expect(container.querySelectorAll('.agent-logo-generic')).toHaveLength(2);
+    const meta = [...container.querySelectorAll('.agent-meta')].map((element) => element.textContent?.trim());
+    expect(meta).toEqual(['Devin', 'Devin']);
+  });
+
+  it('names Antigravity panes under every alias Herdr reports', () => {
+    const agents: Agent[] = ['agy', 'antigravity', 'Antigravity-CLI'].map((agent, index) => ({
+      relay_id: 'mac',
+      relay_label: 'Mac',
+      raw_pane_id: `w5:p${index}`,
+      pane_id: `mac::w5:p${index}`,
+      project: `agy-${index}`,
+      agent,
+      status: 'idle',
+    }));
+    const { container } = render(AgentList, { agents, relays: [], responding: new Set<string>(), onopen: vi.fn() });
+    expect(screen.getAllByRole('img', { name: 'Antigravity' })).toHaveLength(3);
+    expect(container.querySelectorAll('.agent-logo-agy')).toHaveLength(3);
+  });
+
+  it('keeps a structured answer local until Submit', async () => {
+    const interaction: QuestionInteraction = {
+      id: 'question-1', kind: 'single_select', question: 'Where should the adapter live?',
+      options: [
+        { index: 0, label: 'Domain port', description: 'Transport agnostic.' },
+        { index: 1, label: 'Protocol boundary' },
+      ],
+      other: { label: 'None of the above', placeholder: 'Optional notes', allow_empty: true },
+      submit_label: 'Next', can_go_back: true, can_chat: true, question_index: 2, question_total: 4,
+    };
+    const answer = vi.spyOn(relayStore, 'answerQuestion').mockResolvedValue({ type: 'command_result', request_id: '1', ok: true, phase: 'confirmed' });
+    vi.spyOn(relayStore, 'navigateQuestionPrevious').mockResolvedValue({ type: 'command_result', request_id: '2', ok: true });
+    render(QuestionForm, { agent: { ...blockedAgent, interaction }, interaction, responding: false });
+    expect(screen.getByRole('group', { name: interaction.question })).toBeInTheDocument();
+    expect(screen.getByText('Question 2 of 4')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Next' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Chat about this' })).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('radio', { name: /Domain port/ }));
+    expect(answer).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(answer).toHaveBeenCalledOnce();
+    const draft = answer.mock.calls[0][2];
+    expect([...draft.selected]).toEqual([0]);
+    answer.mockRestore();
+    vi.restoreAllMocks();
+  });
+
+  it('renders a Qoder review without a custom-answer input', async () => {
+    const interaction: QuestionInteraction = {
+      id: 'qoder-review', kind: 'single_select',
+      question: 'Review your answers and choose what to do',
+      options: [
+        { index: 0, label: 'Submit answers', description: 'Vibe: Relaxation · Budget: Mid-range' },
+        { index: 1, label: 'Cancel ask' },
+      ],
+      other: { hidden: true },
+      submit_label: 'Continue', can_go_back: true, question_index: 5, question_total: 5,
+    };
+    const answer = vi.spyOn(relayStore, 'answerQuestion').mockResolvedValue({
+      type: 'command_result', request_id: 'review', ok: true, phase: 'confirmed',
+    });
+    render(QuestionForm, {
+      agent: { ...blockedAgent, interaction }, interaction, responding: false,
+    });
+
+    expect(screen.getByText('Question 5 of 5')).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: /Submit answers/ })).toBeInTheDocument();
+    expect(screen.getByRole('radio', { name: /Cancel ask/ })).toBeInTheDocument();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('radio', { name: /Submit answers/ }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    expect(answer).toHaveBeenCalledOnce();
+    vi.restoreAllMocks();
+  });
+
+  it('does not restore Other after selecting a normal answer across navigation', async () => {
+    const first: QuestionInteraction = {
+      id: 'question-1', kind: 'single_select', question: 'Choose reconnect behavior',
+      options: [{ index: 0, label: 'Backoff' }, { index: 1, label: 'Fixed retry' }],
+      other: { label: 'Other', placeholder: 'Other answer' }, submit_label: 'Next',
+    };
+    const second: QuestionInteraction = {
+      id: 'question-2', kind: 'multi_select', question: 'Choose offline scope',
+      options: [{ index: 0, label: 'App shell' }, { index: 1, label: 'Activity cache' }],
+      other: { label: 'Other', placeholder: 'Other answer' }, submit_label: 'Next', can_go_back: true,
+    };
+    const view = render(QuestionForm, {
+      agent: { ...blockedAgent, interaction: first }, interaction: first, responding: false,
+    });
+
+    const otherInput = screen.getByRole('textbox', { name: 'Other answer' });
+    await fireEvent.input(otherInput, { target: { value: 'Hello' } });
+    expect(screen.getByRole('radio', { name: 'Other' })).toBeChecked();
+    await view.rerender({ agent: { ...blockedAgent, interaction: second }, interaction: second, responding: false });
+    await view.rerender({ agent: { ...blockedAgent, interaction: first }, interaction: first, responding: false });
+    await fireEvent.click(screen.getByRole('radio', { name: 'Fixed retry' }));
+    expect(screen.getByRole('radio', { name: 'Other' })).not.toBeChecked();
+    expect(screen.getByRole('textbox', { name: 'Other answer' })).toHaveValue('');
+
+    await view.rerender({ agent: { ...blockedAgent, interaction: second }, interaction: second, responding: false });
+    const restored = {
+      ...first,
+      options: first.options.map((option) => ({ ...option, selected: option.index === 1 })),
+      other: { ...first.other, selected: false, text: 'Hello' },
+    };
+    await view.rerender({ agent: { ...blockedAgent, interaction: restored }, interaction: restored, responding: false });
+    expect(screen.getByRole('radio', { name: 'Fixed retry' })).toBeChecked();
+    expect(screen.getByRole('radio', { name: 'Other' })).not.toBeChecked();
+    expect(screen.getByRole('textbox', { name: 'Other answer' })).toHaveValue('');
+  });
+
+  it('restores a confirmed choice instead of an incomplete stale draft', async () => {
+    const first: QuestionInteraction = {
+      id: 'confirmed-reconnect', kind: 'single_select', question: 'Choose reconnect strategy',
+      options: [{ index: 0, label: 'Backoff' }, { index: 1, label: 'Signals' }],
+      other: { label: 'Other', placeholder: 'Other answer' }, submit_label: 'Next',
+    };
+    const second: QuestionInteraction = {
+      id: 'confirmed-offline', kind: 'multi_select', question: 'Choose offline scope',
+      options: [{ index: 0, label: 'App shell' }], submit_label: 'Next', can_go_back: true,
+    };
+    const view = render(QuestionForm, {
+      agent: { ...blockedAgent, interaction: first }, interaction: first, responding: false,
+    });
+
+    await fireEvent.focus(screen.getByRole('textbox', { name: 'Other answer' }));
+    expect(screen.getByRole('radio', { name: 'Other' })).toBeChecked();
+    expect(screen.getByRole('button', { name: 'Next' })).toBeDisabled();
+    await view.rerender({ agent: { ...blockedAgent, interaction: second }, interaction: second, responding: false });
+
+    const confirmed = {
+      ...first,
+      options: first.options.map((option) => ({ ...option, selected: option.index === 1 })),
+    };
+    await view.rerender({ agent: { ...blockedAgent, interaction: confirmed }, interaction: confirmed, responding: false });
+
+    expect(screen.getByRole('radio', { name: 'Signals' })).toBeChecked();
+    expect(screen.getByRole('radio', { name: 'Other' })).not.toBeChecked();
+  });
+
+  it('keeps an unoccupied linked worktree visible when its repository parent is absent', () => {
+    const orphan = {
+      relay_id: 'fedora', relay_label: 'Fedora', workspace_id: 'w9', number: 9, label: 'fix-auth',
+      pane_count: 1, tab_count: 1, cwd: '/repos/mobile-fix-auth',
+      worktree: {
+        repo_key: 'repo', repo_name: 'mobile', repo_root: '/repos/mobile',
+        checkout_path: '/repos/mobile-fix-auth', is_linked_worktree: true,
+      },
+    } as RelayWorkspace;
+    // The same repository open on another computer must not hide the orphan.
+    const foreignParent = {
+      relay_id: 'mac', relay_label: 'Mac', workspace_id: 'w1', number: 1, label: 'mobile',
+      pane_count: 1, tab_count: 1, cwd: '/repos/mobile',
+      worktree: {
+        repo_key: 'repo', repo_name: 'mobile', repo_root: '/repos/mobile',
+        checkout_path: '/repos/mobile', is_linked_worktree: false,
+      },
+    } as RelayWorkspace;
+    render(AgentList, {
+      agents: [], relays: [], workspaces: [orphan, foreignParent],
+      responding: new Set<string>(), onopen: vi.fn(),
+    });
+    expect(screen.getByText('fix-auth', { selector: 'summary strong' })).toBeInTheDocument();
+    expect(screen.getByText('mobile', { selector: 'summary strong' })).toBeInTheDocument();
+  });
+
+  describe('server filter', () => {
+    const relays = ['Mac', 'Spark'].map((label) => ({ id: label.toLowerCase(), label, url: `wss://${label.toLowerCase()}.example`, token: '' }));
+    const agentOn = (relay: string, status: Agent['status'], project: string): Agent => ({
+      relay_id: relay, relay_label: relay, raw_pane_id: 'p1', pane_id: `${relay}::p1`,
+      project, agent: 'codex', status,
+    });
+    const workspaceOn = (relay: string, label: string): RelayWorkspace => ({
+      relay_id: relay, relay_label: relay, workspace_id: `${relay}-w`, number: 1, label,
+      focused: false, pane_count: 1, tab_count: 1, active_tab_id: '', agent_status: '', cwd: `/home/user/${label}`,
+    });
+    const renderList = (props: Partial<{ agents: Agent[]; relays: typeof relays; workspaces: RelayWorkspace[] }> = {}) => render(AgentList, {
+      agents: [], relays, workspaces: [], responding: new Set<string>(), onopen: vi.fn(), ...props,
+    });
+
+    afterEach(() => {
+      hiddenServers.set([]);
+      relayStore.relayConfigs.set([]);
+    });
+
+    it('stays out of the way with a single computer, even with a stale hidden id', () => {
+      hiddenServers.set(['mac']);
+      renderList({ relays: [relays[0]], agents: [agentOn('mac', 'idle', 'solo project')] });
+      expect(screen.queryByRole('group', { name: 'Show servers' })).not.toBeInTheDocument();
+      expect(screen.getAllByText('solo project').length).toBeGreaterThan(0);
+    });
+
+    it('says so when every server is hidden instead of showing onboarding', async () => {
+      renderList();
+      await fireEvent.click(screen.getByRole('button', { name: 'Mac' }));
+      await fireEvent.click(screen.getByRole('button', { name: 'Spark' }));
+      expect(screen.getByText('All servers are hidden.')).toBeInTheDocument();
+      await fireEvent.click(screen.getByRole('button', { name: 'Mac' }));
+      expect(screen.queryByText(/All servers are hidden/)).not.toBeInTheDocument();
+    });
+
+    it('hides a server\'s idle and empty workspaces too', () => {
+      setServerHidden('mac', true);
+      renderList({ workspaces: [workspaceOn('mac', 'mac-empty'), workspaceOn('spark', 'spark-empty')] });
+      expect(screen.queryByText('mac-empty')).not.toBeInTheDocument();
+      expect(screen.getByText('spark-empty')).toBeInTheDocument();
+    });
+
+    it('badges blocked and needs-inspection agents on a hidden server and keeps the choice across remounts', async () => {
+      // Approval blocks and "Needs inspection" both wait on a person; idle panes do not count.
+      const agents = [
+        { ...agentOn('mac', 'blocked', 'mac approval'), attention_kind: 'approval' as const, attention_capable: true, options: ['Approve', 'Deny'] },
+        { ...agentOn('mac', 'blocked', 'mac inspect'), raw_pane_id: 'p2', pane_id: 'mac::p2' },
+        { ...agentOn('mac', 'idle', 'mac idle'), raw_pane_id: 'p3', pane_id: 'mac::p3' },
+      ];
+      const first = renderList({ agents });
+      await fireEvent.click(screen.getByRole('button', { name: 'Mac' }));
+      first.unmount();
+      renderList({ agents });
+      expect(screen.getByRole('button', { name: /^Mac/ })).toHaveAttribute('aria-pressed', 'false');
+      expect(screen.getByRole('img', { name: '2 need attention while hidden' })).toBeInTheDocument();
+      expect(screen.queryByText('mac approval')).not.toBeInTheDocument();
+    });
+
+    it('tells same-named computers apart', () => {
+      const twins = [
+        { id: 'a', label: 'Mac', url: 'wss://mac.home.lan', token: '' },
+        { id: 'b', label: 'Mac', url: 'wss://mac.office.lan', token: '' },
+      ];
+      renderList({ relays: twins });
+      expect(screen.getByRole('button', { name: 'Mac (mac.home.lan)' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Mac (mac.office.lan)' })).toBeInTheDocument();
+    });
+
+    it('falls back to the id for same-named computers without a URL', () => {
+      renderList({ relays: [{ id: 'gw-a', label: 'Mac', url: '', token: '' }, { id: 'gw-b', label: 'Mac', url: '', token: '' }] });
+      expect(screen.getByRole('button', { name: 'Mac (gw-a)' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Mac (gw-b)' })).toBeInTheDocument();
+    });
+
+    it('forgets a removed hidden server, and every hidden server once one computer is left', () => {
+      relayStore.relayConfigs.set([...relays, { id: 'fedora', label: 'Fedora', url: 'wss://fedora.example', token: '' }]);
+      setServerHidden('mac', true);
+      setServerHidden('spark', true);
+      relayStore.removeRelay('spark');
+      expect(get(hiddenServers)).toEqual(['mac']);
+      relayStore.removeRelay('fedora');
+      expect(get(hiddenServers)).toEqual([]);
+    });
+  });
+
+  it.each([
+    ['workspace_management', true, true, true],
+    ['workspace_rename', true, false, false],
+    ['workspace_reorder', false, true, false],
+  ] as const)('gates workspace controls with %s', async (capability, rename, reorder, manage) => {
+    relayStore.relayConfigs.set([{ id: 'fedora', label: 'Fedora', url: 'wss://fedora', token: '' }]);
+    relayStore.connections.set(new Map([['fedora', {
+      status: 'connected', inventory: { state: 'ready' }, capabilities: [capability],
+    } as never]]));
+    relayStore.workspaces.set([{
+      relay_id: 'fedora', relay_label: 'Fedora', workspace_id: 'w1', number: 1, label: 'Project',
+      focused: false, pane_count: 1, tab_count: 1, active_tab_id: '', agent_status: '', cwd: '/project',
+    }]);
+    try {
+      render(WorkspaceManager);
+      expect(Boolean(screen.queryByRole('button', { name: 'Rename' }))).toBe(rename);
+      expect(Boolean(screen.queryByRole('button', { name: 'Reorder Project' }))).toBe(reorder);
+      expect(Boolean(screen.queryByRole('button', { name: 'Create Workspace' }))).toBe(manage);
+      expect(Boolean(screen.queryByRole('button', { name: 'Close' }))).toBe(manage);
+      expect(Boolean(screen.queryByRole('button', { name: 'Worktrees' }))).toBe(manage);
+      if (rename) {
+        await fireEvent.click(screen.getByRole('button', { name: 'Rename' }));
+        expect(screen.getByDisplayValue('Project')).toBeInTheDocument();
+      }
+    } finally {
+      relayStore.workspaces.set([]);
+      relayStore.connections.set(new Map());
+      relayStore.relayConfigs.set([]);
+    }
+  });
+
+  it('drops an optimistic workspace order once an authoritative snapshot changes membership', async () => {
+    const workspace = (id: string, label: string): RelayWorkspace => ({
+      relay_id: 'fedora', relay_label: 'Fedora', workspace_id: id, number: 1, label,
+      focused: false, pane_count: 1, tab_count: 1, active_tab_id: '', agent_status: '',
+      cwd: `/home/user/${id}`,
+    });
+    relayStore.relayConfigs.set([{ id: 'fedora', label: 'Fedora', url: 'wss://fedora', token: '' }]);
+    // RelayConnection is store-internal; the rendered manager reads only
+    // status, inventory readiness, and capabilities — all on the view type.
+    const connection = {
+      status: 'connected', inventory: { state: 'ready' },
+      capabilities: ['workspace_management', 'workspace_reorder_block'],
+    } as unknown as RelayConnectionView;
+    relayStore.connections.set(new Map([['fedora', connection as never]]));
+    relayStore.workspaces.set([workspace('w1', 'One'), workspace('w2', 'Two')]);
+    // A never-settling reorder keeps the optimistic order pending under test.
+    const reorder = vi.spyOn(relayStore, 'reorderWorkspaceBlock')
+      .mockReturnValue(new Promise<CommandResult>(() => {}));
+    try {
+      const { container } = render(WorkspaceManager);
+      const labels = () => [...container.querySelectorAll('.workspace-management-slot header strong')]
+        .map((element) => element.textContent);
+      expect(labels()).toEqual(['One', 'Two']);
+
+      await fireEvent.keyDown(screen.getByRole('button', { name: 'Reorder One' }), { key: 'ArrowDown', altKey: true });
+      expect(reorder).toHaveBeenCalledWith('fedora', ['w1'], '', 2);
+      // The optimistic arrangement shows while the relay has not confirmed.
+      expect(labels()).toEqual(['Two', 'One']);
+
+      // A snapshot with different membership invalidates the optimism.
+      relayStore.workspaces.set([workspace('w1', 'One'), workspace('w2', 'Two'), workspace('w3', 'Three')]);
+      await vi.waitFor(() => expect(labels()).toEqual(['One', 'Two', 'Three']));
+    } finally {
+      reorder.mockRestore();
+      relayStore.workspaces.set([]);
+      relayStore.connections.set(new Map());
+      relayStore.relayConfigs.set([]);
+    }
+  });
+  it('requires separate group consent after a primary close refusal', async () => {
+    const user = userEvent.setup();
+    const workspace = (id: string, label: string, linked: boolean, panes: number): RelayWorkspace => ({
+      relay_id: 'fedora', relay_label: 'Fedora', workspace_id: id, number: linked ? 2 : 1, label,
+      focused: false, pane_count: panes, tab_count: 1, active_tab_id: '', agent_status: '',
+      cwd: `/repos/${id}`,
+      worktree: {
+        repo_key: 'repo', repo_name: 'project', repo_root: '/repos/project',
+        checkout_path: `/repos/${id}`, is_linked_worktree: linked,
+      },
+    });
+    const primary = workspace('w1', 'Project', false, 2);
+    const child = workspace('w2', 'Fix', true, 1);
+    const connection = {
+      status: 'connected', inventory: { state: 'ready' },
+      capabilities: ['workspace_management', 'worktree_management'],
+    } as unknown as RelayConnectionView;
+    relayStore.relayConfigs.set([{ id: 'fedora', label: 'Fedora', url: 'wss://fedora', token: '' }]);
+    relayStore.connections.set(new Map([['fedora', connection as never]]));
+    relayStore.workspaces.set([primary, child]);
+    const close = vi.spyOn(relayStore, 'closeWorkspace')
+      .mockRejectedValueOnce(Object.assign(
+        new CommandError('Close the workspace group explicitly'),
+        { data: { code: 'workspace_group_close_required', workspace_ids: ['w1', 'w2'] } },
+      ))
+      .mockResolvedValue({ type: 'command_result', request_id: 'close-2', action: 'workspace_close', ok: true, phase: 'completed' });
+    try {
+      render(WorkspaceManager);
+      await user.click(screen.getAllByRole('button', { name: 'Close' })[0]);
+      const firstDialog = screen.getByRole('dialog', { name: 'Close Project?' });
+      await user.click(within(firstDialog).getByRole('button', { name: 'Close Workspace' }));
+      await vi.waitFor(() => expect(screen.getByRole('dialog', { name: 'Close Project group?' })).toBeInTheDocument());
+      const groupDialog = screen.getByRole('dialog', { name: 'Close Project group?' });
+      expect(groupDialog).toHaveTextContent('All running panes in the currently open group will close. Group membership can change until the command runs. Git checkouts and branches are not removed.');
+      expect(within(groupDialog).getByRole('list')).toHaveTextContent('Project');
+      expect(within(groupDialog).getByRole('list')).toHaveTextContent('Fix');
+      expect(close).toHaveBeenCalledTimes(1);
+      await user.click(within(groupDialog).getByRole('button', { name: 'Close Workspace Group' }));
+      await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(2));
+      expect(close).toHaveBeenNthCalledWith(2, primary, {
+        closeGroup: true,
+        expectedWorkspaceIds: ['w1', 'w2'],
+      });
+    } finally {
+      close.mockRestore();
+      relayStore.workspaces.set([]);
+      relayStore.connections.set(new Map());
+      relayStore.relayConfigs.set([]);
+    }
+  });
+
+  it('does not route a delayed workspace refusal to the selected sibling relay', async () => {
+    const user = userEvent.setup();
+    const workspace = (relayId: string, relayLabel: string, id: string, label: string, linked: boolean): RelayWorkspace => ({
+      relay_id: relayId, relay_label: relayLabel, workspace_id: id, number: linked ? 2 : 1, label,
+      focused: false, pane_count: 1, tab_count: 1, active_tab_id: '', agent_status: '',
+      cwd: `/repos/${relayId}/${id}`,
+      worktree: {
+        repo_key: 'repo', repo_name: 'project', repo_root: `/repos/${relayId}/project`,
+        checkout_path: `/repos/${relayId}/${id}`, is_linked_worktree: linked,
+      },
+    });
+    const alphaPrimary = workspace('alpha', 'Alpha', 'w1', 'Alpha Project', false);
+    const alphaChild = workspace('alpha', 'Alpha', 'w2', 'Alpha Fix', true);
+    const betaPrimary = workspace('beta', 'Beta', 'w1', 'Beta Project', false);
+    const betaChild = workspace('beta', 'Beta', 'w2', 'Beta Fix', true);
+    const connection = {
+      status: 'connected', inventory: { state: 'ready' },
+      capabilities: ['workspace_management', 'worktree_management'],
+    } as unknown as RelayConnectionView;
+    relayStore.relayConfigs.set([
+      { id: 'alpha', label: 'Alpha', url: 'wss://alpha', token: '' },
+      { id: 'beta', label: 'Beta', url: 'wss://beta', token: '' },
+    ]);
+    relayStore.connections.set(new Map([
+      ['alpha', connection as never],
+      ['beta', connection as never],
+    ]));
+    relayStore.workspaces.set([alphaPrimary, alphaChild, betaPrimary, betaChild]);
+    let rejectClose!: (reason?: unknown) => void;
+    const pending = new Promise<CommandResult>((_resolve, reject) => { rejectClose = reject; });
+    const close = vi.spyOn(relayStore, 'closeWorkspace').mockReturnValue(pending);
+    try {
+      render(WorkspaceManager);
+      await vi.waitFor(() => expect(screen.getAllByRole('button', { name: 'Close' }).length).toBeGreaterThan(0));
+      await user.click(screen.getAllByRole('button', { name: 'Close' })[0]);
+      const dialog = screen.getByRole('dialog', { name: 'Close Alpha Project?' });
+      await user.click(within(dialog).getByRole('button', { name: 'Close Workspace' }));
+      await vi.waitFor(() => expect(close).toHaveBeenCalledOnce());
+
+      await user.selectOptions(screen.getByRole('combobox', { name: 'Computer' }), 'beta');
+      rejectClose(Object.assign(new CommandError('Close the workspace group explicitly'), {
+        data: { code: 'workspace_group_close_required', workspace_ids: ['w1', 'w2'] },
+      }));
+      await expect(pending).rejects.toThrow('Close the workspace group explicitly');
+      await vi.waitFor(() => expect(screen.queryByRole('dialog', { name: 'Close Beta Project group?' })).not.toBeInTheDocument());
+    } finally {
+      close.mockRestore();
+      relayStore.workspaces.set([]);
+      relayStore.connections.set(new Map());
+      relayStore.relayConfigs.set([]);
+    }
+  });
+
+  it('cancels group confirmation when its relay disconnects', async () => {
+    const user = userEvent.setup();
+    const workspace = (id: string, label: string, linked: boolean): RelayWorkspace => ({
+      relay_id: 'fedora', relay_label: 'Fedora', workspace_id: id, number: linked ? 2 : 1, label,
+      focused: false, pane_count: 1, tab_count: 1, active_tab_id: '', agent_status: '',
+      cwd: `/repos/${id}`,
+      worktree: {
+        repo_key: 'repo', repo_name: 'project', repo_root: '/repos/project',
+        checkout_path: `/repos/${id}`, is_linked_worktree: linked,
+      },
+    });
+    const primary = workspace('w1', 'Project', false);
+    const child = workspace('w2', 'Fix', true);
+    const connection = {
+      status: 'connected', inventory: { state: 'ready' },
+      capabilities: ['workspace_management'],
+    } as unknown as RelayConnectionView;
+    relayStore.relayConfigs.set([{ id: 'fedora', label: 'Fedora', url: 'wss://fedora', token: '' }]);
+    relayStore.connections.set(new Map([['fedora', connection as never]]));
+    relayStore.workspaces.set([primary, child]);
+    const close = vi.spyOn(relayStore, 'closeWorkspace').mockRejectedValue(
+      Object.assign(new CommandError('Close the workspace group explicitly'), {
+        data: { code: 'workspace_group_close_required', workspace_ids: ['w1', 'w2'] },
+      }),
+    );
+    try {
+      render(WorkspaceManager);
+      await user.click(screen.getAllByRole('button', { name: 'Close' })[0]);
+      const firstDialog = screen.getByRole('dialog', { name: 'Close Project?' });
+      await user.click(within(firstDialog).getByRole('button', { name: 'Close Workspace' }));
+      await vi.waitFor(() => expect(screen.getByRole('dialog', { name: 'Close Project group?' })).toBeInTheDocument());
+      relayStore.connections.set(new Map());
+      await vi.waitFor(() => expect(
+        screen.queryByRole('dialog', { name: 'Close Project group?' }),
+      ).not.toBeInTheDocument());
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      close.mockRestore();
+      relayStore.workspaces.set([]);
+      relayStore.connections.set(new Map());
+      relayStore.relayConfigs.set([]);
+    }
+  });
+  it('hands the launch form to a deep link relay that connects after a faster sibling', async () => {
+    relayStore.relayConfigs.set([
+      { id: 'fast', label: 'Fast', url: 'wss://fast', token: '' },
+      { id: 'slow', label: 'Slow', url: 'wss://slow', token: '' },
+    ]);
+    const ready = {
+      status: 'connected', inventory: { state: 'ready' }, capabilities: ['agent_launch'], agentProfiles: [],
+    } as unknown as RelayConnectionView;
+    relayStore.connections.set(new Map([['fast', ready as never]]));
+    try {
+      render(LaunchView, { relayId: 'slow', cwd: '/home/user/project' });
+      const select = screen.getByRole('combobox', { name: 'Computer' }) as HTMLSelectElement;
+      // The faster sibling wins only while the requested relay is absent.
+      await vi.waitFor(() => expect(select.value).toBe('fast'));
+      relayStore.connections.set(new Map([['fast', ready as never], ['slow', ready as never]]));
+      await vi.waitFor(() => expect(select.value).toBe('slow'));
+    } finally {
+      relayStore.connections.set(new Map());
+      relayStore.relayConfigs.set([]);
+    }
+  });
+
+  const homeListing = { current: { path: '/home/user', label: '~' }, parent: '', directories: [] };
+  const projectListing = { current: { path: '/home/user/project', label: '~/project' }, parent: '/home/user', directories: [] };
+  it.each([
+    ['the home folder, which the relay refuses', '/home/user', homeListing, () => Promise.resolve(homeListing), true],
+    ['a project folder below it', '/home/user/project', projectListing, () => Promise.resolve(projectListing), false],
+    // A failed reload keeps the older listing, which must not veto the selected project folder.
+    ['a project folder whose reload failed over an older home listing', '/home/user/project', homeListing, () => Promise.reject(new CommandError('Relay timed out')), false],
+  ])('offers Start Agent only for a project folder: %s', async (_case, cwd, shown, load, refused) => {
+    const hint = 'Agents cannot start in the home folder itself. Tap the folder above to pick a project folder.';
+    const connection = {
+      status: 'connected', inventory: { state: 'ready' }, capabilities: ['directory_browser', 'agent_launch'],
+      agentProfiles: [{ id: 'claude', label: 'Claude Code' }],
+      directoryBrowser: shown, directoryLoading: false, directoryError: '',
+    } as unknown as RelayConnectionView;
+    relayStore.relayConfigs.set([{ id: 'fedora', label: 'Fedora', url: 'wss://fedora', token: '' }]);
+    relayStore.connections.set(new Map([['fedora', connection as never]]));
+    const list = vi.spyOn(relayStore, 'listDirectories').mockImplementation(load as never);
+    try {
+      render(LaunchView, { relayId: 'fedora', cwd });
+      const start = screen.getByRole('button', { name: 'Start Agent' }) as HTMLButtonElement;
+      await vi.waitFor(() => expect(list).toHaveBeenCalled());
+      await vi.waitFor(() => expect(start.disabled).toBe(refused));
+      expect(start).toHaveAccessibleDescription(refused ? hint : '');
+      expect(Boolean(screen.queryByText(hint))).toBe(refused);
+    } finally {
+      list.mockRestore();
+      relayStore.connections.set(new Map());
+      relayStore.relayConfigs.set([]);
+    }
+  });
+
+  it('shows the Hermes profile picker only for the Hermes agent', async () => {
+    relayStore.relayConfigs.set([{ id: 'fedora', label: 'Fedora', url: 'wss://fedora', token: '' }]);
+    const list = vi.spyOn(relayStore, 'listDirectories').mockResolvedValue({
+      current: { path: '/home/user/project', label: 'project' }, parent: '', directories: [],
+    });
+    try {
+      relayStore.connections.set(new Map([
+        ['fedora', launchConnection([{ id: 'codex', label: 'Codex' }], ['apollo']) as never],
+      ]));
+      render(LaunchView);
+      await vi.waitFor(() => expect(screen.getByRole('combobox', { name: 'Agent' })).toHaveValue('codex'));
+      expect(screen.queryByRole('combobox', { name: 'Hermes profile' })).not.toBeInTheDocument();
+
+      // A custom profile whose label mentions Hermes must not open the picker:
+      // only the builtin agent id is accepted by the relay's start validation.
+      relayStore.connections.set(new Map([
+        ['fedora', launchConnection([{ id: 'project-hermes', label: 'Hermes staging' }], ['apollo']) as never],
+      ]));
+      await vi.waitFor(() => expect(screen.getByRole('combobox', { name: 'Agent' })).toHaveValue('project-hermes'));
+      expect(screen.queryByRole('combobox', { name: 'Hermes profile' })).not.toBeInTheDocument();
+
+      relayStore.connections.set(new Map([
+        ['fedora', launchConnection([{ id: 'hermes', label: 'Hermes' }], ['apollo']) as never],
+      ]));
+      await vi.waitFor(() => expect(screen.getByRole('combobox', { name: 'Hermes profile' })).toBeInTheDocument());
+    } finally {
+      list.mockRestore();
+      relayStore.connections.set(new Map());
+      relayStore.relayConfigs.set([]);
+    }
+  });
+
+  it('offers the sticky default as the first Hermes profile option', async () => {
+    relayStore.relayConfigs.set([{ id: 'fedora', label: 'Fedora', url: 'wss://fedora', token: '' }]);
+    const list = vi.spyOn(relayStore, 'listDirectories').mockResolvedValue({
+      current: { path: '/home/user/project', label: 'project' }, parent: '', directories: [],
+    });
+    try {
+      // hermesprofiles.List always returns Default first, then the named
+      // profiles, so this is the payload the relay really sends.
+      relayStore.connections.set(new Map([
+        ['fedora', launchConnection([{ id: 'hermes', label: 'Hermes' }], ['default', 'apollo', 'work']) as never],
+      ]));
+      render(LaunchView);
+      const select = screen.getByRole('combobox', { name: 'Hermes profile' }) as HTMLSelectElement;
+      await vi.waitFor(() => expect(select.options.length).toBe(4));
+      // The empty choice and the literal "default" start different profiles, so
+      // they must not read the same. The empty option is the initial selection:
+      // submitting it omits -p and leaves Hermes on its sticky active_profile.
+      expect([...select.options].map((option) => option.value)).toEqual(['', 'default', 'apollo', 'work']);
+      expect([...select.options].map((option) => option.textContent?.trim())).toEqual([
+        'Use my usual setup', 'Main profile (default)', 'apollo', 'work',
+      ]);
+      expect(select.value).toBe('');
+    } finally {
+      list.mockRestore();
+      relayStore.connections.set(new Map());
+      relayStore.relayConfigs.set([]);
+    }
+  });
+
+  it('omits hermes_profile for the default option and sends an explicit choice', async () => {
+    const user = userEvent.setup();
+    relayStore.relayConfigs.set([{ id: 'fedora', label: 'Fedora', url: 'wss://fedora', token: '' }]);
+    const list = vi.spyOn(relayStore, 'listDirectories').mockResolvedValue({
+      current: { path: '/home/user/project', label: 'project' }, parent: '', directories: [],
+    });
+    const send = vi.spyOn(relayStore, 'sendCommand').mockResolvedValue({
+      type: 'command_result', request_id: 'launch-1', ok: true, data: { pane_id: 'pane-new' },
+    } as CommandResult);
+    vi.spyOn(relayStore, 'waitForAgent').mockResolvedValue(null);
+    vi.spyOn(relayStore, 'showToast').mockImplementation(() => {});
+    try {
+      relayStore.connections.set(new Map([
+        ['fedora', launchConnection([{ id: 'hermes', label: 'Hermes' }], ['default', 'apollo']) as never],
+      ]));
+      render(LaunchView);
+      const start = screen.getByRole('button', { name: 'Start Agent' });
+      await vi.waitFor(() => expect(start).toBeEnabled());
+
+      await user.click(start);
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+      const defaultPayload = send.mock.calls[0][1];
+      expect(defaultPayload.profile_id).toBe('hermes');
+      expect('hermes_profile' in defaultPayload).toBe(false);
+
+      await user.selectOptions(screen.getByRole('combobox', { name: 'Hermes profile' }), 'apollo');
+      // A successful launch clears the name field, so the form needs it again.
+      await user.type(screen.getByLabelText('Name'), 'project-hermes');
+      await vi.waitFor(() => expect(start).toBeEnabled());
+      await user.click(start);
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(2));
+      expect(send.mock.calls[1][1].hermes_profile).toBe('apollo');
+
+      // Picking the literal default is its own choice: it pins the root home,
+      // unlike the empty option above, so the field must travel.
+      await user.selectOptions(screen.getByRole('combobox', { name: 'Hermes profile' }), 'default');
+      await user.type(screen.getByLabelText('Name'), 'project-hermes');
+      await vi.waitFor(() => expect(start).toBeEnabled());
+      await user.click(start);
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(3));
+      expect(send.mock.calls[2][1].hermes_profile).toBe('default');
+    } finally {
+      send.mockRestore();
+      list.mockRestore();
+      vi.restoreAllMocks();
+      relayStore.connections.set(new Map());
+      relayStore.relayConfigs.set([]);
+    }
+  });
+
+  it('drops a stale worktree listing that resolves under another workspace dialog', async () => {
+    const user = userEvent.setup();
+    const workspace = (id: string, label: string): RelayWorkspace => ({
+      relay_id: 'fedora', relay_label: 'Fedora', workspace_id: id, number: 1, label,
+      focused: false, pane_count: 1, tab_count: 1, active_tab_id: '', agent_status: '',
+      cwd: `/repos/${id}`,
+    });
+    const listing = (repo: string, branch: string): WorktreeListing => ({
+      source: { repo_key: repo, repo_name: repo, repo_root: `/repos/${repo}` },
+      worktrees: [{ path: `/repos/${repo}-${branch}`, branch, label: branch, is_linked_worktree: true }],
+    } as unknown as WorktreeListing);
+    relayStore.relayConfigs.set([{ id: 'fedora', label: 'Fedora', url: 'wss://fedora', token: '' }]);
+    const connection = {
+      status: 'connected', inventory: { state: 'ready' },
+      capabilities: ['workspace_management', 'worktree_management'],
+    } as unknown as RelayConnectionView;
+    relayStore.connections.set(new Map([['fedora', connection as never]]));
+    relayStore.workspaces.set([workspace('w1', 'One'), workspace('w2', 'Two')]);
+    let releaseFirst = (_: WorktreeListing) => {};
+    const first = new Promise<WorktreeListing>((resolve) => { releaseFirst = resolve; });
+    const list = vi.spyOn(relayStore, 'listWorktrees')
+      .mockImplementationOnce(() => first)
+      .mockImplementationOnce(() => Promise.resolve(listing('two', 'feature-two')));
+    try {
+      render(WorkspaceManager);
+      const buttons = screen.getAllByRole('button', { name: 'Worktrees' });
+      await user.click(buttons[0]);
+      await user.click(buttons[1]);
+      // The second dialog's listing arrives first; the first workspace's
+      // slower response must not replace it afterwards.
+      await vi.waitFor(() => expect(screen.getByText('feature-two')).toBeInTheDocument());
+      releaseFirst(listing('one', 'feature-one'));
+      await first;
+      expect(list).toHaveBeenCalledTimes(2);
+      expect(screen.queryByText('feature-one')).not.toBeInTheDocument();
+      expect(screen.getByText('feature-two')).toBeInTheDocument();
+    } finally {
+      list.mockRestore();
+      relayStore.workspaces.set([]);
+      relayStore.connections.set(new Map());
+      relayStore.relayConfigs.set([]);
+    }
+  });
+
+  it('reports corrupt conversation records separately from file truncation', async () => {
+    const user = userEvent.setup();
+    const agent: Agent = {
+      relay_id: 'fedora', relay_label: 'Fedora', raw_pane_id: 'w1:p9', pane_id: 'fedora::w1:p9',
+      project: 'relay', agent: 'opencode', status: 'working', cwd: '/home/test/relay',
+    };
+    const history = vi.spyOn(relayStore, 'getConversationHistory').mockResolvedValueOnce({
+      available: true,
+      reason: '',
+      entries: [{
+        id: 'turn-1', timestamp: '2026-09-02T12:00:00Z',
+        role: 'assistant', text: 'valid turn', tools: [],
+      }],
+      nextCursor: 'cursor-1',
+      hasMore: true,
+      total: 2,
+      diagnostics: {
+        oversized_records: 0,
+        corrupt_records: 1,
+        omitted_tools: 0,
+        omitted_payloads: 0,
+        plan_corrupt: false,
+        source_truncated: false,
+      },
+    }).mockResolvedValue({
+      available: true,
+      reason: '',
+      entries: [{
+        id: 'turn-0', timestamp: '2026-09-02T11:00:00Z',
+        role: 'user', text: 'older turn', tools: [],
+      }],
+      hasMore: false,
+      total: 2,
+    });
+    try {
+      const view = render(ConversationHistory, { agent });
+      expect(await screen.findByText(/Some records could not be decoded/)).toBeInTheDocument();
+      expect(screen.queryByText(/log exceeds 16 MB/)).not.toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: 'Load older turns' }));
+      await vi.waitFor(() => expect(history).toHaveBeenCalledTimes(2));
+      expect(screen.getByText(/Some records could not be decoded/)).toBeInTheDocument();
+      view.unmount();
+    } finally {
+      history.mockRestore();
+    }
+  });
+
+  it('persists the conversation composer draft across remounts and clears it on send', async () => {
+    const user = userEvent.setup();
+    const agent: Agent = {
+      relay_id: 'fedora', relay_label: 'Fedora', raw_pane_id: 'w1:p9', pane_id: 'fedora::w1:p9',
+      server_session_id: 'primary', terminal_id: 'terminal-p9', generation: 1, agent_session_id: 'draft-session',
+      project: 'relay', agent: 'codex', status: 'working', cwd: '/home/test/relay',
+    };
+    vi.spyOn(relayStore, 'getConversationHistory').mockResolvedValue({
+      available: true, reason: '', entries: [], hasMore: false, total: 0,
+    });
+    const send = vi.spyOn(relayStore, 'sendToAgent').mockResolvedValue({
+      type: 'command_result', request_id: 'prompt-1', ok: true,
+    });
+    try {
+      relayStore.connections.set(new Map([['fedora', { status: 'connected', capabilities: [] }]] as never));
+      vi.spyOn(relayStore, 'readPane').mockImplementation(() => {});
+      const freshFrame = () => ({ paneId: agent.pane_id, target: { relay_id: agent.relay_id, pane_id: agent.raw_pane_id, server_session_id: agent.server_session_id!, terminal_id: agent.terminal_id!, generation: agent.generation!, agent_session_id: agent.agent_session_id }, content: 'Ready', format: 'plain', noEcho: false, receivedAt: performance.now() });
+      const first = render(ConversationHistory, { agent });
+      await first.rerender({ frame: freshFrame() });
+      await user.type(screen.getByRole('combobox', { name: 'Prompt' }), 'Keep me around');
+      first.unmount();
+
+      const second = render(ConversationHistory, { agent });
+      expect(screen.getByRole('combobox', { name: 'Prompt' })).toHaveValue('');
+      await second.rerender({ frame: freshFrame() });
+      expect(screen.getByRole('combobox', { name: 'Prompt' })).toHaveValue('Keep me around');
+      await user.click(screen.getByRole('button', { name: 'Send prompt' }));
+      expect(send).toHaveBeenCalledWith(agent, { type: 'submit_prompt', text: 'Keep me around' });
+      second.unmount();
+
+      render(ConversationHistory, { agent });
+      expect(screen.getByRole('combobox', { name: 'Prompt' })).toHaveValue('');
+    } finally {
+      clearPromptDraft(agent);
+      vi.restoreAllMocks();
+      relayStore.connections.set(new Map());
+    }
+  });
+});

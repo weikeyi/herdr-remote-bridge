@@ -1,0 +1,861 @@
+<script lang="ts">
+  import { createReorderHold } from '$lib/reorder-hold';
+  import { displacedSlot, insertionSlot, slotGap, type ReorderSlot } from '$lib/reorder-geometry';
+  import { tick } from 'svelte';
+  import DirectoryPicker from '$components/DirectoryPicker.svelte';
+  import AppDialog from '$components/ui/AppDialog.svelte';
+  import Button from '$components/ui/Button.svelte';
+  import Card from '$components/ui/Card.svelte';
+  import { navigate } from '$lib/router';
+  import { CommandError, relayStore } from '$lib/store';
+  import { informativePath, relayWorkspaceTrees, workspaceProvenance, type RelayWorkspaceTree } from '$lib/workspaces';
+  import type { RelayWorkspace, WorktreeListing } from '$lib/types';
+
+  const relays = relayStore.relayConfigs;
+  const connections = relayStore.connections;
+  const workspaces = relayStore.workspaces;
+  const agents = relayStore.agents;
+  let { readOnlyRelayIds = new Set<string>() }: { readOnlyRelayIds?: Set<string> } = $props();
+
+  let relayId = $state('');
+  let loadedRelay = '';
+  let cwd = $state('');
+  let label = $state('');
+  let directoryOpen = $state(false);
+  let createOpen = $state(false);
+  let busy = $state(false);
+  let status = $state('');
+  let error = $state(false);
+  let renamingId = $state('');
+  let renameLabel = $state('');
+  let renameInput = $state<HTMLInputElement | null>(null);
+  let renameInvoker: HTMLElement | null = null;
+  let worktreeWorkspaceId = $state('');
+  let worktreeOpen = $state(false);
+  let worktreeListing = $state<WorktreeListing | null>(null);
+  let worktreeLoading = $state(false);
+  let worktreeError = $state('');
+  let branch = $state('');
+  let base = $state('');
+  let worktreeLabel = $state('');
+  let confirmOpen = $state(false);
+  type ConfirmingAction = {
+    kind: 'close' | 'close_group' | 'remove';
+    workspace: RelayWorkspace;
+    force: boolean;
+    workspaceIDs?: string[];
+  };
+  let confirming = $state<ConfirmingAction | null>(null);
+  let movingWorkspace = $state('');
+  let workspaceDrag = $state<{
+    owner: HTMLElement;
+    sourceKey: string;
+    pointerId: number;
+    startY: number;
+    deltaY: number;
+    insertIdx: number;
+    items: ReorderSlot[];
+    gap: number;
+  } | null>(null);
+  let pendingWorkspaceOrder = $state<{ relayId: string; order: string[] } | null>(null);
+  let directoryLoadGeneration = 0;
+  let worktreeLoadGeneration = 0;
+  const cancelWorkspaceReorders = new Set<() => void>();
+
+  function selectWorkspaceRelay(next: string) {
+    if (next === relayId) return;
+    for (const cancel of cancelWorkspaceReorders) cancel();
+    relayId = next;
+  }
+
+  const readyRelays = $derived($relays.filter((relay) => {
+    const connection = $connections.get(relay.id);
+    return connection?.status === 'connected'
+      && connection.inventory.state === 'ready'
+      && ['workspace_management', 'workspace_rename', 'workspace_reorder'].some((capability) => connection.capabilities.includes(capability));
+  }));
+  const connection = $derived($connections.get(relayId));
+  const workspaceManagementAvailable = $derived(connection?.capabilities.includes('workspace_management') ?? false);
+  const workspaceRenameAvailable = $derived(workspaceManagementAvailable || (connection?.capabilities.includes('workspace_rename') ?? false));
+  const workspaceReorderAvailable = $derived(workspaceManagementAvailable || (connection?.capabilities.includes('workspace_reorder') ?? false));
+  const worktreeManagementAvailable = $derived(connection?.capabilities.includes('worktree_management') ?? false);
+  const relayWorkspaces = $derived(
+    $workspaces.filter((workspace) => workspace.relay_id === relayId),
+  );
+  const workspaceTrees = $derived(relayWorkspaceTrees(relayWorkspaces));
+  const displayWorkspaceTrees = $derived.by(() => {
+    if (pendingWorkspaceOrder?.relayId !== relayId) return workspaceTrees;
+    const rank = new Map(pendingWorkspaceOrder.order.map((id, index) => [id, index]));
+    return [...workspaceTrees].sort((left, right) =>
+      (rank.get(left.workspace.workspace_id) ?? Number.MAX_SAFE_INTEGER)
+      - (rank.get(right.workspace.workspace_id) ?? Number.MAX_SAFE_INTEGER));
+  });
+  const worktreeWorkspace = $derived(
+    relayWorkspaces.find((workspace) => workspace.workspace_id === worktreeWorkspaceId) || null,
+  );
+  const agentCounts = $derived.by(() => {
+    const counts = new Map<string, number>();
+    for (const agent of $agents) {
+      const key = `${agent.relay_id}\u0000${agent.workspace_id || ''}`;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    return counts;
+  });
+
+  $effect(() => {
+    if (!readyRelays.some((relay) => relay.id === relayId)) selectWorkspaceRelay(readyRelays[0]?.id || '');
+    if (!relayId || loadedRelay === relayId) return;
+    loadedRelay = relayId;
+    cwd = '';
+    label = '';
+    renamingId = '';
+    renameLabel = '';
+    createOpen = false;
+    worktreeWorkspaceId = '';
+    worktreeOpen = false;
+    worktreeListing = null;
+    if (workspaceManagementAvailable) void loadDirectory('');
+  });
+
+  $effect(() => {
+    if (worktreeWorkspaceId && !relayWorkspaces.some((workspace) => workspace.workspace_id === worktreeWorkspaceId)) {
+      worktreeWorkspaceId = '';
+      worktreeOpen = false;
+      worktreeListing = null;
+    }
+  });
+
+  $effect(() => {
+    const pending = pendingWorkspaceOrder;
+    if (!pending || pending.relayId !== relayId) return;
+    const current = workspaceTrees.map((tree) => tree.workspace.workspace_id);
+    if (current.join('\u0000') === pending.order.join('\u0000')) {
+      pendingWorkspaceOrder = null;
+      return;
+    }
+    // An authoritative snapshot whose membership differs from the optimistic
+    // array invalidates the optimism outright; only a pure reorder of the
+    // same set keeps waiting for the relay's confirmation.
+    const optimistic = new Set(pending.order);
+    if (current.length !== pending.order.length || current.some((id) => !optimistic.has(id))) {
+      pendingWorkspaceOrder = null;
+    }
+  });
+  $effect(() => {
+    const action = confirming;
+    if (!confirmOpen || !action || action.kind !== 'close_group') return;
+    const originReady = readyRelays.some((relay) => relay.id === action.workspace.relay_id);
+    const tree = workspaceTrees.find((candidate) =>
+      candidate.workspace.workspace_id === action.workspace.workspace_id);
+    const currentIDs = tree?.workspaceIds || [];
+    if (!originReady || relayId !== action.workspace.relay_id
+      || currentIDs.join('\u0000') !== (action.workspaceIDs || []).join('\u0000')) {
+      confirmOpen = false;
+      confirming = null;
+    }
+  });
+
+  function isReadOnly(relay: string): boolean {
+    return readOnlyRelayIds.has(relay);
+  }
+  function pathBase(path: string): string {
+    return path.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).at(-1) || 'workspace';
+  }
+
+  async function loadDirectory(path: string) {
+    const loadRelayId = relayId;
+    const generation = ++directoryLoadGeneration;
+    if (!loadRelayId || !connection?.capabilities.includes('directory_browser')) return;
+    try {
+      const listing = await relayStore.listDirectories(loadRelayId, path);
+      if (generation !== directoryLoadGeneration || relayId !== loadRelayId) return;
+      if (listing.current.path) {
+        cwd = listing.current.path;
+        if (!label) label = pathBase(cwd);
+      }
+    } catch (caught) {
+      if (generation !== directoryLoadGeneration || relayId !== loadRelayId) return;
+      setStatus((caught as Error).message, true);
+    }
+  }
+
+  function setStatus(message: string, failed = false) {
+    status = message;
+    error = failed;
+    if (message) relayStore.showToast(message, failed);
+  }
+
+  /**
+   * True when the relay may have applied the mutation even though no
+   * confirmation came back (the store's `dispatched_unknown` phase).
+   * Retrying such a create blindly can duplicate the workspace or worktree,
+   * so callers steer the user to check the current list first.
+   */
+  function ambiguousOutcome(caught: unknown): boolean {
+    return caught instanceof CommandError && caught.data?.dispatched_unknown === true;
+  }
+
+  function openCreateWorkspace() {
+    if (isReadOnly(relayId)) return;
+    label ||= pathBase(cwd);
+    directoryOpen = false;
+    createOpen = true;
+  }
+
+  function closeCreateWorkspace() {
+    createOpen = false;
+    directoryOpen = false;
+  }
+
+  async function createWorkspace(event: SubmitEvent) {
+    event.preventDefault();
+    if (!relayId || isReadOnly(relayId) || !cwd || !label.trim()) return;
+    busy = true;
+    try {
+      await relayStore.createWorkspace(relayId, cwd, label.trim());
+      setStatus(`Created workspace ${label.trim()}.`);
+      label = '';
+      closeCreateWorkspace();
+    } catch (caught) {
+      if (ambiguousOutcome(caught)) {
+        // Leaving the dialog primed with the same values invites a blind
+        // retry that can create the workspace twice.
+        closeCreateWorkspace();
+        setStatus(`${(caught as Error).message} Check the workspace list before retrying.`, true);
+      } else {
+        setStatus((caught as Error).message, true);
+      }
+    } finally {
+      busy = false;
+    }
+  }
+  async function beginRename(workspace: RelayWorkspace, invoker: HTMLElement) {
+    renameInvoker = invoker;
+    renamingId = workspace.workspace_id;
+    renameLabel = workspace.label;
+    await tick();
+    renameInput?.focus();
+    renameInput?.select();
+  }
+
+  async function finishRename() {
+    const invoker = renameInvoker;
+    renamingId = '';
+    renameInvoker = null;
+    await tick();
+    invoker?.focus();
+  }
+
+  async function renameWorkspace(event: SubmitEvent, workspace: RelayWorkspace) {
+    event.preventDefault();
+    if (isReadOnly(workspace.relay_id) || !renameLabel.trim()) return;
+    busy = true;
+    try {
+      await relayStore.renameWorkspace(workspace, renameLabel.trim());
+      setStatus(`Renamed workspace to ${renameLabel.trim()}.`);
+      await finishRename();
+    } catch (caught) {
+      setStatus((caught as Error).message, true);
+    } finally {
+      busy = false;
+    }
+  }
+
+  function workspaceReorderPress(node: HTMLElement, params: { tree: RelayWorkspaceTree }) {
+    let current = params;
+    const hold = createReorderHold(node);
+
+    function clearOwnedDrag() {
+      if (workspaceDrag?.owner === node) workspaceDrag = null;
+    }
+
+    function cancel() {
+      clearOwnedDrag();
+      hold.cancel();
+    }
+    cancelWorkspaceReorders.add(cancel);
+
+    function onPointerDown(event: PointerEvent) {
+      if (!workspaceReorderAvailable || current.tree.workspace.relay_id !== relayId || !event.isPrimary || event.button !== 0 || movingWorkspace || isReadOnly(current.tree.workspace.relay_id)) return;
+      if (event.target instanceof Element && event.target.closest('button, input, select, textarea, a') && !event.target.closest('.workspace-drag-handle')) return;
+      hold.start(event, () => {
+        const items = measureWorkspaceSlots(node);
+        if (items.length < 2) {
+          hold.reset();
+          return;
+        }
+        const sourceIdx = items.findIndex((item) => item.id === current.tree.workspace.workspace_id);
+        if (sourceIdx < 0) {
+          hold.reset();
+          return;
+        }
+        hold.lift();
+        workspaceDrag = {
+          owner: node,
+          sourceKey: current.tree.workspace.workspace_id,
+          pointerId: hold.pointerId,
+          startY: hold.startY + window.scrollY,
+          deltaY: 0,
+          insertIdx: sourceIdx,
+          items,
+          gap: slotGap(items),
+        };
+      });
+    }
+
+    const stopListening = hold.listen(onPointerDown, {
+      move: trackWorkspaceDrag,
+      finish: (event) => finishWorkspaceDrag(event, current.tree),
+      cancel: clearOwnedDrag,
+    });
+    return {
+      update(next: { tree: RelayWorkspaceTree }) {
+        current = next;
+      },
+      destroy() {
+        cancelWorkspaceReorders.delete(cancel);
+        stopListening();
+        clearOwnedDrag();
+        hold.destroy();
+      },
+    };
+  }
+
+  function measureWorkspaceSlots(node: HTMLElement): ReorderSlot[] {
+    const container = node.closest('.workspace-management-list');
+    if (!container) return [];
+    return [...container.querySelectorAll<HTMLElement>('.workspace-management-slot')].map((slot) => {
+      const bounds = slot.getBoundingClientRect();
+      return {
+        id: slot.dataset.workspaceKey || '',
+        top: bounds.top + window.scrollY,
+        height: bounds.height,
+      };
+    });
+  }
+
+  function trackWorkspaceDrag(event: PointerEvent) {
+    if (!workspaceDrag || workspaceDrag.pointerId !== event.pointerId) return;
+    if (event.clientY < 72) window.scrollBy(0, -12);
+    else if (event.clientY > window.innerHeight - 72) window.scrollBy(0, 12);
+    const pointerY = event.clientY + window.scrollY;
+    const insertIdx = insertionSlot(workspaceDrag.items, workspaceDrag.sourceKey, pointerY);
+    workspaceDrag = { ...workspaceDrag, deltaY: pointerY - workspaceDrag.startY, insertIdx };
+  }
+
+  function workspaceShift(workspaceID: string): string {
+    if (!workspaceDrag) return '';
+    if (workspaceID === workspaceDrag.sourceKey) return `translateY(${workspaceDrag.deltaY}px)`;
+    const { items, sourceKey, insertIdx, gap } = workspaceDrag;
+    return displacedSlot(items, sourceKey, workspaceID, insertIdx, gap);
+  }
+
+  function finishWorkspaceDrag(event: PointerEvent, tree: RelayWorkspaceTree) {
+    if (!workspaceDrag || workspaceDrag.pointerId !== event.pointerId) return;
+    const completed = workspaceDrag;
+    workspaceDrag = null;
+    const sourceIdx = completed.items.findIndex((item) => item.id === completed.sourceKey);
+    if (sourceIdx < 0 || completed.insertIdx === sourceIdx) return;
+    void commitWorkspaceReorder(tree, completed.insertIdx);
+  }
+
+  function handleWorkspaceOrderKey(event: KeyboardEvent, tree: RelayWorkspaceTree) {
+    if (event.target !== event.currentTarget || !event.altKey || movingWorkspace || isReadOnly(tree.workspace.relay_id)) return;
+    const delta = event.key === 'ArrowUp' || event.key === 'ArrowLeft'
+      ? -1
+      : event.key === 'ArrowDown' || event.key === 'ArrowRight' ? 1 : 0;
+    if (!delta) return;
+    const index = displayWorkspaceTrees.findIndex((item) => item.workspace.workspace_id === tree.workspace.workspace_id);
+    if (index < 0 || !displayWorkspaceTrees[index + delta]) return;
+    event.preventDefault();
+    void commitWorkspaceReorder(tree, index + delta);
+  }
+
+  async function commitWorkspaceReorder(tree: RelayWorkspaceTree, insertIdx: number) {
+    if (!workspaceReorderAvailable || movingWorkspace || isReadOnly(tree.workspace.relay_id)) return;
+    const sourceID = tree.workspace.workspace_id;
+    const others = displayWorkspaceTrees.filter((item) => item.workspace.workspace_id !== sourceID);
+    const beforeWorkspaceID = others[insertIdx]?.workspace.workspace_id || '';
+    const order = [
+      ...others.slice(0, insertIdx).map((item) => item.workspace.workspace_id),
+      sourceID,
+      ...others.slice(insertIdx).map((item) => item.workspace.workspace_id),
+    ];
+    pendingWorkspaceOrder = { relayId: tree.workspace.relay_id, order };
+    movingWorkspace = sourceID;
+    try {
+      const legacyInsertIndex = beforeWorkspaceID
+        ? relayWorkspaces.findIndex((workspace) => workspace.workspace_id === beforeWorkspaceID)
+        : relayWorkspaces.length;
+      await relayStore.reorderWorkspaceBlock(
+        tree.workspace.relay_id,
+        tree.workspaceIds,
+        beforeWorkspaceID,
+        legacyInsertIndex,
+      );
+      setStatus(`Moved ${tree.workspace.label}.`);
+    } catch (caught) {
+      pendingWorkspaceOrder = null;
+      setStatus((caught as Error).message, true);
+    } finally {
+      movingWorkspace = '';
+    }
+  }
+
+  // Wait for showModal and for Cancel to be enabled after a refusal.
+  $effect(() => {
+    if (!confirmOpen || !confirming || busy) return;
+    void tick().then(() => {
+      if (confirmOpen && !busy) document.getElementById('workspace-confirm-cancel')?.focus();
+    });
+  });
+
+  function beginConfirm(kind: 'close' | 'remove', workspace: RelayWorkspace, force = false) {
+    if (isReadOnly(workspace.relay_id)) return;
+    confirming = { kind, workspace, force };
+    confirmOpen = true;
+  }
+
+  function beginGroupConfirm(tree: RelayWorkspaceTree) {
+    if (tree.workspace.relay_id !== relayId
+      || isReadOnly(tree.workspace.relay_id)
+      || tree.workspaceIds.length < 2) return;
+    confirming = {
+      kind: 'close_group',
+      workspace: tree.workspace,
+      force: false,
+      workspaceIDs: [...tree.workspaceIds],
+    };
+    confirmOpen = true;
+  }
+
+  function cancelConfirm() {
+    confirmOpen = false;
+    confirming = null;
+  }
+
+  function workspaceTreesForRelay(targetRelayId: string): RelayWorkspaceTree[] {
+    return relayWorkspaceTrees($workspaces.filter((workspace) => workspace.relay_id === targetRelayId));
+  }
+
+  function groupConfirmWorkspaces(): RelayWorkspace[] {
+    const targetRelayId = confirming?.workspace.relay_id;
+    if (!targetRelayId) return [];
+    return $workspaces.filter((workspace) =>
+      workspace.relay_id === targetRelayId
+      && (confirming?.workspaceIDs?.includes(workspace.workspace_id) ?? false));
+  }
+
+
+  async function confirmAction() {
+    if (!confirming || isReadOnly(confirming.workspace.relay_id)) return;
+    const action = confirming;
+    if (action.kind === 'close_group' && (
+      relayId !== action.workspace.relay_id
+      || !readyRelays.some((relay) => relay.id === action.workspace.relay_id)
+    )) {
+      cancelConfirm();
+      return;
+    }
+    busy = true;
+    try {
+      if (action.kind === 'close' || action.kind === 'close_group') {
+        await relayStore.closeWorkspace(action.workspace, action.kind === 'close_group'
+          ? { closeGroup: true, expectedWorkspaceIds: action.workspaceIDs }
+          : undefined);
+        setStatus(`Closed workspace${action.kind === 'close_group' ? ' group' : ''} ${action.workspace.label}.`);
+      } else {
+        await relayStore.removeWorktree(action.workspace, action.force);
+        setStatus(`Removed worktree ${action.workspace.label}.`);
+      }
+      cancelConfirm();
+    } catch (caught) {
+      // A dismissed dialog, a changed action, or a relay switch makes this
+      // response stale. It must not mutate whichever computer is visible now.
+      if (confirming !== action || !confirmOpen) return;
+      const commandError = caught as CommandError;
+      const code = commandError.data?.code;
+      if (action.kind === 'close' && code === 'workspace_group_close_required') {
+        const tree = workspaceTreesForRelay(action.workspace.relay_id).find((candidate) =>
+          candidate.workspace.relay_id === action.workspace.relay_id
+          && candidate.workspaceIds.includes(action.workspace.workspace_id));
+        if (!tree || tree.workspaceIds.length < 2) {
+          setStatus('Workspace group inventory is stale. Refresh and try again.', true);
+          cancelConfirm();
+          return;
+        }
+        if (relayId !== action.workspace.relay_id) {
+          cancelConfirm();
+          return;
+        }
+        beginGroupConfirm(tree);
+        setStatus('Review the workspace group before closing it.');
+        return;
+      }
+      if (action.kind === 'close_group' && (
+        code === 'workspace_group_changed' || code === 'workspace_group_consent_invalid'
+      )) {
+        setStatus('Workspace group changed. Review the current group before closing it.', true);
+        cancelConfirm();
+        return;
+      }
+      if (action.kind === 'remove' && !action.force && commandError.data?.force_available === true) {
+        confirming = { ...action, force: true };
+        return;
+      }
+      setStatus(commandError.message, true);
+      cancelConfirm();
+    } finally {
+      busy = false;
+    }
+  }
+
+  function startAgent(workspace: RelayWorkspace) {
+    if (isReadOnly(workspace.relay_id)) return;
+    navigate({
+      view: 'launch',
+      relayId: workspace.relay_id,
+      workspaceId: workspace.workspace_id,
+      cwd: workspace.cwd || workspace.worktree?.checkout_path || '',
+    });
+  }
+
+  async function showWorktrees(workspace: RelayWorkspace) {
+    const generation = ++worktreeLoadGeneration;
+    worktreeWorkspaceId = workspace.workspace_id;
+    worktreeOpen = true;
+    worktreeListing = null;
+    worktreeError = '';
+    worktreeLoading = true;
+    try {
+      const listing = await relayStore.listWorktrees(workspace);
+      // A slower listing for a previously shown workspace must not land
+      // under the dialog's current title; its Open buttons would then send
+      // paths from one repository with another one's workspace id.
+      if (generation !== worktreeLoadGeneration) return;
+      worktreeListing = listing;
+    } catch (caught) {
+      if (generation !== worktreeLoadGeneration) return;
+      worktreeError = (caught as Error).message;
+    } finally {
+      if (generation === worktreeLoadGeneration) worktreeLoading = false;
+    }
+  }
+
+  /**
+   * Refreshes the worktree dialog after a mutation, but only when the user
+   * still has it open: Escape-dismissing the dialog while the request was
+   * busy must not reopen it. When dismissed, the stale listing is dropped so
+   * the next explicit open fetches a fresh one.
+   */
+  async function refreshWorktrees(workspace: RelayWorkspace) {
+    if (worktreeOpen && worktreeWorkspaceId === workspace.workspace_id) {
+      await showWorktrees(workspace);
+      return;
+    }
+    if (worktreeWorkspaceId === workspace.workspace_id) worktreeListing = null;
+  }
+
+  function closeWorktrees() {
+    worktreeOpen = false;
+    worktreeWorkspaceId = '';
+    worktreeListing = null;
+  }
+
+  async function createWorktree(event: SubmitEvent) {
+    event.preventDefault();
+    const workspace = worktreeWorkspace;
+    if (!workspace || isReadOnly(workspace.relay_id) || !branch.trim()) return;
+    busy = true;
+    try {
+      await relayStore.createWorktree(workspace, {
+        branch: branch.trim(),
+        base: base.trim(),
+        label: worktreeLabel.trim(),
+      });
+      setStatus(`Created worktree ${branch.trim()}.`);
+      branch = '';
+      base = '';
+      worktreeLabel = '';
+      await refreshWorktrees(workspace);
+    } catch (caught) {
+      if (ambiguousOutcome(caught)) {
+        // The worktree may exist despite the lost confirmation; refreshing
+        // the listing shows the truth instead of inviting a duplicate.
+        setStatus(`${(caught as Error).message} Check the worktree list before retrying.`, true);
+        await refreshWorktrees(workspace);
+      } else {
+        setStatus((caught as Error).message, true);
+      }
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function openWorktree(path: string, labelValue: string) {
+    const workspace = worktreeWorkspace;
+    if (!workspace || isReadOnly(workspace.relay_id)) return;
+    busy = true;
+    try {
+      await relayStore.openWorktree(workspace, { path });
+      setStatus(`Opened worktree ${labelValue}.`);
+      await refreshWorktrees(workspace);
+    } catch (caught) {
+      if (ambiguousOutcome(caught)) {
+        // Opening creates a workspace; a blind retry can open it twice.
+        setStatus(`${(caught as Error).message} Check the workspace list before retrying.`, true);
+        await refreshWorktrees(workspace);
+      } else {
+        setStatus((caught as Error).message, true);
+      }
+    } finally {
+      busy = false;
+    }
+  }
+
+  function agentCount(workspace: RelayWorkspace): number {
+    return agentCounts.get(`${workspace.relay_id}\u0000${workspace.workspace_id}`) || 0;
+  }
+</script>
+
+{#snippet workspacePanel(workspace: RelayWorkspace, nested = false, tree: RelayWorkspaceTree | null = null)}
+  <article class:nested-workspace={nested} class="workspace-management-card">
+    {#if renamingId === workspace.workspace_id}
+      <form class="form-stack" onsubmit={(event) => renameWorkspace(event, workspace)}>
+        <label for={`workspace-rename-${workspace.workspace_id}`}>Workspace label</label>
+        <input bind:this={renameInput} id={`workspace-rename-${workspace.workspace_id}`} bind:value={renameLabel} maxlength="128" required autocomplete="off" />
+        <div class="button-row">
+          <Button type="submit" disabled={busy || isReadOnly(workspace.relay_id) || !renameLabel.trim()}>Save</Button>
+          <Button variant="ghost" disabled={busy} onclick={finishRename}>Cancel</Button>
+        </div>
+      </form>
+    {:else}
+      {@const checkoutPath = workspace.cwd || workspace.worktree?.checkout_path || ''}
+      {@const shownPath = nested ? informativePath(checkoutPath, workspace.label) : checkoutPath || 'Working directory unavailable'}
+      {@const provenance = workspaceProvenance(workspace, nested)}
+      <header>
+        <span>
+          <strong>{workspace.label}</strong>
+          {#if shownPath}<small>{shownPath}</small>{/if}
+        </span>
+        {#if tree && workspaceReorderAvailable}
+          <button
+            class="workspace-drag-handle"
+            type="button"
+            disabled={isReadOnly(workspace.relay_id)}
+            aria-label={`Reorder ${workspace.label}`}
+            aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
+            title="Hold and drag to reorder; Alt+arrow keys also work."
+            onkeydown={(event) => handleWorkspaceOrderKey(event, tree)}
+          >⠿</button>
+        {/if}
+      </header>
+      <p class="workspace-management-meta">
+        {workspace.tab_count} {workspace.tab_count === 1 ? 'tab' : 'tabs'} ·
+        {workspace.pane_count} {workspace.pane_count === 1 ? 'pane' : 'panes'} ·
+        {agentCount(workspace)} {agentCount(workspace) === 1 ? 'agent' : 'agents'}
+      </p>
+      {#if provenance}
+        <p class="workspace-management-meta">{provenance}</p>
+      {/if}
+      <div class="workspace-management-actions">
+        <Button size="sm" disabled={busy || isReadOnly(workspace.relay_id) || !(workspace.cwd || workspace.worktree?.checkout_path)} onclick={() => startAgent(workspace)}>Start Agent</Button>
+        {#if workspaceRenameAvailable}
+          <Button size="sm" variant="secondary" disabled={busy || isReadOnly(workspace.relay_id)} onclick={(event) => beginRename(workspace, event.currentTarget)}>Rename</Button>
+        {/if}
+        {#if workspaceManagementAvailable && !workspace.worktree?.is_linked_worktree}
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={busy || !worktreeManagementAvailable}
+            title={worktreeManagementAvailable ? undefined : 'This relay does not support worktree management'}
+            onclick={() => showWorktrees(workspace)}
+          >Worktrees</Button>
+        {/if}
+        {#if workspaceManagementAvailable}
+          <Button size="sm" variant="danger" disabled={busy || isReadOnly(workspace.relay_id)} onclick={() => beginConfirm('close', workspace)}>Close</Button>
+        {/if}
+        {#if workspaceManagementAvailable && workspace.worktree?.is_linked_worktree}
+          <Button
+            size="sm"
+            variant="danger"
+            disabled={busy || isReadOnly(workspace.relay_id) || !worktreeManagementAvailable}
+            title={worktreeManagementAvailable ? undefined : 'This relay does not support worktree management'}
+            onclick={() => beginConfirm('remove', workspace)}
+          >Remove Worktree</Button>
+        {/if}
+      </div>
+    {/if}
+  </article>
+{/snippet}
+
+<main class="page workspace-manager-page" aria-labelledby="workspace-manager-title">
+  <div class="workspace-manager-heading">
+    <div>
+      <h2 id="workspace-manager-title">Workspaces</h2>
+      <p>Manage Herdr workspaces and their Git worktrees without changing desktop focus.</p>
+    </div>
+  </div>
+
+  <Card>
+    <div class="form-stack">
+      <label for="workspace-relay">Computer</label>
+      <select id="workspace-relay" value={relayId} onchange={(event) => selectWorkspaceRelay(event.currentTarget.value)}>
+        {#if !readyRelays.length}<option value="">No compatible relays</option>{/if}
+        {#each readyRelays as relay (relay.id)}<option value={relay.id}>{relay.label}</option>{/each}
+      </select>
+    </div>
+  </Card>
+
+  {#if workspaceManagementAvailable}
+  <Card>
+    <Button
+      class="workspace-create-button"
+      disabled={!relayId || isReadOnly(relayId) || busy}
+      onclick={openCreateWorkspace}
+    >Create Workspace</Button>
+  </Card>
+  {/if}
+
+  <section class="workspace-management-list" aria-label="Herdr workspaces">
+    {#if relayId && !relayWorkspaces.length}
+      <p class="empty-state">No workspaces are open on this computer.</p>
+    {/if}
+    {#each displayWorkspaceTrees as tree (tree.workspace.workspace_id)}
+      <div
+        class:workspace-dragging={workspaceDrag?.sourceKey === tree.workspace.workspace_id}
+        class="workspace-management-slot"
+        data-workspace-key={tree.workspace.workspace_id}
+        title={workspaceReorderAvailable ? "Hold to reorder this workspace." : undefined}
+        style:transform={workspaceShift(tree.workspace.workspace_id) || undefined}
+        use:workspaceReorderPress={{ tree }}
+      >
+        <Card>
+          {@render workspacePanel(tree.workspace, false, tree)}
+          {#if tree.children.length}
+            <div class="workspace-management-worktrees" aria-label={`${tree.workspace.label} linked worktrees`}>
+              {#each tree.children as child (child.workspace_id)}
+                {@render workspacePanel(child, true)}
+              {/each}
+            </div>
+          {/if}
+        </Card>
+      </div>
+    {/each}
+  </section>
+
+  {#if status}<p class:error class="form-status" role="status">{status}</p>{/if}
+
+</main>
+
+<AppDialog
+  id="workspace-create-dialog"
+  bind:open={createOpen}
+  title="Create Workspace"
+  description="Create an empty Herdr workspace with its initial tab. Start an agent later to add a second tab."
+>
+  <form class="form-stack" onsubmit={createWorkspace}>
+    <span id="workspace-cwd-label" class="field-label">Working Directory</span>
+    <div class:open={directoryOpen} class="directory-browser" aria-labelledby="workspace-cwd-label">
+      <DirectoryPicker
+        {connection}
+        {cwd}
+        listId="workspace-directory-list"
+        bind:open={directoryOpen}
+        onselect={loadDirectory}
+      />
+    </div>
+    <label for="workspace-label">Label</label>
+    <input id="workspace-label" bind:value={label} maxlength="128" required autocomplete="off" />
+    <div class="button-row">
+      <Button variant="ghost" disabled={busy} onclick={closeCreateWorkspace}>Cancel</Button>
+      <Button type="submit" disabled={busy || !relayId || isReadOnly(relayId) || !cwd || !label.trim()}>Confirm</Button>
+    </div>
+  </form>
+</AppDialog>
+
+<AppDialog
+  id="worktree-manager-dialog"
+  bind:open={worktreeOpen}
+  title={worktreeWorkspace ? `${worktreeWorkspace.label} Worktrees` : 'Worktrees'}
+  description={worktreeListing?.source.repo_root || worktreeWorkspace?.cwd || 'List, open, or create Git worktrees.'}
+>
+  {#if worktreeLoading}
+    <p role="status">Loading worktrees…</p>
+  {:else if worktreeError}
+    <p class="error" role="alert">{worktreeError}</p>
+  {:else if worktreeListing && worktreeWorkspace}
+    <div class="worktree-list">
+      {#each worktreeListing.worktrees as worktree (worktree.path)}
+        <article>
+          <span>
+            <strong>{worktree.branch || worktree.label}</strong>
+            <small>{worktree.path}</small>
+          </span>
+          {#if worktree.open_workspace_id}
+            <span class="worktree-state">Open</span>
+          {:else if worktree.is_bare || worktree.is_prunable}
+            <span class="worktree-state">Unavailable</span>
+          {:else}
+            <Button size="sm" variant="secondary" disabled={busy || isReadOnly(worktreeWorkspace.relay_id)} onclick={() => openWorktree(worktree.path, worktree.branch || worktree.label)}>Open</Button>
+          {/if}
+        </article>
+      {/each}
+    </div>
+    <form class="form-stack worktree-create-form" onsubmit={createWorktree}>
+      <h4>Create Worktree</h4>
+      <label for="worktree-branch">Branch</label>
+      <input id="worktree-branch" bind:value={branch} maxlength="512" required autocomplete="off" placeholder="fix/issue-14" />
+      <label for="worktree-base">Base ref <span class="optional">(optional, defaults to HEAD)</span></label>
+      <input id="worktree-base" bind:value={base} maxlength="512" autocomplete="off" placeholder="main" />
+      <label for="worktree-label">Workspace label <span class="optional">(optional)</span></label>
+      <input id="worktree-label" bind:value={worktreeLabel} maxlength="128" autocomplete="off" />
+      <div class="button-row">
+        <Button variant="ghost" disabled={busy} onclick={closeWorktrees}>Cancel</Button>
+        <Button type="submit" disabled={busy || !worktreeWorkspace || isReadOnly(worktreeWorkspace.relay_id) || !branch.trim()}>Confirm</Button>
+      </div>
+    </form>
+  {/if}
+</AppDialog>
+
+<AppDialog
+  id="workspace-destructive-dialog"
+  bind:open={confirmOpen}
+  title={confirming?.kind === 'close_group'
+    ? `Close ${confirming.workspace.label} group?`
+    : confirming?.kind === 'remove'
+      ? confirming.force ? `Force remove ${confirming.workspace.label}?` : `Remove ${confirming.workspace.label}?`
+      : `Close ${confirming?.workspace.label || 'workspace'}?`}
+  description={confirming?.kind === 'close_group'
+    ? 'All running panes in the currently open group will close. Group membership can change until the command runs. Git checkouts and branches are not removed.'
+    : confirming?.kind === 'remove'
+      ? confirming.force
+        ? 'The checkout has uncommitted changes. Force removal permanently discards those checkout changes; the Git branch is retained.'
+        : 'This closes the Herdr workspace and removes its linked checkout. The Git branch is retained.'
+      : 'Every pane in this workspace will close. Git checkouts are not removed.'}
+>
+  {#if confirming?.kind === 'close_group'}
+    <ul aria-label="Workspaces confirmed for closure">
+      {#each groupConfirmWorkspaces() as member (member.workspace_id)}
+        <li>
+          <strong>{member.label}</strong>
+          <span>{member.pane_count} {member.pane_count === 1 ? 'pane' : 'panes'}</span>
+        </li>
+      {/each}
+    </ul>
+  {/if}
+  <div class="button-row">
+    <Button
+      variant="danger"
+      disabled={busy || !confirming || isReadOnly(confirming.workspace.relay_id)}
+      onclick={confirmAction}
+    >
+      {confirming?.kind === 'close_group'
+        ? 'Close Workspace Group'
+        : confirming?.kind === 'remove'
+          ? confirming.force ? 'Force Remove' : 'Remove Worktree'
+          : 'Close Workspace'}
+    </Button>
+    <Button id="workspace-confirm-cancel" variant="ghost" disabled={busy} onclick={cancelConfirm}>Cancel</Button>
+  </div>
+</AppDialog>

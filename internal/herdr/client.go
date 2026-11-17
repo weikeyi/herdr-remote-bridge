@@ -1,0 +1,932 @@
+package herdr
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	defaultTimeout   = 15 * time.Second
+	maxOutputBytes   = 4 * 1024 * 1024
+	termGrace        = 2 * time.Second
+	waitDelay        = 4 * time.Second
+	shiftTabSequence = "\x1b[Z"
+)
+
+var (
+	// ErrDispatchedUnknown means cmd.Start succeeded, but completion could not
+	// be proved. Retrying a mutation is unsafe.
+	ErrDispatchedUnknown = errors.New("herdr: process started but completion is unknown")
+	// ErrNotStarted means no subprocess was created. Retrying is safe.
+	ErrNotStarted = errors.New("herdr: process was not started")
+	// ErrCreatedTargetUnknown means Herdr accepted a create command but its
+	// response did not identify the new root pane.
+	ErrCreatedTargetUnknown = errors.New("herdr: created target response did not identify the root pane")
+	// ErrPartiallyApplied means an earlier step of a multi-step mutation already
+	// reached the agent before a later step failed. It outranks any
+	// safe-to-retry classification derived from the failing step alone,
+	// because retrying would duplicate the input that already landed.
+	ErrPartiallyApplied = errors.New("herdr: earlier step of the mutation was already applied")
+)
+
+// OutcomeError preserves the subprocess dispatch boundary without exposing
+// stdout, stderr, user input, or environment data to protocol callers.
+type OutcomeError struct {
+	Started bool
+	Err     error
+}
+
+func (e *OutcomeError) Error() string {
+	if e == nil || e.Err == nil {
+		return "herdr command failed"
+	}
+	return e.Err.Error()
+}
+
+// CLIError is a machine-readable failure returned by the Herdr CLI.
+type CLIError struct {
+	Code               string
+	Message            string
+	refusedBeforeInput bool
+}
+
+func (e *CLIError) Error() string {
+	if e == nil {
+		return "herdr CLI command failed"
+	}
+	if e.Code == "" {
+		return e.Message
+	}
+	if e.Message == "" {
+		return e.Code
+	}
+	return e.Code + ": " + e.Message
+}
+
+var refusalCodes = map[string]struct{}{
+	"layout_conflict":                        {},
+	"blocked":                                {},
+	"status_mismatch":                        {},
+	"finished":                               {},
+	"needs_target":                           {},
+	"invalid_params":                         {},
+	"server_not_running":                     {},
+	"agent_pane_busy":                        {},
+	"protocol_mismatch":                      {},
+	"invalid_request":                        {},
+	"workspace_not_found":                    {},
+	"worktree_not_found":                     {},
+	"not_git_worktree":                       {},
+	"linked_worktree_source":                 {},
+	"workspace_group_close_required":         {},
+	"workspace_group_changed":                {},
+	"workspace_group_primary_required":       {},
+	"workspace_group_consent_invalid":        {},
+	"workspace_group_validation_unavailable": {},
+	"workspace_move_block_failed":            {},
+	"unknown_method":                         {},
+	"method_not_found":                       {},
+	"unsupported_method":                     {},
+}
+
+var transientRefusalCodes = map[string]struct{}{
+	"server_not_running": {},
+	"agent_pane_busy":    {},
+}
+
+func refusalCode(err error) (string, bool) {
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr == nil {
+		return "", false
+	}
+	_, refused := refusalCodes[cliErr.Code]
+	return cliErr.Code, refused || cliErr.refusedBeforeInput
+}
+
+func IsRefused(err error) bool {
+	_, refused := refusalCode(err)
+	return refused
+}
+
+func IsTransientRefused(err error) bool {
+	code, refused := refusalCode(err)
+	if !refused {
+		return false
+	}
+	_, transient := transientRefusalCodes[code]
+	return transient
+}
+
+func RefusalCode(err error) string {
+	code, _ := refusalCode(err)
+	return code
+}
+
+func RefusalMessage(code string) string {
+	switch code {
+	case "layout_conflict":
+		return "The layout changed on the desktop; try again"
+	case "server_not_running":
+		return "Herdr server is not running"
+	case "agent_pane_busy":
+		return "Agent pane is still starting"
+	case "agent_not_ready":
+		return "Agent is not ready to receive prompts; review the pane before retrying"
+	case "protocol_mismatch":
+		return "Herdr server protocol is incompatible with this relay"
+	case "workspace_group_close_required":
+		return "Close the workspace group explicitly"
+	case "workspace_group_changed":
+		return "Workspace group changed; review it before closing"
+	case "workspace_group_primary_required":
+		return "Select the primary workspace to close the group"
+	case "workspace_group_consent_invalid":
+		return "Workspace group confirmation is invalid; confirm again"
+	case "workspace_group_validation_unavailable":
+		return "Current workspace membership could not be verified; try again"
+	default:
+		return "Herdr rejected the command before it was sent"
+	}
+}
+
+type cliErrorEnvelope struct {
+	ID    string `json:"id"`
+	Error *struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+func (e *OutcomeError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	if e.Started {
+		return errors.Join(ErrDispatchedUnknown, e.Err)
+	}
+	return errors.Join(ErrNotStarted, e.Err)
+}
+
+type limitedBuffer struct {
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	original := len(p)
+	remaining := b.limit - b.buf.Len()
+	if remaining <= 0 {
+		b.truncated = true
+		return original, nil
+	}
+	if len(p) > remaining {
+		p = p[:remaining]
+		b.truncated = true
+	}
+	_, err := b.buf.Write(p)
+	return original, err
+}
+
+func (b *limitedBuffer) Bytes() []byte  { return b.buf.Bytes() }
+func (b *limitedBuffer) String() string { return b.buf.String() }
+
+type Client struct {
+	bin          string
+	socketPath   string
+	sem          chan struct{}
+	api          *socketAPIClient
+	capabilities *capabilityManager
+}
+
+func NewClient(bin, socketPath string) *Client {
+	client := &Client{
+		bin:        bin,
+		socketPath: socketPath,
+		sem:        make(chan struct{}, 8),
+		api:        newSocketAPIClient(socketPath),
+	}
+	client.capabilities = newCapabilityManager(client)
+	return client
+}
+
+type Pane struct {
+	ID             string `json:"pane_id"`
+	TerminalID     string `json:"terminal_id"`
+	TabID          string `json:"tab_id"`
+	TabLabel       string `json:"tab_label"`
+	TabNumber      int    `json:"tab_number"`
+	WorkspaceID    string `json:"workspace_id"`
+	Agent          string `json:"agent"`
+	Name           string `json:"name"`
+	Status         string `json:"agent_status"`
+	Focused        bool   `json:"focused"`
+	Cwd            string `json:"cwd"`
+	Revision       int    `json:"revision"`
+	StateChangeSeq int64  `json:"state_change_seq"`
+	Scroll         struct {
+		MaxOffsetFromBottom int `json:"max_offset_from_bottom"`
+	} `json:"scroll"`
+	ForegroundCwd string `json:"foreground_cwd"`
+	Session       string `json:"-"`
+	SessionRaw    struct {
+		Value string `json:"value"`
+		Kind  string `json:"kind"`
+	} `json:"agent_session"`
+}
+
+type Workspace struct {
+	ID          string             `json:"workspace_id"`
+	Number      int                `json:"number"`
+	Label       string             `json:"label"`
+	Focused     bool               `json:"focused"`
+	PaneCount   int                `json:"pane_count"`
+	TabCount    int                `json:"tab_count"`
+	ActiveTabID string             `json:"active_tab_id"`
+	AgentStatus string             `json:"agent_status"`
+	Cwd         string             `json:"cwd,omitempty"`
+	Worktree    *WorkspaceWorktree `json:"worktree,omitempty"`
+}
+
+type WorkspaceWorktree struct {
+	RepoKey          string `json:"repo_key"`
+	RepoName         string `json:"repo_name"`
+	RepoRoot         string `json:"repo_root"`
+	CheckoutPath     string `json:"checkout_path"`
+	IsLinkedWorktree bool   `json:"is_linked_worktree"`
+}
+
+type Worktree struct {
+	Path            string  `json:"path"`
+	Branch          *string `json:"branch"`
+	IsBare          bool    `json:"is_bare"`
+	IsDetached      bool    `json:"is_detached"`
+	IsPrunable      bool    `json:"is_prunable"`
+	IsLinked        bool    `json:"is_linked_worktree"`
+	Label           string  `json:"label"`
+	OpenWorkspaceID *string `json:"open_workspace_id"`
+}
+
+type WorktreeSource struct {
+	RepoKey            string  `json:"repo_key"`
+	RepoName           string  `json:"repo_name"`
+	RepoRoot           string  `json:"repo_root"`
+	SourceCheckoutPath string  `json:"source_checkout_path"`
+	SourceWorkspaceID  *string `json:"source_workspace_id"`
+}
+
+type WorktreeListResult struct {
+	Source    WorktreeSource `json:"source"`
+	Worktrees []Worktree     `json:"worktrees"`
+}
+
+type WorktreeMutationResult struct {
+	Workspace   Workspace `json:"workspace"`
+	Tab         Tab       `json:"tab"`
+	RootPane    Pane      `json:"root_pane"`
+	Worktree    Worktree  `json:"worktree"`
+	AlreadyOpen bool      `json:"already_open,omitempty"`
+}
+
+type WorktreeRemoveResult struct {
+	WorkspaceID string `json:"workspace_id"`
+	Path        string `json:"path"`
+	Forced      bool   `json:"forced"`
+}
+
+type Tab struct {
+	ID          string `json:"tab_id"`
+	WorkspaceID string `json:"workspace_id"`
+	Label       string `json:"label"`
+	Number      int    `json:"number"`
+	Cwd         string `json:"cwd"`
+}
+
+type CreateResult struct {
+	PaneID      string `json:"pane_id"`
+	TabID       string `json:"tab_id"`
+	WorkspaceID string `json:"workspace_id"`
+}
+
+// UnmarshalJSON accepts both the nested Herdr 0.7.5 create responses and the
+// flat result returned by older versions and test fixtures.
+func (r *CreateResult) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		PaneID      string    `json:"pane_id"`
+		TabID       string    `json:"tab_id"`
+		WorkspaceID string    `json:"workspace_id"`
+		RootPane    Pane      `json:"root_pane"`
+		Tab         Tab       `json:"tab"`
+		Workspace   Workspace `json:"workspace"`
+		Agent       AgentInfo `json:"agent"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+
+	r.PaneID = firstNonEmpty(wire.PaneID, wire.RootPane.ID, wire.Agent.PaneID)
+	r.TabID = firstNonEmpty(wire.TabID, wire.RootPane.TabID, wire.Tab.ID)
+	r.WorkspaceID = firstNonEmpty(
+		wire.WorkspaceID,
+		wire.RootPane.WorkspaceID,
+		wire.Tab.WorkspaceID,
+		wire.Workspace.ID,
+	)
+	return nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+type AgentInfo struct {
+	PaneID  string `json:"pane_id"`
+	Agent   string `json:"agent"`
+	Name    string `json:"name"`
+	Status  string `json:"agent_status"`
+	Running bool   `json:"running"`
+}
+
+type PaneProcess struct {
+	PID     int      `json:"pid"`
+	Name    string   `json:"name"`
+	Cwd     string   `json:"cwd"`
+	Cmdline string   `json:"cmdline"`
+	Argv    []string `json:"argv"`
+}
+
+type PaneProcessInfo struct {
+	PaneID                   string        `json:"pane_id"`
+	ShellPID                 int           `json:"shell_pid"`
+	ForegroundProcessGroupID int           `json:"foreground_process_group_id"`
+	ForegroundProcesses      []PaneProcess `json:"foreground_processes"`
+}
+
+type Inventory struct {
+	Panes []Pane
+}
+
+func (c *Client) GetInventory(ctx context.Context) (*Inventory, error) {
+	var result struct {
+		Agents *[]Pane `json:"agents"`
+	}
+	if err := c.api.requestResult(ctx, "agent.list", map[string]any{}, "agent_list", &result); err != nil {
+		return nil, fmt.Errorf("herdr inventory: %w", err)
+	}
+	if result.Agents == nil {
+		return nil, errors.New("herdr inventory: agent.list response has no agents")
+	}
+	for i := range *result.Agents {
+		(*result.Agents)[i].Session = (*result.Agents)[i].SessionRaw.Value
+	}
+	return &Inventory{Panes: *result.Agents}, nil
+}
+
+func (c *Client) PaneList(ctx context.Context) ([]Pane, error) {
+	var result struct {
+		Panes *[]Pane `json:"panes"`
+	}
+	if err := c.api.requestResult(ctx, "pane.list", map[string]any{}, "pane_list", &result); err != nil {
+		return nil, fmt.Errorf("herdr pane list: %w", err)
+	}
+	if result.Panes == nil {
+		return nil, errors.New("herdr pane list: pane.list response has no panes")
+	}
+	for index := range *result.Panes {
+		(*result.Panes)[index].Session = (*result.Panes)[index].SessionRaw.Value
+	}
+	return *result.Panes, nil
+}
+
+func (c *Client) WorkspaceList(ctx context.Context) ([]Workspace, error) {
+	var result struct {
+		Workspaces *[]Workspace `json:"workspaces"`
+	}
+	if err := c.api.requestResult(ctx, "workspace.list", map[string]any{}, "workspace_list", &result); err != nil {
+		return nil, fmt.Errorf("herdr workspace list: %w", err)
+	}
+	if result.Workspaces == nil {
+		return nil, errors.New("herdr workspace list: workspace.list response has no workspaces")
+	}
+	return *result.Workspaces, nil
+}
+
+func (c *Client) WorkspaceCreate(ctx context.Context, cwd, label string) (*CreateResult, error) {
+	var result CreateResult
+	if err := c.runResult(ctx, &result,
+		"workspace", "create",
+		"--cwd", cwd,
+		"--label", label,
+		"--no-focus",
+	); err != nil {
+		if !errors.Is(err, ErrNotStarted) && !errors.Is(err, ErrDispatchedUnknown) {
+			err = errors.Join(ErrDispatchedUnknown, ErrCreatedTargetUnknown, err)
+		}
+		return nil, fmt.Errorf("herdr workspace create: %w", err)
+	}
+	if result.PaneID == "" {
+		return nil, fmt.Errorf(
+			"herdr workspace create: %w",
+			errors.Join(ErrDispatchedUnknown, ErrCreatedTargetUnknown),
+		)
+	}
+	return &result, nil
+}
+
+func (c *Client) WorkspaceRename(ctx context.Context, workspaceID, label string) error {
+	if _, err := c.runCommand(ctx, "workspace", "rename", workspaceID, label); err != nil {
+		return fmt.Errorf("herdr workspace rename: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) WorkspaceMove(ctx context.Context, workspaceID string, insertIndex int) error {
+	if err := c.api.workspaceMove(ctx, workspaceID, insertIndex); err != nil {
+		return fmt.Errorf("herdr workspace move: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) WorkspaceMoveBlock(
+	ctx context.Context,
+	workspaceIDs []string,
+	beforeWorkspaceID string,
+) error {
+	epoch := c.capabilityEpoch()
+	if err := c.api.workspaceMoveBlock(ctx, workspaceIDs, beforeWorkspaceID); err != nil {
+		c.noteSocketFeature(epoch, FeatureWorkspaceMoveBlock, err)
+		return fmt.Errorf("herdr workspace move block: %w", err)
+	}
+	c.noteFeatureSupportedAt(epoch, FeatureWorkspaceMoveBlock, "operation_succeeded")
+	return nil
+}
+
+func (c *Client) WorkspaceClose(ctx context.Context, workspaceID string, closeGroup bool) error {
+	params := map[string]any{"workspace_id": workspaceID}
+	if closeGroup {
+		params["close_group"] = true
+	}
+	if err := c.api.requestResult(ctx, "workspace.close", params, "ok", nil); err != nil {
+		return fmt.Errorf("herdr workspace close: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) WorktreeList(ctx context.Context, workspaceID string) (*WorktreeListResult, error) {
+	var result WorktreeListResult
+	if err := c.runResult(ctx, &result, "worktree", "list", "--workspace", workspaceID); err != nil {
+		return nil, fmt.Errorf("herdr worktree list: %w", err)
+	}
+	return &result, nil
+}
+
+func (c *Client) WorktreeCreate(
+	ctx context.Context,
+	workspaceID, branch, base, label string,
+) (*WorktreeMutationResult, error) {
+	args := []string{"worktree", "create", "--workspace", workspaceID, "--branch", branch, "--no-focus"}
+	args = appendOptionalFlag(args, "--base", base)
+	args = appendOptionalFlag(args, "--label", label)
+	var result WorktreeMutationResult
+	if err := c.runResult(ctx, &result, args...); err != nil {
+		return nil, fmt.Errorf("herdr worktree create: %w", dispatchedAfterSuccess(err))
+	}
+	return &result, nil
+}
+
+func (c *Client) WorktreeOpen(
+	ctx context.Context,
+	workspaceID, path, branch, label string,
+) (*WorktreeMutationResult, error) {
+	args := []string{"worktree", "open", "--workspace", workspaceID, "--no-focus"}
+	args = appendOptionalFlag(args, "--path", path)
+	args = appendOptionalFlag(args, "--branch", branch)
+	args = appendOptionalFlag(args, "--label", label)
+	var result WorktreeMutationResult
+	if err := c.runResult(ctx, &result, args...); err != nil {
+		return nil, fmt.Errorf("herdr worktree open: %w", dispatchedAfterSuccess(err))
+	}
+	return &result, nil
+}
+
+func (c *Client) WorktreeRemove(
+	ctx context.Context,
+	workspaceID string,
+	force bool,
+) (*WorktreeRemoveResult, error) {
+	args := []string{"worktree", "remove", "--workspace", workspaceID}
+	if force {
+		args = append(args, "--force")
+	}
+	var result WorktreeRemoveResult
+	if err := c.runResult(ctx, &result, args...); err != nil {
+		return nil, fmt.Errorf("herdr worktree remove: %w", dispatchedAfterSuccess(err))
+	}
+	return &result, nil
+}
+
+// dispatchedAfterSuccess classifies runResult failures for mutations. An
+// error that carries no dispatch boundary comes from decoding the result
+// envelope after the subprocess reported success: the mutation may have
+// applied even though its outcome could not be read, so retrying is unsafe.
+// Errors already classified at the subprocess boundary keep their marker.
+func dispatchedAfterSuccess(err error) error {
+	if errors.Is(err, ErrNotStarted) || errors.Is(err, ErrDispatchedUnknown) {
+		return err
+	}
+	return errors.Join(ErrDispatchedUnknown, err)
+}
+
+func appendOptionalFlag(args []string, flag, value string) []string {
+	if value == "" {
+		return args
+	}
+	return append(args, flag, value)
+}
+
+func (c *Client) TabCreate(ctx context.Context, workspaceID, cwd, label string) (*CreateResult, error) {
+	var result CreateResult
+	if err := c.runResult(ctx, &result,
+		"tab", "create",
+		"--workspace", workspaceID,
+		"--cwd", cwd,
+		"--label", label,
+		"--no-focus",
+	); err != nil {
+		if !errors.Is(err, ErrNotStarted) && !errors.Is(err, ErrDispatchedUnknown) {
+			err = errors.Join(ErrDispatchedUnknown, ErrCreatedTargetUnknown, err)
+		}
+		return nil, fmt.Errorf("herdr tab create: %w", err)
+	}
+	if result.PaneID == "" {
+		return nil, fmt.Errorf(
+			"herdr tab create: %w",
+			errors.Join(ErrDispatchedUnknown, ErrCreatedTargetUnknown),
+		)
+	}
+	return &result, nil
+}
+
+func (c *Client) TabList(ctx context.Context) ([]Tab, error) {
+	var result struct {
+		Tabs *[]Tab `json:"tabs"`
+	}
+	if err := c.api.requestResult(ctx, "tab.list", map[string]any{}, "tab_list", &result); err != nil {
+		return nil, fmt.Errorf("herdr tab list: %w", err)
+	}
+	if result.Tabs == nil {
+		return nil, errors.New("herdr tab list: tab.list response has no tabs")
+	}
+	return *result.Tabs, nil
+}
+
+func (c *Client) TabRename(ctx context.Context, tabID, label string) error {
+	if _, err := c.runCommand(ctx, "tab", "rename", tabID, label); err != nil {
+		return fmt.Errorf("herdr tab rename: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) TabMove(ctx context.Context, tabID string, insertIndex int) error {
+	epoch := c.capabilityEpoch()
+	if err := c.api.tabMove(ctx, tabID, insertIndex); err != nil {
+		c.noteSocketFeature(epoch, FeatureTabMove, err)
+		return fmt.Errorf("herdr tab move: %w", err)
+	}
+	c.noteFeatureSupportedAt(epoch, FeatureTabMove, "operation_succeeded")
+	return nil
+}
+
+func (c *Client) PaneRun(ctx context.Context, paneID string, argv []string) error {
+	if len(argv) == 0 {
+		return errors.New("herdr pane run: empty profile argv")
+	}
+	command := ShellJoin(argv)
+	if _, err := c.runCommand(ctx, "pane", "run", paneID, command); err != nil {
+		return fmt.Errorf("herdr pane run: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) AgentGet(ctx context.Context, paneID string) (*AgentInfo, error) {
+	var result AgentInfo
+	if err := c.runResult(ctx, &result, "agent", "get", paneID); err != nil {
+		return nil, fmt.Errorf("herdr agent get: %w", err)
+	}
+	if result.PaneID == "" {
+		result.PaneID = paneID
+	}
+	return &result, nil
+}
+
+func (c *Client) PaneProcessInfo(ctx context.Context, paneID string) (*PaneProcessInfo, error) {
+	var result struct {
+		ProcessInfo PaneProcessInfo `json:"process_info"`
+	}
+	if err := c.runResult(ctx, &result, "pane", "process-info", "--pane", paneID); err != nil {
+		return nil, fmt.Errorf("herdr pane process info: %w", err)
+	}
+	return &result.ProcessInfo, nil
+}
+
+// PaneGet asks the running Herdr server for one pane over a fresh socket
+// request. Unlike the agent inventory it also covers plain shell panes, and it
+// carries the terminal incarnation (terminal_id) a pane-size lease is bound to.
+func (c *Client) PaneGet(ctx context.Context, paneID string) (*Pane, error) {
+	var result struct {
+		Pane *Pane `json:"pane"`
+	}
+	if err := c.api.requestResult(ctx, "pane.get", map[string]any{"pane_id": paneID}, "pane_info", &result); err != nil {
+		return nil, fmt.Errorf("herdr pane get: %w", err)
+	}
+	if result.Pane == nil {
+		return nil, errors.New("herdr pane get: pane.get response has no pane")
+	}
+	return result.Pane, nil
+}
+
+// PaneProcessInfoFresh reads pane.process_info over a fresh socket request,
+// without the CLI process PaneProcessInfo spawns. Pane-size identity checks
+// call it before every terminal write, so a cached answer is never reused.
+func (c *Client) PaneProcessInfoFresh(ctx context.Context, paneID string) (*PaneProcessInfo, error) {
+	var result struct {
+		ProcessInfo *PaneProcessInfo `json:"process_info"`
+	}
+	if err := c.api.requestResult(ctx, "pane.process_info", map[string]any{"pane_id": paneID}, "pane_process_info", &result); err != nil {
+		return nil, fmt.Errorf("herdr pane process info: %w", err)
+	}
+	if result.ProcessInfo == nil {
+		return nil, errors.New("herdr pane process info: response has no process_info")
+	}
+	return result.ProcessInfo, nil
+}
+
+// IsPaneNotFound reports Herdr's structured refusal for a pane that no longer
+// exists, from either the socket API or the CLI.
+func IsPaneNotFound(err error) bool {
+	var cliErr *CLIError
+	return errors.As(err, &cliErr) && cliErr != nil && cliErr.Code == "pane_not_found"
+}
+
+func (c *Client) ReadPane(ctx context.Context, paneID string, lines int, format string) (PaneRead, error) {
+	return c.readPane(ctx, paneID, lines, format, "recent-unwrapped")
+}
+
+func (c *Client) ReadPaneRecent(ctx context.Context, paneID string, lines int, format string) (PaneRead, error) {
+	return c.readPane(ctx, paneID, lines, format, "recent")
+}
+
+func (c *Client) ReadPaneVisible(ctx context.Context, paneID string, lines int, format string) (PaneRead, error) {
+	return c.readPane(ctx, paneID, lines, format, "visible")
+}
+
+func (c *Client) readPane(ctx context.Context, paneID string, lines int, format, source string) (PaneRead, error) {
+	if lines < 1 {
+		lines = 1
+	}
+	if format != "ansi" {
+		format = "text"
+	}
+	epoch := c.capabilityEpoch()
+	read, err := c.api.readPane(ctx, paneID, lines, format, source)
+	c.noteSocketFeature(epoch, FeaturePaneRead, err)
+	if err == nil {
+		return read, nil
+	}
+	content, err := c.runCommand(ctx,
+		"pane", "read", paneID,
+		"--lines", strconv.Itoa(lines),
+		"--source", source,
+		"--format", format,
+	)
+	if err != nil {
+		return PaneRead{}, err
+	}
+	return PaneRead{Content: content}, nil
+}
+
+func (c *Client) ProbePaneVisible(ctx context.Context, paneID string, lines int, format string) ([]byte, error) {
+	if lines < 1 {
+		lines = 1
+	}
+	if format != "ansi" {
+		format = "text"
+	}
+	epoch := c.capabilityEpoch()
+	read, err := c.api.readPane(ctx, paneID, lines, format, "visible")
+	c.noteSocketFeature(epoch, FeaturePaneRead, err)
+	if err != nil {
+		return nil, err
+	}
+	return read.Content, nil
+}
+
+func (c *Client) SupportsRealtimePane(ctx context.Context) bool {
+	return c.SupportsPaneRead()
+}
+
+func (c *Client) Close() error {
+	return c.api.close()
+}
+
+func (c *Client) SendKeys(ctx context.Context, paneID string, keys []string) error {
+	if len(keys) == 1 && strings.EqualFold(keys[0], "shift+tab") {
+		return c.SendText(ctx, paneID, shiftTabSequence)
+	}
+	args := make([]string, 0, 3+len(keys))
+	args = append(args, "pane", "send-keys", paneID)
+	for _, key := range keys {
+		args = append(args, normalizeTerminalKey(key))
+	}
+	_, err := c.runCommand(ctx, args...)
+	return err
+}
+
+func normalizeTerminalKey(key string) string {
+	if len(key) != len("ctrl+x") || !strings.EqualFold(key[:len("ctrl+")], "ctrl+") {
+		return key
+	}
+	letter := key[len(key)-1]
+	if letter >= 'A' && letter <= 'Z' {
+		return "ctrl+" + string(letter+'a'-'A')
+	}
+	return key
+}
+
+func (c *Client) SendText(ctx context.Context, paneID, text string) error {
+	_, err := c.runCommand(ctx, "pane", "send-text", paneID, text)
+	return err
+}
+
+func (c *Client) Prompt(ctx context.Context, paneID, text string) error {
+	_, err := c.runCommand(ctx, "agent", "prompt", paneID, text)
+	var cliErr *CLIError
+	if errors.As(err, &cliErr) && cliErr != nil && cliErr.Code == "agent_not_ready" {
+		cliErr.refusedBeforeInput = true
+	}
+	return err
+}
+
+func (c *Client) StopPane(ctx context.Context, paneID string) error {
+	_, err := c.runCommand(ctx, "pane", "close", paneID)
+	return err
+}
+
+func (c *Client) RenameAgent(ctx context.Context, paneID, name string) error {
+	_, err := c.runCommand(ctx, "agent", "rename", paneID, name)
+	return err
+}
+
+// RenamePane is retained as a compatibility alias for callers being migrated.
+func (c *Client) RenamePane(ctx context.Context, paneID, name string) error {
+	return c.RenameAgent(ctx, paneID, name)
+}
+
+// StartAgent starts kind in paneID. agentArgs, when given, are the started
+// agent's own arguments - `hermes -p <profile>` and the like. They follow a
+// "--" separator so herdr stops parsing at that point and the agent owns
+// everything after it; without that, a profile named like a herdr flag would be
+// read as one.
+func (c *Client) StartAgent(ctx context.Context, name, kind, paneID string, timeoutMs int, agentArgs ...string) (string, error) {
+	var result CreateResult
+	args := []string{
+		"agent", "start", name,
+		"--kind", kind,
+		"--pane", paneID,
+		"--timeout", strconv.Itoa(timeoutMs),
+	}
+	if len(agentArgs) > 0 {
+		args = append(args, "--")
+		args = append(args, agentArgs...)
+	}
+	if err := c.runResult(ctx, &result, args...); err != nil {
+		return "", fmt.Errorf("herdr agent start: %w", dispatchedAfterSuccess(err))
+	}
+	if result.PaneID == "" {
+		result.PaneID = paneID
+	}
+	if result.PaneID == "" {
+		return "", dispatchedAfterSuccess(errors.New("herdr agent start: response has no pane_id"))
+	}
+	return result.PaneID, nil
+}
+
+func (c *Client) IntegrationStatus(ctx context.Context) ([]byte, error) {
+	return c.runCommand(ctx, "integration", "status")
+}
+
+func (c *Client) runResult(ctx context.Context, result any, args ...string) error {
+	out, err := c.runCommand(ctx, args...)
+	if err != nil {
+		return err
+	}
+	var envelope struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(out, &envelope); err != nil {
+		return fmt.Errorf("malformed JSON envelope: %w", err)
+	}
+	if len(envelope.Result) == 0 || bytes.Equal(envelope.Result, []byte("null")) {
+		return errors.New("response has no result envelope")
+	}
+	if err := json.Unmarshal(envelope.Result, result); err != nil {
+		return fmt.Errorf("malformed result envelope: %w", err)
+	}
+	return nil
+}
+
+// run is retained for package-level process-boundary tests. Production callers
+// carry their own absolute deadline and use runCommand.
+func (c *Client) run(parent context.Context, timeout time.Duration, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	return c.runCommand(ctx, args...)
+}
+
+type dispatchCheckKey struct{}
+
+func WithDispatchCheck(ctx context.Context, check func() error) context.Context {
+	prior, _ := ctx.Value(dispatchCheckKey{}).(func() error)
+	return context.WithValue(ctx, dispatchCheckKey{}, func() error {
+		if prior != nil {
+			if err := prior(); err != nil {
+				return err
+			}
+		}
+		return check()
+	})
+}
+
+func CheckDispatch(ctx context.Context) error {
+	if check, ok := ctx.Value(dispatchCheckKey{}).(func() error); ok {
+		return check()
+	}
+	return nil
+}
+
+func commandResult(stdout, stderr *limitedBuffer, waitErr error) ([]byte, error) {
+	if waitErr == nil {
+		return append([]byte(nil), stdout.Bytes()...), nil
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(waitErr, &exitErr) {
+		return nil, &OutcomeError{Started: true, Err: waitErr}
+	}
+	diagnostic := strings.TrimSpace(stderr.String())
+	if !stderr.truncated && diagnostic != "" {
+		var envelope cliErrorEnvelope
+		if err := json.Unmarshal([]byte(diagnostic), &envelope); err == nil &&
+			envelope.Error != nil && envelope.Error.Code != "" {
+			return nil, &OutcomeError{
+				Started: true,
+				Err: &CLIError{
+					Code:    envelope.Error.Code,
+					Message: envelope.Error.Message,
+				},
+			}
+		}
+	}
+	if diagnostic == "" {
+		diagnostic = exitErr.Error()
+	}
+	if stderr.truncated {
+		diagnostic += " (truncated)"
+	}
+	if len(diagnostic) > 500 {
+		diagnostic = diagnostic[:500] + "..."
+	}
+	return nil, &OutcomeError{Started: true, Err: fmt.Errorf("command failed: %s", diagnostic)}
+}
+
+// ShellJoin is equivalent to shlex.join for the POSIX shell grammar used by
+// `herdr pane run`. Only configured profile argv is accepted by PaneRun.
+func ShellJoin(argv []string) string {
+	quoted := make([]string, len(argv))
+	for i, value := range argv {
+		quoted[i] = shellQuote(value)
+	}
+	return strings.Join(quoted, " ")
+}
+
+func shellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	const safe = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@%+=:,./-"
+	if strings.IndexFunc(value, func(r rune) bool { return !strings.ContainsRune(safe, r) }) == -1 {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}

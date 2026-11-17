@@ -1,0 +1,1123 @@
+package conversation
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"github.com/0cv/herdr-mobile-relay/internal/agentroots"
+	panehistory "github.com/0cv/herdr-mobile-relay/internal/history"
+)
+
+const (
+	UnknownTotal            = -1
+	maxConversationBytes    = 16 * 1024 * 1024
+	maxEntryBytes           = 128 * 1024
+	maxToolCount            = 128
+	maxToolIDBytes          = 256
+	maxToolNameBytes        = 160
+	maxToolInputBytes       = 1024 * 1024
+	maxToolOutputBytes      = 1024 * 1024
+	defaultPageSize         = 80
+	maxPageSize             = 200
+	locationCacheTTL        = 60 * time.Second
+	locationMissTTL         = 5 * time.Second
+	maxLocationCacheEntries = 2048
+	maxOMOCacheEntries      = 8
+)
+
+var (
+	canonicalSessionID           = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	claudeProjectNonAlphanumeric = regexp.MustCompile(`[^A-Za-z0-9]`)
+)
+
+type ToolActivity struct {
+	ID            string `json:"id,omitempty"`
+	Name          string `json:"name"`
+	State         string `json:"state,omitempty"`
+	ParentID      string `json:"parent_id,omitempty"`
+	associationID string
+	Input         string `json:"input,omitempty"`
+	Output        string `json:"output,omitempty"`
+	Error         bool   `json:"error,omitempty"`
+	Truncated     bool   `json:"truncated,omitempty"`
+}
+
+type Entry struct {
+	Kind      string         `json:"kind,omitempty"`
+	ID        string         `json:"id"`
+	Timestamp string         `json:"timestamp,omitempty"`
+	Role      string         `json:"role"`
+	Text      string         `json:"text,omitempty"`
+	Tools     []ToolActivity `json:"tools,omitempty"`
+	Truncated bool           `json:"truncated,omitempty"`
+}
+
+type Page struct {
+	Available              bool          `json:"available"`
+	ReasonCode             string        `json:"reason_code,omitempty"`
+	Reason                 string        `json:"reason,omitempty"`
+	Entries                []Entry       `json:"entries"`
+	HasMore                bool          `json:"has_more"`
+	Total                  int           `json:"total"`
+	FileTruncated          bool          `json:"file_truncated,omitempty"`
+	SourceCorrupt          bool          `json:"source_corrupt,omitempty"`
+	ContinuationIncomplete bool          `json:"continuation_incomplete,omitempty"`
+	ContinuationReason     string        `json:"continuation_reason,omitempty"`
+	OMOPlan                *OMOTodoState `json:"omo_plan,omitempty"`
+}
+
+func (page Page) MarshalJSON() ([]byte, error) {
+	type wirePage Page
+	var total *int
+	if page.Total != UnknownTotal {
+		total = &page.Total
+	}
+	return json.Marshal(struct {
+		wirePage
+		Total *int `json:"total"`
+	}{wirePage(page), total})
+}
+
+type locationKey struct {
+	Agent         string
+	CWD           string
+	ForegroundCWD string
+	SessionID     string
+}
+
+type Reader struct {
+	home            string
+	mu              sync.Mutex
+	locations       map[locationKey]locationCacheEntry
+	locating        map[locationKey]chan struct{}
+	omoCache        map[string]omoCacheEntry
+	openCode        *openCodeReader
+	hermes          *hermesReader
+	agy             *agyReader
+	kimiMu          sync.Mutex
+	kimiSources     map[string]kimiSourceState
+	kimiSelectionMu sync.Mutex
+	kimiSelections  map[string]kimiSelection
+}
+
+type locationCacheEntry struct {
+	location Location
+	expires  time.Time
+}
+
+// Location identifies the exact transcript selected for a pane and the
+// configured root that contains it. Session-title resolution consumes the same
+// location so it cannot read a different copy of the session.
+type Location struct {
+	Path  string
+	Root  string
+	Title string
+}
+
+// NewReader keeps a bounded tuple-to-location cache. Sharing one Reader between
+// the conversation and session packages makes their root selection identical.
+func NewReader(home string) *Reader {
+	return &Reader{
+		home: home, locations: make(map[locationKey]locationCacheEntry),
+		locating: make(map[locationKey]chan struct{}), omoCache: make(map[string]omoCacheEntry),
+		openCode: newOpenCodeReader(home), hermes: newHermesReader(home), agy: newAgyReader(home),
+	}
+}
+
+func (r *Reader) claudeRoots() []string { return agentroots.Claude(r.home) }
+
+func (r *Reader) qoderRoots() []string { return agentroots.Qoder(r.home) }
+
+func (r *Reader) codexRoots() []string { return agentroots.Codex(r.home) }
+
+func (r *Reader) piRoots() []string { return agentroots.Pi(r.home) }
+
+func (r *Reader) ompRoots() []string { return agentroots.OMP(r.home) }
+
+func (r *Reader) cursorRoots() []string { return agentroots.Cursor(r.home) }
+
+func (r *Reader) grokRoots() []string { return agentroots.Grok(r.home) }
+
+func Supported(agent string) bool {
+	return RecordedSupported(agent)
+}
+
+func RecordedSupported(agent string) bool {
+	switch normalizedAgent(agent) {
+	case "claude", "claudecode", "qoder", "qodercli", "codex", "openaicodex",
+		"pi", "picodingagent", "omp", "ohmypi", "cursor", "cursoragent",
+		"opencode", "hermes", "hermesagent", "omo", "ohmyopencode", "kimi", "kimicode",
+		"agy", "antigravity", "antigravitycli", "grok":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizedAgent(agent string) string {
+	value := strings.ToLower(strings.TrimSpace(agent))
+	value = strings.NewReplacer("-", "", "_", "", " ", "").Replace(value)
+	if value == "grokbuild" {
+		return "grok"
+	}
+	return value
+}
+
+// Read resolves a conversation without project context. It is used for
+// historical activity where the pane cwd is no longer available.
+func (r *Reader) Read(agent, sessionID, before string, limit int) (Page, error) {
+	return r.ReadWithProject(agent, ProjectContext{}, sessionID, before, limit)
+}
+
+// ReadFor resolves a pane conversation using the same cwd-aware locator as the
+// session-title resolver.
+func (r *Reader) ReadFor(agent, cwd, sessionID, before string, limit int) (Page, error) {
+	return r.ReadWithProject(agent, ProjectContext{CWD: cwd}, sessionID, before, limit)
+}
+
+// read preserves the old package-local helper shape for tests and legacy
+// callers; public callers should use Read or ReadFor.
+func (r *Reader) read(agent, cwd, sessionID, before string, limit int) (Page, error) {
+	return r.ReadWithProject(agent, ProjectContext{CWD: cwd}, sessionID, before, limit)
+}
+
+// ReadWithProject resolves a conversation with the pane and, for Claude Code,
+// foreground directory hints. Once the anchor is located, Claude continuation
+// descendants stay in that anchor's project and root.
+func (r *Reader) ReadWithProject(agent string, project ProjectContext, sessionID, before string, limit int) (Page, error) {
+	project = NormalizeProjectContext(agent, project)
+	if IsKimi(agent) {
+		projection, _, code := r.readKimi(context.Background(), project, sessionID)
+		if code != "" {
+			return unavailableCode(code, kimiReason(code)), nil
+		}
+		return kimiPage(projection, before, limit), nil
+	}
+	if isHermesAgent(agent) {
+		return r.readHermesFor(agent, project.CWD, sessionID, before, limit)
+	}
+	if isAgyAgent(agent) {
+		return r.readAgyFor(sessionID, before, limit)
+	}
+	if normalizedAgent(agent) == "opencode" {
+		return r.readOpenCode(sessionID, before, limit)
+	}
+	if normalizedAgent(agent) == "omo" || normalizedAgent(agent) == "ohmyopencode" {
+		return r.readOMO(project.CWD, sessionID, before, limit)
+	}
+	if normalizedAgent(agent) == "grok" {
+		return r.readGrokFor(project, sessionID, before, limit)
+	}
+	if !Supported(agent) {
+		return unavailableCode("invalid_provider", "Conversation history is not available for this agent."), nil
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return unavailableCode("invalid_session", "This agent has not reported a conversation session yet."), nil
+	}
+	location := r.LocateWithProject(agent, project, sessionID)
+	if location.Path == "" {
+		return unavailableCode("invalid_session", "No conversation log is available for this session."), nil
+	}
+	if isClaudeProvider(agent) {
+		return r.readClaudeChain(project.CWD, sessionID, location, before, limit)
+	}
+	text, clipped, err := loadTail(location.Path, maxConversationBytes)
+	if err != nil {
+		return Page{}, fmt.Errorf("read conversation log: %w", err)
+	}
+	entries := parseTranscript(agent, text)
+	if limit < 1 {
+		limit = defaultPageSize
+	}
+	if limit > maxPageSize {
+		limit = maxPageSize
+	}
+	end := len(entries)
+	if before != "" {
+		for index := range entries {
+			if entries[index].ID == before {
+				end = index
+				break
+			}
+		}
+	}
+	start := end - limit
+	if start < 0 {
+		start = 0
+	}
+	pageEntries := append([]Entry(nil), entries[start:end]...)
+	return Page{
+		Available:     true,
+		Entries:       pageEntries,
+		HasMore:       start > 0,
+		Total:         len(entries),
+		FileTruncated: clipped,
+	}, nil
+}
+func unavailable(reason string) Page {
+	return unavailableCode("source_unavailable", reason)
+}
+
+func unavailableCode(code, reason string) Page {
+	return Page{Available: false, ReasonCode: code, Reason: reason, Entries: []Entry{}}
+}
+
+// Locate returns the exact contained transcript selected for agent, cwd and
+// sessionID. Root order is authoritative; within Claude roots the foreground
+// directory is tried before the pane cwd. Cached tuple locations are returned
+// before any filesystem walk, keeping title and history on the same copy.
+func (r *Reader) Locate(agent, cwd, sessionID string) Location {
+	return r.LocateWithProject(agent, ProjectContext{CWD: cwd}, sessionID)
+}
+
+// LocateWithProject returns the exact contained transcript selected for the
+// supplied project context. The effective foreground hint is part of the
+// cache and single-flight keys, so changing it cannot reuse an old hit or
+// miss.
+func (r *Reader) LocateWithProject(agent string, project ProjectContext, sessionID string) Location {
+	project = NormalizeProjectContext(agent, project)
+	sessionID = strings.TrimSpace(sessionID)
+	agentKey := normalizedAgent(agent)
+	if IsKimi(agent) {
+		_, location, _ := r.SelectKimiSession(project, sessionID)
+		return location
+	}
+	if isHermesAgent(agent) {
+		agentKey = "hermes"
+	}
+	if isAgyAgent(agent) {
+		agentKey = "agy"
+	}
+	key := locationKey{Agent: agentKey, CWD: project.CWD, ForegroundCWD: project.ForegroundCWD, SessionID: sessionID}
+	for {
+		now := time.Now()
+		r.mu.Lock()
+		if cached, ok := r.locations[key]; ok && now.Before(cached.expires) {
+			r.mu.Unlock()
+			return cached.location
+		}
+		if ready, ok := r.locating[key]; ok {
+			r.mu.Unlock()
+			<-ready
+			continue
+		}
+		r.locating[key] = make(chan struct{})
+		r.mu.Unlock()
+		break
+	}
+
+	location := r.locateWithProject(agent, project, sessionID)
+	ttl := locationCacheTTL
+	if location.Path == "" {
+		ttl = locationMissTTL
+	}
+	now := time.Now()
+	r.mu.Lock()
+	if len(r.locations) >= maxLocationCacheEntries {
+		for cachedKey, cached := range r.locations {
+			if !now.Before(cached.expires) {
+				delete(r.locations, cachedKey)
+			}
+		}
+		if len(r.locations) >= maxLocationCacheEntries {
+			clear(r.locations)
+		}
+	}
+	r.locations[key] = locationCacheEntry{location: location, expires: now.Add(ttl)}
+	ready := r.locating[key]
+	delete(r.locating, key)
+	close(ready)
+	r.mu.Unlock()
+	return location
+}
+
+// locate preserves the old package-local helper shape for tests and legacy
+// callers; public callers should use Locate or LocateWithProject.
+func (r *Reader) locate(agent, cwd, sessionID string) Location {
+	return r.locateWithProject(agent, ProjectContext{CWD: cwd}, sessionID)
+}
+
+func (r *Reader) locateWithProject(agent string, project ProjectContext, sessionID string) Location {
+	project = NormalizeProjectContext(agent, project)
+	switch normalizedAgent(agent) {
+	case "claude", "claudecode":
+		if !safeSessionID(sessionID) {
+			return Location{}
+		}
+		return findProjectSessionWithProject(r.claudeRoots(), project, sessionID+".jsonl", claudeProjectName)
+	case "qoder", "qodercli":
+		if !safeSessionID(sessionID) {
+			return Location{}
+		}
+		return findProjectSessionWithProject(r.qoderRoots(), project, sessionID+".jsonl", claudeProjectName)
+	case "codex", "openaicodex":
+		if !canonicalSessionID.MatchString(sessionID) {
+			return Location{}
+		}
+		return findCodexSession(r.codexRoots(), sessionID)
+	case "pi", "picodingagent":
+		return resolvePathOrSession(r.piRoots(), sessionID, "_")
+	case "omp", "ohmypi":
+		return resolvePathOrSession(r.ompRoots(), sessionID, "_")
+	case "hermes", "hermesagent":
+		return r.hermes.locate(project.CWD, sessionID)
+	case "agy", "antigravity", "antigravitycli":
+		return r.agy.locate(sessionID)
+	case "kimi", "kimicode":
+		_, location, _ := r.SelectKimiSession(project, sessionID)
+		return location
+	case "cursor", "cursoragent":
+		return findCursorSession(r.cursorRoots(), project, sessionID)
+	case "grok":
+		if !safeSessionID(sessionID) {
+			return Location{}
+		}
+		return findGrokSession(r.grokRoots(), project, sessionID)
+	default:
+		return Location{}
+	}
+}
+
+func claudeProjectName(cwd string) string {
+	return claudeProjectNonAlphanumeric.ReplaceAllString(cwd, "-")
+}
+
+func safeSessionID(value string) bool {
+	if value == "" || len(value) > 128 || value == "." || value == ".." {
+		return false
+	}
+	for _, character := range value {
+		switch {
+		case character >= 'a' && character <= 'z', character >= 'A' && character <= 'Z', character >= '0' && character <= '9':
+		case character == '-', character == '_', character == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isDir reports whether path is a directory, following symlinks. DirEntry's
+// IsDir reports the entry's own type bits, which are ModeSymlink for a
+// symlink, so it is false for a symlink to a directory - the same hazard
+// agentroots.profileAgentDirs documents. Stat follows the link so a
+// symlinked project or profile directory is still searched.
+func isDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func findProjectSession(roots []string, cwd, filename, preferredProjectName string) Location {
+	return findProjectSessionWithProject(roots, ProjectContext{CWD: cwd}, filename, func(string) string {
+		return preferredProjectName
+	})
+}
+
+// findProjectSessionWithProject keeps roots as the outer loop. Within one root
+// the more specific foreground directory is tried before the pane cwd, and an
+// unknown-cwd scan is used only when neither known directory is available.
+func findProjectSessionWithProject(roots []string, project ProjectContext, filename string, preferredProjectName func(string) string) Location {
+	candidates := projectDirectoriesForContext(project)
+	for _, root := range roots {
+		seen := make(map[string]bool)
+		for _, cwd := range candidates {
+			preferred := ""
+			if preferredProjectName != nil {
+				preferred = preferredProjectName(cwd)
+			}
+			for _, projectDir := range projectDirectories(root, cwd, preferred) {
+				projectDir = filepath.Clean(projectDir)
+				if seen[projectDir] {
+					continue
+				}
+				seen[projectDir] = true
+				if path := containedRegularFile(filepath.Join(projectDir, filename), root); path != "" {
+					return Location{Path: path, Root: root}
+				}
+			}
+		}
+	}
+	return Location{}
+}
+
+func projectDirectoriesForContext(project ProjectContext) []string {
+	candidates := make([]string, 0, 2)
+	if project.ForegroundCWD != "" {
+		candidates = append(candidates, project.ForegroundCWD)
+	}
+	if strings.TrimSpace(project.CWD) != "" {
+		if len(candidates) == 0 || candidates[0] != project.CWD {
+			candidates = append(candidates, project.CWD)
+		}
+	}
+	if len(candidates) == 0 {
+		// An empty cwd has historical meaning: enumerate every project in the
+		// root. It is deliberately not combined with a valid foreground hint.
+		return []string{""}
+	}
+	return candidates
+}
+
+func projectDirectories(root, cwd, preferredProjectName string) []string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	if strings.TrimSpace(cwd) == "" {
+		directories := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			path := filepath.Join(root, entry.Name())
+			if isDir(path) {
+				directories = append(directories, path)
+			}
+		}
+		return directories
+	}
+
+	encoded := strings.ReplaceAll(strings.TrimPrefix(cwd, "/"), "/", "-")
+	candidates := [...]string{preferredProjectName, "-" + encoded, encoded}
+	directories := make([]string, 0, len(candidates))
+	seen := make(map[string]bool, len(candidates))
+	for _, name := range candidates {
+		if name == "" {
+			continue
+		}
+		path := filepath.Join(root, name)
+		if seen[path] || !isDir(path) {
+			continue
+		}
+		directories = append(directories, path)
+		seen[path] = true
+	}
+	for _, entry := range entries {
+		path := filepath.Join(root, entry.Name())
+		if seen[path] || !isDir(path) {
+			continue
+		}
+		cwdFile := containedRegularFile(filepath.Join(path, "cwd"), root)
+		if cwdFile == "" {
+			continue
+		}
+		data, err := os.ReadFile(cwdFile)
+		if err == nil && strings.TrimSpace(string(data)) == cwd {
+			directories = append(directories, path)
+		}
+	}
+	return directories
+}
+
+func findCodexSession(roots []string, sessionID string) Location {
+	suffix := "-" + strings.ToLower(sessionID) + ".jsonl"
+	for _, root := range roots {
+		for _, year := range descendingDirectories(root) {
+			yearPath := filepath.Join(root, year)
+			for _, month := range descendingDirectories(yearPath) {
+				monthPath := filepath.Join(yearPath, month)
+				for _, day := range descendingDirectories(monthPath) {
+					dayPath := filepath.Join(monthPath, day)
+					files, err := os.ReadDir(dayPath)
+					if err != nil {
+						continue
+					}
+					for _, file := range files {
+						name := strings.ToLower(file.Name())
+						filePath := filepath.Join(dayPath, file.Name())
+						if isDir(filePath) || !strings.HasPrefix(name, "rollout-") || !strings.HasSuffix(name, suffix) {
+							continue
+						}
+						if path := containedRegularFile(filePath, root); path != "" {
+							return Location{Path: path, Root: root}
+						}
+					}
+				}
+			}
+		}
+	}
+	return Location{}
+}
+
+func descendingDirectories(path string) []string {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return nil
+	}
+	directories := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if isDir(filepath.Join(path, entry.Name())) {
+			directories = append(directories, entry.Name())
+		}
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(directories)))
+	return directories
+}
+
+func resolvePathOrSession(roots []string, sessionID, separator string) Location {
+	if filepath.IsAbs(sessionID) && strings.HasSuffix(strings.ToLower(sessionID), ".jsonl") {
+		for _, root := range roots {
+			if path := containedRegularFile(sessionID, root); path != "" {
+				return Location{Path: path, Root: root}
+			}
+		}
+		return Location{}
+	}
+	if !canonicalSessionID.MatchString(sessionID) {
+		return Location{}
+	}
+	suffix := separator + strings.ToLower(sessionID) + ".jsonl"
+	for _, root := range roots {
+		directories, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, directory := range directories {
+			projectDir := filepath.Join(root, directory.Name())
+			if !isDir(projectDir) {
+				continue
+			}
+			files, err := os.ReadDir(projectDir)
+			if err != nil {
+				continue
+			}
+			for _, file := range files {
+				filePath := filepath.Join(projectDir, file.Name())
+				if isDir(filePath) || !strings.HasSuffix(strings.ToLower(file.Name()), suffix) {
+					continue
+				}
+				if path := containedRegularFile(filePath, root); path != "" {
+					return Location{Path: path, Root: root}
+				}
+			}
+		}
+	}
+	return Location{}
+}
+
+func containedRegularFile(path, root string) string {
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return ""
+	}
+	realPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return ""
+	}
+	relative, err := filepath.Rel(realRoot, realPath)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	info, err := os.Stat(realPath)
+	if err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	return realPath
+}
+
+func loadTail(path string, limit int64) (string, bool, error) {
+	file, err := openConversationSource(path)
+	if err != nil {
+		return "", false, err
+	}
+	defer file.Close()
+	return loadTailFile(file, limit)
+}
+
+func loadTailFile(file *os.File, limit int64) (string, bool, error) {
+	if file == nil {
+		return "", false, errors.New("conversation source is closed")
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		if err == nil {
+			err = errors.New("conversation source is not a regular file")
+		}
+		return "", false, err
+	}
+	clipped := info.Size() > limit
+	start := int64(0)
+	if clipped {
+		start = info.Size() - limit
+	}
+	if _, err := file.Seek(start, 0); err != nil {
+		return "", false, err
+	}
+	data, err := io.ReadAll(io.LimitReader(file, limit))
+	if err != nil {
+		return "", false, err
+	}
+	if clipped {
+		if newline := bytes.IndexByte(data, '\n'); newline >= 0 {
+			data = data[newline+1:]
+		} else {
+			data = nil
+		}
+	}
+	return string(data), clipped, nil
+}
+
+type toolResult struct {
+	id     string
+	output string
+	failed bool
+}
+
+type toolLocation struct {
+	entry int
+	tool  int
+}
+
+func parseTranscript(agent, text string) []Entry {
+	normalized := normalizedAgent(agent)
+	entries := make([]Entry, 0)
+	seenIDs := make(map[string]int)
+	pendingTools := make(map[string]toolLocation)
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var record map[string]any
+		if json.Unmarshal([]byte(line), &record) != nil {
+			continue
+		}
+		calls, results := parseToolActivity(normalized, record)
+		for _, result := range results {
+			location, ok := pendingTools[toolAssociationKey(normalized, result.id)]
+			if !ok || location.entry >= len(entries) || location.tool >= len(entries[location.entry].Tools) {
+				continue
+			}
+			tool := &entries[location.entry].Tools[location.tool]
+			applyProjectedToolResult(tool, result)
+			delete(pendingTools, toolAssociationKey(normalized, result.id))
+		}
+
+		entry := prepareJSONLEntry(agent, record, calls)
+		if entry == nil {
+			continue
+		}
+		normalizeEntryTools(entry)
+		entry.ID = stableRowID(line, seenIDs)
+		entryIndex := len(entries)
+		entries = append(entries, *entry)
+		for toolIndex := range calls {
+			if id := toolAssociationID(calls[toolIndex]); id != "" {
+				pendingTools[toolAssociationKey(normalized, id)] = toolLocation{entry: entryIndex, tool: toolIndex}
+			}
+		}
+	}
+	return entries
+}
+
+func parseToolActivity(agent string, record map[string]any) ([]ToolActivity, []toolResult) {
+	switch agent {
+	case "claude", "claudecode", "qoder", "qodercli":
+		if record["isSidechain"] == true {
+			return nil, nil
+		}
+		message, _ := record["message"].(map[string]any)
+		blocks, _ := message["content"].([]any)
+		return toolsFromBlocks(blocks)
+	case "codex", "openaicodex":
+		if stringValue(record["type"]) != "response_item" {
+			return nil, nil
+		}
+		payload, _ := record["payload"].(map[string]any)
+		switch normalizedBlockType(payload["type"]) {
+		case "functioncall", "customtoolcall", "localshellcall":
+			call := newToolActivity(
+				firstString(payload, "call_id", "id"),
+				firstString(payload, "name", "tool_name"),
+				firstValue(payload, "arguments", "input"),
+			)
+			return []ToolActivity{call}, nil
+		case "functioncalloutput", "customtoolcalloutput", "localshellcalloutput":
+			return nil, []toolResult{{
+				id:     strings.TrimSpace(firstString(payload, "call_id", "id")),
+				output: textValue(firstValue(payload, "output", "content")),
+				failed: payload["is_error"] == true,
+			}}
+		}
+	case "pi", "picodingagent", "omp", "ohmypi", "omo", "ohmyopencode":
+		if stringValue(record["type"]) != "message" {
+			return nil, nil
+		}
+		message, _ := record["message"].(map[string]any)
+		if normalizedBlockType(message["role"]) == "toolresult" {
+			return nil, []toolResult{{
+				id:     strings.TrimSpace(firstString(message, "toolCallId", "tool_call_id", "id")),
+				output: textValue(message["content"]),
+				failed: message["isError"] == true || message["is_error"] == true,
+			}}
+		}
+		blocks, _ := message["content"].([]any)
+		return toolsFromBlocks(blocks)
+	case "cursor", "cursoragent":
+		message, _ := record["message"].(map[string]any)
+		blocks, _ := message["content"].([]any)
+		return toolsFromBlocks(blocks)
+	}
+	return nil, nil
+}
+
+func toolsFromBlocks(blocks []any) ([]ToolActivity, []toolResult) {
+	calls := make([]ToolActivity, 0)
+	results := make([]toolResult, 0)
+	for _, raw := range blocks {
+		block, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch normalizedBlockType(block["type"]) {
+		case "tooluse", "toolcall":
+			calls = append(calls, newToolActivity(
+				firstString(block, "id", "toolCallId", "tool_call_id"),
+				firstString(block, "name", "toolName", "tool_name"),
+				firstValue(block, "input", "arguments"),
+			))
+		case "toolresult":
+			results = append(results, toolResult{
+				id:     strings.TrimSpace(firstString(block, "tool_use_id", "toolCallId", "tool_call_id", "id")),
+				output: textValue(block["content"]),
+				failed: block["is_error"] == true || block["isError"] == true,
+			})
+		}
+	}
+	return calls, results
+}
+
+func newToolActivity(id, name string, input any) ToolActivity {
+	if strings.TrimSpace(name) == "" {
+		name = "Tool"
+	}
+	inputText := sanitizeText(textValue(input))
+	inputText, truncated := clampText(inputText, maxEntryBytes/2)
+	tool := ToolActivity{
+		ID: strings.TrimSpace(id), Name: strings.TrimSpace(name), Input: inputText, Truncated: truncated,
+		associationID: strings.TrimSpace(id),
+	}
+	normalized, _ := normalizeToolActivity(tool)
+	return normalized
+}
+
+func normalizeToolID(value string) string {
+	value, _ = clampText(strings.TrimSpace(value), maxToolIDBytes)
+	return value
+}
+
+func toolAssociationID(tool ToolActivity) string {
+	if tool.associationID != "" {
+		return tool.associationID
+	}
+	return strings.TrimSpace(tool.ID)
+}
+
+func toolAssociationKey(agent, id string) string {
+	digest := sha256.Sum256([]byte(agent + "\x00" + id))
+	return hex.EncodeToString(digest[:])
+}
+
+func normalizeToolActivity(tool ToolActivity) (ToolActivity, bool) {
+	originalID, originalName := tool.ID, tool.Name
+	originalInput, originalOutput := tool.Input, tool.Output
+	originalError, originalTruncated := tool.Error, tool.Truncated
+	associationID := toolAssociationID(tool)
+	tool.associationID = associationID
+	tool.ID = normalizeToolID(associationID)
+	tool.Name, _ = clampText(strings.TrimSpace(tool.Name), maxToolNameBytes)
+	tool.Input, _ = clampText(tool.Input, maxToolInputBytes)
+	tool.Output, _ = clampText(tool.Output, maxToolOutputBytes)
+	if tool.Name == "" {
+		tool.Name = "Tool"
+	}
+	changed := tool.ID != originalID || tool.Name != originalName || tool.Input != originalInput ||
+		tool.Output != originalOutput || tool.Error != originalError || tool.Truncated != originalTruncated
+	if changed {
+		tool.Truncated = true
+	}
+	return tool, changed
+}
+
+func normalizeEntryTools(entry *Entry) (int, int) {
+	if entry == nil || len(entry.Tools) == 0 {
+		return 0, 0
+	}
+	omittedTools, omittedPayloads := 0, 0
+	if len(entry.Tools) > maxToolCount {
+		omittedTools = len(entry.Tools) - maxToolCount
+		entry.Tools = append([]ToolActivity(nil), entry.Tools[:maxToolCount]...)
+		entry.Truncated = true
+	}
+	for index, tool := range entry.Tools {
+		normalized, changed := normalizeToolActivity(tool)
+		if changed || normalized.Truncated {
+			omittedPayloads++
+			entry.Truncated = true
+		}
+		entry.Tools[index] = normalized
+	}
+	return omittedTools, omittedPayloads
+}
+
+func normalizeEntriesForResponse(entries []Entry) BrowseDiagnostics {
+	diagnostics := BrowseDiagnostics{}
+	for index := range entries {
+		tools, payloads := normalizeEntryTools(&entries[index])
+		diagnostics.OmittedTools += tools
+		diagnostics.OmittedPayloads += payloads
+	}
+	return diagnostics
+}
+
+func normalizedBlockType(value any) string {
+	return strings.NewReplacer("-", "", "_", "", " ", "").Replace(strings.ToLower(stringValue(value)))
+}
+
+func firstString(record map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := stringValue(record[key]); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func firstValue(record map[string]any, keys ...string) any {
+	for _, key := range keys {
+		if value, ok := record[key]; ok && value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func textValue(value any) string {
+	if text, ok := value.(string); ok {
+		return text
+	}
+	if text := textBlocks(value); text != "" {
+		return text
+	}
+	data, err := json.Marshal(value)
+	if err != nil || string(data) == "null" {
+		return ""
+	}
+	return string(data)
+}
+
+func parseClaudeRecord(record map[string]any) (string, string) {
+	role := stringValue(record["type"])
+	if (role != "user" && role != "assistant") || record["isSidechain"] == true {
+		return "", ""
+	}
+	if role == "user" && (record["isMeta"] == true || record["isCompactSummary"] == true) {
+		return "", ""
+	}
+	message, ok := record["message"].(map[string]any)
+	if !ok {
+		return "", ""
+	}
+	content := message["content"]
+	if raw, ok := content.(string); ok {
+		if role != "user" {
+			return role, raw
+		}
+		return role, humanClaudeText(raw)
+	}
+	if role == "user" {
+		// Filter per block, not on the joined string: humanClaudeText anchors its
+		// envelope checks on the start of what it is given, so joining first
+		// would let a <system-reminder> in any block after the first survive
+		// into the phone's conversation view.
+		blocks := textBlockList(content)
+		kept := make([]string, 0, len(blocks))
+		for _, block := range blocks {
+			if text := humanClaudeText(block); strings.TrimSpace(text) != "" {
+				kept = append(kept, text)
+			}
+		}
+		if len(kept) == 0 {
+			return "", ""
+		}
+		return role, strings.Join(kept, "\n")
+	}
+	return role, textBlocks(content)
+}
+
+var (
+	bashOutputRow     = regexp.MustCompile(`(?s)^<bash-stdout>.*</bash-stdout><bash-stderr>.*</bash-stderr>$`)
+	bashOutputElement = regexp.MustCompile(`(?s)<bash-stdout>.*?</bash-stdout>|<bash-stderr>.*?</bash-stderr>`)
+)
+
+var commandTags = regexp.MustCompile(`(?s)<command-(?:message|name|args)>.*?</command-(?:message|name|args)>`)
+
+func humanClaudeText(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	for _, envelope := range []string{"<system-reminder>", "<local-command-caveat>", "<task-notification>", "<local-command-stdout>"} {
+		if strings.HasPrefix(trimmed, envelope) {
+			return ""
+		}
+	}
+	// Shell output rows: Claude Code writes stdout and stderr together as one
+	// row, and output may itself contain tag text, so the genuine adjacent pair is
+	// recognised first. A row made only of output elements is hidden too; a
+	// prompt that also carries other text keeps all of it.
+	if strings.HasPrefix(trimmed, "<bash-stdout>") || strings.HasPrefix(trimmed, "<bash-stderr>") {
+		if bashOutputRow.MatchString(trimmed) || strings.TrimSpace(bashOutputElement.ReplaceAllString(trimmed, "")) == "" {
+			return ""
+		}
+		return raw
+	}
+	// A shell command row is exactly one bash-input element; a prompt holding
+	// several keeps its text.
+	if strings.HasPrefix(trimmed, "<bash-input>") && strings.HasSuffix(trimmed, "</bash-input>") && strings.Count(trimmed, "<bash-input>") == 1 {
+		return "! " + strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(trimmed, "<bash-input>"), "</bash-input>"))
+	}
+	// A slash-command row is nothing but command-* elements; a prompt that also
+	// carries other text keeps all of it. A row without a command name is noise.
+	if strings.HasPrefix(trimmed, "<command-name>") || strings.HasPrefix(trimmed, "<command-message>") {
+		if strings.TrimSpace(commandTags.ReplaceAllString(trimmed, "")) == "" {
+			name := innerTag(trimmed, "command-name")
+			if name == "" {
+				return ""
+			}
+			return strings.TrimSpace(name + " " + innerTag(trimmed, "command-args"))
+		}
+	}
+	return raw
+}
+
+func innerTag(text, name string) string {
+	startToken, endToken := "<"+name+">", "</"+name+">"
+	start := strings.Index(text, startToken)
+	if start < 0 {
+		return ""
+	}
+	start += len(startToken)
+	end := strings.Index(text[start:], endToken)
+	if end < 0 {
+		return ""
+	}
+	return strings.TrimSpace(text[start : start+end])
+}
+
+func parseCodexRecord(record map[string]any) (string, string) {
+	if stringValue(record["type"]) != "response_item" {
+		return "", ""
+	}
+	payload, ok := record["payload"].(map[string]any)
+	if !ok || stringValue(payload["type"]) != "message" {
+		return "", ""
+	}
+	role := stringValue(payload["role"])
+	if role != "user" && role != "assistant" {
+		return "", ""
+	}
+	text := textBlocks(payload["content"])
+	if role == "user" && strings.HasPrefix(strings.TrimSpace(text), "<environment_context>") {
+		return "", ""
+	}
+	return role, text
+}
+
+func parsePiRecord(record map[string]any) (string, string) {
+	if stringValue(record["type"]) == "custom_message" {
+		if record["display"] != true {
+			return "", ""
+		}
+		text := textBlocks(record["content"])
+		if strings.TrimSpace(sanitizeText(text)) == "" {
+			text = "Extension message has no displayable text."
+		}
+		return "notice", text
+	}
+	if stringValue(record["type"]) != "message" {
+		return "", ""
+	}
+	message, ok := record["message"].(map[string]any)
+	if !ok {
+		return "", ""
+	}
+	role := stringValue(message["role"])
+	if role != "user" && role != "assistant" {
+		return "", ""
+	}
+	return role, textBlocks(message["content"])
+}
+
+func textBlocks(value any) string {
+	if text, ok := value.(string); ok {
+		return text
+	}
+	return strings.Join(textBlockList(value), "\n")
+}
+
+// textBlockList reports the text carried by each text-like block separately.
+// Callers that filter per block need the boundaries: joining first would let an
+// envelope in a later block escape a prefix test anchored on the whole string.
+func textBlockList(value any) []string {
+	blocks, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	texts := make([]string, 0, len(blocks))
+	for _, rawBlock := range blocks {
+		block, ok := rawBlock.(map[string]any)
+		if !ok {
+			continue
+		}
+		typeName := stringValue(block["type"])
+		if typeName != "text" && typeName != "input_text" && typeName != "output_text" {
+			continue
+		}
+		if text := stringValue(block["text"]); text != "" {
+			texts = append(texts, text)
+		}
+	}
+	return texts
+}
+
+func sanitizeText(text string) string {
+	text = panehistory.NormalizeLine(text)
+	text = strings.ReplaceAll(text, "\x00", "")
+	return strings.TrimSpace(text)
+}
+
+func clampText(text string, limit int) (string, bool) {
+	if len(text) <= limit {
+		return text, false
+	}
+	clipped := text[:limit]
+	for !utf8.ValidString(clipped) {
+		clipped = clipped[:len(clipped)-1]
+	}
+	return strings.TrimSpace(clipped), true
+}
+
+func stableRowID(line string, seen map[string]int) string {
+	digest := sha256.Sum256([]byte(line))
+	base := hex.EncodeToString(digest[:12])
+	occurrence := seen[base]
+	seen[base] = occurrence + 1
+	if occurrence == 0 {
+		return base
+	}
+	return fmt.Sprintf("%s-%d", base, occurrence)
+}
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return text
+}

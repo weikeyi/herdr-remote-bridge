@@ -1,0 +1,396 @@
+import { canRendezvous, RELAY_ID_LENGTH } from './gateway-credentials';
+import type { RelayConfig } from './types';
+
+export const RELAYS_KEY = 'herdr_relays';
+export const THEME_KEY = 'herdr_theme';
+// Keep the existing key so stored terminal-size preferences migrate into the
+// whole-interface size without resetting users.
+export const INTERFACE_SIZE_KEY = 'herdr_terminal_font_size';
+export const LEGACY_FONT_KEY = 'herdr_home_font_size';
+export const TERMINAL_HISTORY_KEY = 'herdr_terminal_history_lines';
+export const TERMINAL_REFRESH_KEY = 'herdr_terminal_refresh_ms';
+export const TERMINAL_RESIZE_SESSION_KEY = 'herdr_terminal_resize_session';
+export const TERMINAL_HEIGHT_LEASE_KEY = 'herdr_terminal_height_lease';
+export const TERMINAL_WAKE_LOCK_KEY = 'herdr_terminal_wake_lock';
+export const HOME_LAYOUT_KEY = 'herdr_home_workspace_layout';
+export const DEVICE_LOCK_KEY = 'herdr_require_device_unlock';
+export const DEVICE_CREDENTIAL_KEY = 'herdr_device_unlock_credential';
+export const PUSH_ENABLED_KEY = 'herdr_push_enabled';
+export const PUSH_FINISHED_KEY = 'herdr_push_finished';
+export const PUSH_CLIENT_KEY = 'herdr_push_client_id';
+export const PUSH_VAPID_KEY_PREFIX = 'herdr_push_vapid_key_';
+export const HANDLED_NOTIFICATION_ACTIONS_KEY = 'herdr_handled_notification_actions';
+export const DEFAULT_AGENT_VIEW_KEY = 'herdr_default_agent_view';
+export const PANE_AGENT_VIEW_OVERRIDES_KEY = 'herdr_pane_agent_view_overrides';
+export const HIDDEN_SERVERS_KEY = 'herdr_hidden_servers';
+
+export const APP_PROTOCOL_VERSION = __APP_PROTOCOL_VERSION__;
+export const APP_VERSION = __APP_VERSION__;
+export const APP_ASSET_VERSION = __APP_ASSET_VERSION__;
+// The release plugin replaces this marker with the digest-derived build
+// identity after Rollup has emitted the bundle. Keeping it in the running app
+// lets update progress acknowledge the bytes that actually initialized, not
+// merely a version.json response.
+export const APP_BUILD_ID = __APP_BUILD_ID__;
+export const SERVICE_WORKER_URL = __SERVICE_WORKER_URL__;
+export const THEMES = ['dark', 'light', 'nord', 'solarized', 'rose', 'latte'] as const;
+export type Theme = (typeof THEMES)[number];
+// Terminal color scheme per theme. Every theme keeps a dark terminal pane by
+// default; a light-terminal theme renders the pane on a light background and
+// swaps the ANSI palette so the desktop's light-scheme output stays legible.
+export type TerminalScheme = 'dark' | 'light';
+export const THEME_TERMINAL_SCHEMES: Record<Theme, TerminalScheme> = {
+  dark: 'dark',
+  light: 'dark',
+  nord: 'dark',
+  solarized: 'dark',
+  rose: 'dark',
+  latte: 'light',
+};
+export const INTERFACE_SIZES = ['compact', 'regular', 'large'] as const;
+export type InterfaceSize = (typeof INTERFACE_SIZES)[number];
+export const TERMINAL_HISTORY_OPTIONS = [100, 500, 1_000, 10_000] as const;
+export type TerminalHistoryLines = (typeof TERMINAL_HISTORY_OPTIONS)[number];
+export const TERMINAL_REFRESH_OPTIONS = [100, 250, 500, 1_000] as const;
+export type TerminalRefreshInterval = (typeof TERMINAL_REFRESH_OPTIONS)[number];
+export const HOME_LAYOUTS = ['state', 'mixed'] as const;
+export type HomeLayout = (typeof HOME_LAYOUTS)[number];
+export const AGENT_VIEWS = ['terminal', 'conversation'] as const;
+export type AgentView = (typeof AGENT_VIEWS)[number];
+export const AGENT_VIEW_LABELS: Record<AgentView, string> = {
+  terminal: 'Terminal',
+  conversation: 'Conversation',
+};
+export const HOME_LAYOUT_LABELS: Record<HomeLayout, string> = {
+  state: 'By State',
+  mixed: 'Mixed',
+};
+export const TERMINAL_REFRESH_LABELS: Record<TerminalRefreshInterval, string> = {
+  100: '100 ms',
+  250: '250 ms',
+  500: '500 ms',
+  1_000: '1 s',
+};
+export const MIN_PANE_SIZE_COLUMNS = 40;
+export const MAX_PANE_SIZE_COLUMNS = 240;
+export const MIN_PANE_SIZE_ROWS = 10;
+export const MAX_PANE_SIZE_ROWS = 120;
+// A hidden page keeps renewing its pane-size lease for this long. Desktop
+// Safari reports an occluded window as hidden, so every switch to another app
+// would otherwise lapse the lease after the relay's TTL and resize the shared
+// pane twice per glance — each cycle can strand a stale copy of an inline
+// agent's status bar in the scrollback. The grace is bounded so a page that
+// stays hidden — a phone in a pocket whose open DataChannel keeps it
+// unfrozen — still gives the desktop its size back within minutes, not
+// overnight.
+export const PANE_LEASE_HIDDEN_GRACE_MS = 5 * 60_000;
+
+export function paneLeaseRenewalAllowed(visible: boolean, hiddenAt: number, now: number): boolean {
+  if (visible) return true;
+  return hiddenAt > 0 && now - hiddenAt < PANE_LEASE_HIDDEN_GRACE_MS;
+}
+
+export const THEME_COLORS: Record<Theme, string> = {
+  dark: '#0a0a0a',
+  light: '#f5f5f5',
+  nord: '#2e3440',
+  solarized: '#002b36',
+  rose: '#191724',
+  latte: '#eff1f5',
+};
+
+/**
+ * Relay keys are used as raw secret bytes, not decoded: the relay refuses to
+ * start unless its key is exactly this many bytes (`config.Validate`).
+ */
+export const RELAY_KEY_BYTES = 32;
+
+export function relayLabelFromUrl(url: string): string {
+  try {
+    return new URL(url).hostname.split('.')[0] || 'relay';
+  } catch {
+    return 'relay';
+  }
+}
+
+export function makeRelayId(label: string, url: string, gatewayUrl = '', gatewayRelayId = ''): string {
+  // A hybrid relay has no URL of its own, so its identity is the gateway it
+  // answers on plus the label from its setup link. An invited entry also has
+  // the computer's rendezvous id, which keeps two same-named computers apart.
+  const target = url || gatewayUrl;
+  return `${label || relayLabelFromUrl(target)}-${target}${gatewayRelayId ? `-${gatewayRelayId}` : ''}`
+    .toLowerCase()
+    .replace(/^wss?:\/\//, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 72) || 'relay';
+}
+
+/**
+ * Accepts only a bare wss origin (ws when the page itself is insecure): no
+ * credentials, no path, no query, no fragment. Anything else in a setup link
+ * is treated as hostile.
+ */
+function safeSocketOrigin(value: string, pageProtocol: string): string | null {
+  try {
+    const parsed = new URL(value.trim());
+    const allowedProtocol = parsed.protocol === 'wss:' || (pageProtocol === 'http:' && parsed.protocol === 'ws:');
+    if (
+      !allowedProtocol
+      || parsed.username
+      || parsed.password
+      || !parsed.hostname
+      || !['', '/'].includes(parsed.pathname)
+      || parsed.search
+      || parsed.hash
+    ) return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ordered gateway origins: unusable entries are dropped and repeats collapsed,
+ * so the failover never dials the same address twice in one pass.
+ */
+function gatewayOrigins(values: readonly string[], pageProtocol: string): string[] {
+  const origins: string[] = [];
+  for (const value of values) {
+    const origin = safeSocketOrigin(String(value || ''), pageProtocol);
+    if (!origin || origins.includes(origin)) continue;
+    origins.push(origin);
+  }
+  return origins;
+}
+
+export function normalizeRelayConfig(relay: Partial<RelayConfig>): RelayConfig {
+  const url = String(relay.url || '').trim();
+  // The primary leads: a relay that advertises a new gateway address while it
+  // is connected is fresher than the list stored beside it, and a config
+  // written before the list existed carries the primary alone. Stored entries
+  // were checked against the page protocol when they were imported, so
+  // re-reading them uses the permissive rule and a LAN gateway paired over
+  // plain http keeps its ws: address.
+  const listed = Array.isArray(relay.gatewayUrls) ? relay.gatewayUrls : [];
+  const gateways = gatewayOrigins([String(relay.gatewayUrl || ''), ...listed], 'http:');
+  const gatewayUrl = gateways[0] || '';
+  const label = String(relay.label || relayLabelFromUrl(url || gatewayUrl)).trim();
+  const rendezvous = isRelayId(relay.gatewayRelayId) && isRendezvousKey(relay.rendezvousKey);
+  const config: RelayConfig = {
+    id: relay.id || makeRelayId(label, url, gatewayUrl, rendezvous ? relay.gatewayRelayId : ''),
+    label,
+    url,
+    token: relay.token || '',
+  };
+  // Only ever written when true: `loadRelayConfigs` normalizes stored entries
+  // on every read, and a legacy entry must round-trip unchanged.
+  if (relay.paired) config.paired = true;
+  // Legacy entries keep their exact stored shape: no transport field at all.
+  if (relay.pathPolicy === 'relay-only') config.pathPolicy = 'relay-only';
+  if (!config.pathPolicy && relay.transport !== 'hybrid' && (url || !gatewayUrl)) return config;
+  config.transport = 'hybrid';
+  config.gatewayUrl = gatewayUrl;
+  if (gateways.length) config.gatewayUrls = gateways;
+  if (rendezvous) {
+    config.gatewayRelayId = relay.gatewayRelayId;
+    config.rendezvousKey = relay.rendezvousKey;
+  }
+  return config;
+}
+
+function isRelayId(value: unknown): value is string {
+  return typeof value === 'string' && value.length === RELAY_ID_LENGTH && /^[A-Za-z0-9_-]+$/.test(value);
+}
+
+function isRendezvousKey(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value);
+}
+
+export function loadRelayConfigs(storage: Storage = localStorage): RelayConfig[] {
+  const raw = storage.getItem(RELAYS_KEY);
+  if (raw) {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .filter((relay): relay is Partial<RelayConfig> => Boolean(
+            relay && typeof relay === 'object' && (relay.url || relay.gatewayUrl),
+          ))
+          .map(normalizeRelayConfig);
+      }
+    } catch {
+      // Fall through to the legacy single-relay keys.
+    }
+  }
+  const url = storage.getItem('herdr_relay_url') || '';
+  if (!url) return [];
+  const relay = normalizeRelayConfig({
+    url,
+    token: storage.getItem('herdr_relay_token') || '',
+    label: relayLabelFromUrl(url),
+  });
+  storage.setItem(RELAYS_KEY, JSON.stringify([relay]));
+  return [relay];
+}
+
+export function saveRelayConfigs(relays: RelayConfig[], storage: Storage = localStorage): void {
+  storage.setItem(RELAYS_KEY, JSON.stringify(relays));
+}
+export interface QuickSetupInvitation {
+  id: string;
+  version: number;
+  secret: string;
+  expiresAt: number;
+}
+
+/**
+ * An invitation must tell the invited device where the computer is: its
+ * direct relay URL, or the gateway rendezvous this device can derive from the
+ * relay key or received in its own invitation.
+ */
+export function canInviteFrom(relay: RelayConfig): boolean {
+  if (relay.url) return true;
+  return relay.transport === 'hybrid' && canRendezvous(relay);
+}
+
+export function quickSetupInvitation(locationValue: Pick<Location, 'hash'>): QuickSetupInvitation | null {
+  const params = new URLSearchParams(String(locationValue.hash || '').replace(/^#/, ''));
+  const id = params.get('invite') || '';
+  if (!id) return null;
+  const secret = params.get('setup') || '';
+  const version = Number(params.get('invite_version'));
+  const expiresAt = Number(params.get('invite_expires'));
+  if (
+    !/^[A-Za-z0-9_-]{16,128}$/.test(id)
+    || !/^[A-Za-z0-9_-]{43}$/.test(secret)
+    || !Number.isSafeInteger(version)
+    || version < 1
+    || !Number.isSafeInteger(expiresAt)
+    || expiresAt < 1
+  ) return null;
+  return { id, version, secret, expiresAt };
+}
+
+
+export function quickSetupConfig(locationValue: Pick<Location, 'hash' | 'protocol' | 'host'>): Omit<RelayConfig, 'id'> | null {
+  const params = new URLSearchParams(String(locationValue.hash || '').replace(/^#/, ''));
+  const invitation = quickSetupInvitation(locationValue);
+  const token = params.get('setup') || '';
+  if (token.length < 16 || token.length > 512) return null;
+  if (!['http:', 'https:'].includes(locationValue.protocol)) return null;
+  const label = (params.get('label') || 'This computer').trim().slice(0, 48) || 'This computer';
+  const configuredGateways = params.get('gateways');
+  const pathPolicy = params.get('path_policy');
+  if (pathPolicy !== null && pathPolicy !== 'relay-only') return null;
+  if (pathPolicy && configuredGateways === null) return null;
+  // `gateway=` was never part of a public phone-app release. Reject it rather
+  // than silently treating an incomplete gateway link as a direct relay link.
+  if (params.has('gateway')) return null;
+  if (configuredGateways !== null) {
+    // The complete ordered list decides both the primary and every fallback.
+    // The separator stays literal; each entry is percent-encoded on its own.
+    const gatewayUrls = gatewayOrigins(configuredGateways.split(','), locationValue.protocol);
+    if (!gatewayUrls.length) return null;
+    if (pathPolicy && gatewayUrls.some((url) => !url.startsWith('wss:'))) return null;
+    const config: Omit<RelayConfig, 'id'> = {
+      label, url: '', token: invitation ? '' : token, transport: 'hybrid', gatewayUrl: gatewayUrls[0], gatewayUrls,
+    };
+    if (pathPolicy === 'relay-only') config.pathPolicy = 'relay-only';
+    if (!invitation) return config;
+    // An invited device holds no relay key, so the link must carry what the
+    // gateway challenge needs; without it the entry could never connect.
+    const gatewayRelayId = params.get('relay_id');
+    const rendezvousKey = params.get('rendezvous');
+    if (!isRelayId(gatewayRelayId) || !isRendezvousKey(rendezvousKey)) return null;
+    return { ...config, gatewayRelayId, rendezvousKey };
+  }
+  const configuredRelay = params.get('relay');
+  let url = `${locationValue.protocol === 'https:' ? 'wss:' : 'ws:'}//${locationValue.host}`;
+  if (configuredRelay) {
+    const origin = safeSocketOrigin(configuredRelay, locationValue.protocol);
+    if (!origin) return null;
+    url = origin;
+  }
+  return { label, url, token: invitation ? '' : token };
+}
+
+export function shouldRetainSetupFragment(
+  locationValue: Pick<Location, 'hash' | 'protocol' | 'host'>,
+  standalone: boolean | undefined,
+): boolean {
+  return standalone === false && quickSetupConfig(locationValue) !== null;
+}
+
+/**
+ * An iOS browser tab and a Home Screen app keep separate storage, so a one-use
+ * pairing secret redeemed in the tab is spent before the installed copy ever
+ * opens. Both a device invitation and the bootstrap relay key are one-use.
+ */
+export function shouldDeferPairingConnection(
+  locationValue: Pick<Location, 'hash' | 'protocol' | 'host'>,
+  standalone: boolean | undefined,
+  userAgent: string,
+  maxTouchPoints = 0,
+): boolean {
+  if (standalone !== false) return false;
+  if (!quickSetupInvitation(locationValue) && !quickSetupConfig(locationValue)?.token) return false;
+  return /\b(?:iPhone|iPad|iPod)\b/iu.test(userAgent)
+    || (/\bMacintosh\b/iu.test(userAgent) && maxTouchPoints > 1);
+}
+
+export function importQuickSetup(
+  relays: RelayConfig[],
+  locationValue: Pick<Location, 'hash' | 'protocol' | 'host'>,
+): RelayConfig[] | null {
+  const setup = quickSetupConfig(locationValue);
+  if (!setup) return null;
+  const invitation = quickSetupInvitation(locationValue);
+  // A shared gateway hosts many computers. A link that names the computer's
+  // rendezvous id is matched on it; a keyed entry made from a setup link has
+  // no id to compare, so its label decides. Any shared entry counts: a relay
+  // that gained a gateway or reordered its list updates its entry instead of
+  // pairing itself a second time.
+  const sameComputer = (relay: RelayConfig): boolean => {
+    if (setup.gatewayRelayId) {
+      return relay.gatewayRelayId
+        ? relay.gatewayRelayId === setup.gatewayRelayId
+        : Boolean(relay.token) && relay.label === setup.label;
+    }
+    return relay.token === setup.token || relay.label === setup.label;
+  };
+  const existing = setup.transport === 'hybrid'
+    ? relays.find((relay) => relay.transport === 'hybrid'
+      && (relay.gatewayUrls ?? [relay.gatewayUrl ?? '']).some((entry) => setup.gatewayUrls?.includes(entry))
+      && sameComputer(relay))
+    // A quick tunnel mints a new hostname on every relay restart, but the
+    // relay's key persists. The same key is the same relay, so the stored
+    // entry - and the device credential enrolled under its id - follows the
+    // relay to its new address instead of pairing a second time and being
+    // refused: the relay's one-use bootstrap invitation is already consumed.
+    : relays.find((relay) => relay.url === setup.url)
+      ?? relays.find((relay) => Boolean(setup.token) && relay.token === setup.token);
+  const next = normalizeRelayConfig({
+    id: existing?.id,
+    label: existing?.label || setup.label,
+    url: setup.url,
+    token: invitation && existing ? existing.token : setup.token,
+    transport: invitation && existing ? existing.transport : setup.transport,
+    gatewayUrl: invitation && existing ? existing.gatewayUrl : setup.gatewayUrl,
+    gatewayUrls: invitation && existing ? existing.gatewayUrls : setup.gatewayUrls,
+    pathPolicy: existing?.pathPolicy ?? setup.pathPolicy,
+    gatewayRelayId: setup.gatewayRelayId ?? existing?.gatewayRelayId,
+    rendezvousKey: setup.rendezvousKey ?? existing?.rendezvousKey,
+    // An invitation link is an encrypted pairing, and the entry it creates
+    // carries no relay key. Recording that here is the only way to tell such a
+    // relay apart from a tokenless one once its credential is gone.
+    paired: invitation ? true : existing?.paired,
+  });
+  return existing ? relays.map((relay) => (relay.id === existing.id ? next : relay)) : [...relays, next];
+}
+
+declare const __APP_PROTOCOL_VERSION__: number;
+declare const __APP_VERSION__: string;
+declare const __APP_ASSET_VERSION__: number;
+declare const __APP_BUILD_ID__: string;
+declare const __SERVICE_WORKER_URL__: string;
