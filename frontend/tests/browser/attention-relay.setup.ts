@@ -444,6 +444,9 @@ export default async function setup() {
       HERDR_RELAY_PLUGIN_PORT: String(pluginPort),
       HERDR_RELAY_HOST: '127.0.0.1',
       HERDR_RELAY_TOKEN: 'attention-browser-test-key-32byt',
+      // Mutation journeys explicitly authorize this synthetic controller fixture.
+      // The reader-denial journey still enrolls its own separate Reader device.
+      HERDR_BOOTSTRAP_ROLE: 'controller',
       HERDR_RELAY_INSTANCE_ID: 'attention-browser-test',
       HERDR_RELAY_POLL_INTERVAL: '0.2',
       HERDR_BIN: fakeBin,
