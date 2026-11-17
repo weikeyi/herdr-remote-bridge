@@ -58,9 +58,7 @@ func TestJournalIntegration(t *testing.T) {
 			errorMarker := marker + "-serve-error"
 			errorUnit := unit + "-serve-error"
 			errorEntries := runJournalFixture(t, testBinary, errorUnit, errorMarker, format, "error", true)
-			assertMarkedPriorities(t, errorEntries, errorMarker, map[string]string{
-				errorMarker + " serve-error": "3",
-			})
+			assertServeErrorRecords(t, errorEntries, errorMarker, format)
 		})
 	}
 }
@@ -132,7 +130,11 @@ func runJournalFixture(t *testing.T, testBinary, unit, marker, format, level str
 	}
 	for {
 		entries := journalEntries(t, unit)
-		marked := markedEntries(entries, marker)
+		selection := marker
+		if serveError {
+			selection = "relay failed"
+		}
+		marked := markedEntries(entries, selection)
 		if len(marked) >= wantMarked || time.Now().After(deadline) {
 			if len(marked) < wantMarked {
 				t.Logf("journal fixture incomplete: unit=%s format=%s level=%s serveError=%t wantMarked=%d marked=%d systemd-run-output=%q journal-entries=%s",
@@ -190,6 +192,62 @@ func assertFixtureRecords(t *testing.T, entries []journalEntry, marker, format s
 				t.Errorf("journal MESSAGE is not JSON: %v; message=%q", err, entry.Message)
 			}
 		}
+	}
+}
+
+// The unit identifies the fixture. The secret-bearing error marker must never
+// survive redaction, so select the stable public event instead.
+func assertServeErrorRecords(t *testing.T, entries []journalEntry, secretMarker, format string) {
+	t.Helper()
+	marked := markedEntries(entries, "relay failed")
+	if len(marked) != 1 {
+		t.Fatalf("serve error records = %d, want 1", len(marked))
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Message, secretMarker) {
+			t.Error("private serve error reached the journal")
+		}
+	}
+	entry := marked[0]
+	if entry.Priority != "3" {
+		t.Errorf("serve error priority = %q, want 3", entry.Priority)
+	}
+	if strings.HasPrefix(entry.Message, "<") {
+		t.Error("journal MESSAGE retained priority prefix")
+	}
+	if format == "json" {
+		var body map[string]any
+		if err := json.Unmarshal([]byte(entry.Message), &body); err != nil {
+			t.Fatalf("invalid journal JSON: %v", err)
+		}
+		if body["msg"] != "relay failed" || body["error"] != "[redacted]" {
+			t.Errorf("unexpected public error record: %v", body)
+		}
+	} else if !strings.Contains(entry.Message, `msg="relay failed"`) || !strings.Contains(entry.Message, `error=[redacted]`) {
+		t.Errorf("unexpected public text error record: %s", entry.Message)
+	}
+}
+
+func TestServeErrorJournalPrivacyFixture(t *testing.T) {
+	for _, format := range []string{"text", "json"} {
+		t.Run(format, func(t *testing.T) {
+			t.Setenv("HERDR_RELAY_LOG_FORMAT", format)
+			output, err := os.CreateTemp(t.TempDir(), "stderr")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer output.Close()
+			marker := "private-fixture-sentinel"
+			reportErrorWithJournal(output, []string{"serve"}, fmt.Errorf("%s serve-error", marker), true)
+			data, err := os.ReadFile(output.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(string(data), "<3>") {
+				t.Fatalf("missing error priority prefix: %s", data)
+			}
+			assertServeErrorRecords(t, []journalEntry{{Message: strings.TrimSpace(strings.TrimPrefix(string(data), "<3>")), Priority: "3"}}, marker, format)
+		})
 	}
 }
 

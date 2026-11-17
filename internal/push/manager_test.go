@@ -976,7 +976,11 @@ func TestTerminalFallbackRestoresPrunedEventWhenSubscriptionsCannotPersist(t *te
 	}); err != nil {
 		t.Fatal(err)
 	}
-	manager.path = filepath.Join(privateTestDir(t), "missing", "subscriptions.json")
+	blockedParent := filepath.Join(privateTestDir(t), "not-a-directory")
+	if err := os.WriteFile(blockedParent, []byte("block directory creation"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manager.path = filepath.Join(blockedParent, "subscriptions.json")
 	manager.sendPush = func(_ context.Context, subscription Subscription, _ []byte) error {
 		if subscription.Endpoint != newEndpoint {
 			t.Fatalf("first delivery endpoint = %q, want %q", subscription.Endpoint, newEndpoint)
@@ -1235,7 +1239,11 @@ func TestRemoveDeviceKeepsMemoryWhenPersistenceFails(t *testing.T) {
 	if err := manager.Subscribe(typedTestSubscription("device-1", "https://fcm.googleapis.com/one")); err != nil {
 		t.Fatal(err)
 	}
-	manager.path = filepath.Join(privateTestDir(t), "missing", "subscriptions.json")
+	blockedParent := filepath.Join(privateTestDir(t), "not-a-directory")
+	if err := os.WriteFile(blockedParent, []byte("block directory creation"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manager.path = filepath.Join(blockedParent, "subscriptions.json")
 	if err := manager.RemoveDevice("device-1"); err == nil {
 		t.Fatal("RemoveDevice succeeded with unavailable persistence path")
 	}

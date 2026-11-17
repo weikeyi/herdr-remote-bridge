@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -53,8 +54,12 @@ func TestHCOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.SocketPath != "/runtime/herdr-core/second.sock" || cfg.Port != 9001 || cfg.PluginPort != 9002 ||
-		cfg.ServiceName != "custom.service" || cfg.RuntimeDir != "/runtime/core" {
+	wantSocket := "/runtime/herdr-core/second.sock"
+	if runtime.GOOS == "windows" {
+		wantSocket = windowsCoreEndpoint(os.Getenv("USERNAME"), "second")
+	}
+	if cfg.SocketPath != wantSocket || cfg.Port != 9001 || cfg.PluginPort != 9002 ||
+		cfg.ServiceName != "custom.service" || cfg.RuntimeDir != filepath.Dir("/runtime/core/relay.env") {
 		t.Fatalf("%+v", cfg)
 	}
 	t.Setenv("HC_SOCKET_PATH", "/explicit/core.sock")

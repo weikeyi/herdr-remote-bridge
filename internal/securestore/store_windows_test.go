@@ -56,7 +56,7 @@ func TestWindowsRefusesBroadACL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h, err := openHandle(path, windows.WRITE_DAC, false)
+	h, err := openHandle(path, windows.READ_CONTROL|windows.WRITE_DAC, false)
 	if err != nil {
 		t.Fatal(err)
 	}
