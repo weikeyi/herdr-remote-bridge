@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 )
@@ -47,8 +46,8 @@ func TestCommandBoundaries(t *testing.T) {
 			t.Fatalf("record = %#v, want one relay failure ERROR", record)
 		}
 		message, ok := record["error"].(string)
-		if !ok || !strings.Contains(message, "serve does not accept arguments") {
-			t.Fatalf("record = %#v, want usage error", record)
+		if !ok || message != "[redacted]" {
+			t.Fatalf("record = %#v, want private usage error redacted", record)
 		}
 	})
 
@@ -69,8 +68,8 @@ func TestCommandBoundaries(t *testing.T) {
 			t.Fatalf("record = %#v, want one relay failure ERROR", record)
 		}
 		message, ok := record["error"].(string)
-		if !ok || !strings.Contains(message, "invalid HERDR_RELAY_LOG_LEVEL") {
-			t.Fatalf("record = %#v, want invalid log-level error", record)
+		if !ok || message != "[redacted]" {
+			t.Fatalf("record = %#v, want private startup error redacted", record)
 		}
 	})
 

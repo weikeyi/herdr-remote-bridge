@@ -41,6 +41,11 @@ type hybridEnv struct {
 
 func setupHybridEnv(t *testing.T) *hybridEnv {
 	t.Helper()
+	return setupHybridEnvWithRole(t, "controller")
+}
+
+func setupHybridEnvWithRole(t *testing.T, bootstrapRole string) *hybridEnv {
+	t.Helper()
 	root := repoRoot(t)
 	tmpDir := t.TempDir()
 
@@ -107,6 +112,7 @@ func setupHybridEnv(t *testing.T) *hybridEnv {
 		fmt.Sprintf("HERDR_RELAY_PLUGIN_PORT=%d", freePort(t)),
 		"HERDR_RELAY_HOST=127.0.0.1",
 		"HERDR_RELAY_TOKEN="+relayKey,
+		"HERDR_BOOTSTRAP_ROLE="+bootstrapRole,
 		"HERDR_RELAY_INSTANCE_ID=hybrid-blackbox",
 		"HERDR_GATEWAY_URL="+env.gatewayWS,
 		// Port mapping would reach for the LAN router from a test run.
@@ -392,6 +398,9 @@ func (p *phone) awaitMessage(ctx context.Context, wanted string) map[string]any 
 	p.t.Helper()
 	for range 60 {
 		message := p.readMessage(ctx)
+		if message["type"] == "error" && wanted != "error" {
+			p.t.Fatalf("relay rejected request while waiting for %q: %v", wanted, message)
+		}
 		if message["type"] == wanted {
 			return message
 		}
@@ -733,4 +742,22 @@ func TestRelayWithoutGatewayIsUnchanged(t *testing.T) {
 		return
 	}
 	t.Fatal("relay never sent push_config")
+}
+
+func TestGatewayReaderCannotWrite(t *testing.T) {
+	env := setupHybridEnvWithRole(t, "reader")
+	waitForRegistration(t, env.relayHTTP)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	phone := dialPhone(t, env)
+	phone.awaitMessage(ctx, "push_config")
+	phone.sendMessage(ctx, map[string]any{"type": "send_text", "protocol": 3, "request_id": "reader-write", "pane_id": "pane-1", "text": "must not execute"})
+	result := phone.awaitMessage(ctx, "error")
+	failure, ok := result["error"].(map[string]any)
+	if !ok || result["request_id"] != "reader-write" || failure["code"] != "reader_denied" {
+		t.Fatalf("expected Reader denial, got %v", result)
+	}
+	// The connection remains useful for read-only refresh after a denied write.
+	phone.sendMessage(ctx, map[string]any{"type": "refresh_agents"})
+	phone.awaitMessage(ctx, "agents")
 }

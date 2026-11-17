@@ -229,6 +229,7 @@ func (l *natLab) startRelay(bins natBinaries, relayPort, gatewayPort int) {
 		fmt.Sprintf("HERDR_RELAY_PLUGIN_PORT=%d", freePort(l.t)),
 		"HERDR_RELAY_HOST=0.0.0.0",
 		"HERDR_RELAY_TOKEN="+relayKey,
+		"HERDR_BOOTSTRAP_ROLE=controller",
 		"HERDR_RELAY_INSTANCE_ID=nat-matrix",
 		fmt.Sprintf("HERDR_GATEWAY_URL=ws://%s:%d", natGatewayAddr, gatewayPort),
 		// Port mapping would look for a router that does not exist in this

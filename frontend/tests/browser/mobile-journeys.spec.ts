@@ -2664,14 +2664,18 @@ async function expectDesktopWidthLayout(page: Page) {
   await expect.poll(() => terminal.evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(true);
 }
 
-test('followup defaults: Resize Session starts on with height off', async ({ page }) => {
-  await openSizedPane(page, 'Default on');
-  await expect.poll(async () => (await leaseCommands(page)).length).toBe(1);
-  expect((await leaseCommands(page))[0]).not.toHaveProperty('rows');
+test('followup defaults: Resize Session stays off until explicit opt-in', async ({ page }) => {
+  await openSizedPane(page, 'Default off');
+  await expectDesktopWidthLayout(page);
+  await page.waitForTimeout(300);
+  expect(await leaseCommands(page)).toHaveLength(0);
+  expect(await releaseCommands(page)).toHaveLength(0);
   expect(await page.evaluate(() => localStorage.getItem('herdr_terminal_resize_session'))).toBeNull();
   await settingsFromTerminal(page);
-  await expect(page.getByRole('switch', { name: 'Resize Session', exact: true })).toBeChecked();
-  await expect(page.getByRole('switch', { name: 'Lease Terminal Height', exact: true })).not.toBeChecked();
+  await expect(page.getByRole('switch', { name: 'Resize Session', exact: true })).not.toBeChecked();
+  const height = page.getByRole('switch', { name: 'Lease Terminal Height', exact: true });
+  await expect(height).not.toBeChecked();
+  await expect(height).toBeDisabled();
 });
 
 test('followup defaults: explicitly saved Resize Session off stays off', async ({ page }) => {
@@ -5842,7 +5846,7 @@ test('scales the whole interface from accessible settings', async ({ page }) => 
   await expect(page.getByRole('group', { name: 'Terminal Width' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Fit to Phone' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Original Columns' })).toHaveCount(0);
-  await expect(page.getByRole('switch', { name: 'Resize Session', exact: true })).toBeChecked();
+  await expect(page.getByRole('switch', { name: 'Resize Session', exact: true })).not.toBeChecked();
   await expect(page.getByText(/laptop and SSH views of that pane look garbled/)).toBeVisible();
   await expect(page.getByRole('switch', { name: 'Resize Session', exact: true }))
     .toHaveAccessibleDescription(/Resizing may truncate scrollback and lose older output\./);
