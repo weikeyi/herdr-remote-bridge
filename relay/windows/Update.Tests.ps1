@@ -56,7 +56,7 @@ Describe 'Update rejects an incorrect supplied checksum before stopping anything
     BeforeAll {
         Mock Get-BridgeIdentity { [PSCustomObject]@{ User = [PSCustomObject]@{ Value = 'S-1-5-21-1' } } }
         Mock Get-BridgeFullPath { $Value }
-        Mock Read-BridgeConfig { [PSCustomObject]@{ dataDir = '/private'; registrationCredentialPath = '/private/gateway'; relayKeyCredentialPath = '/private/key' } }
+        Mock Read-BridgeConfig { [PSCustomObject]@{ dataDir = [IO.Path]::GetDirectoryName('/private/config.json'); registrationCredentialPath = '/private/gateway'; relayKeyCredentialPath = '/private/key' } }
         Mock Assert-BridgePathOwner {}
         Mock Assert-BridgeCredential {}
         Mock Get-FileHash { [PSCustomObject]@{ Hash = 'b' * 64 } }
