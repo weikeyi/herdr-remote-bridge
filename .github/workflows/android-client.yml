@@ -76,6 +76,22 @@ jobs:
             android-client/app/build/outputs/apk/debug/signing-certificate.txt
           retention-days: 14
           if-no-files-found: error
+      - name: Prepare exact device-test APK inputs
+        run: |
+          set -euo pipefail
+          mkdir -p app/build/device-inputs
+          cp app/build/outputs/apk/debug/app-debug.apk app/build/device-inputs/
+          cp app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk app/build/device-inputs/
+          cp app/build/outputs/apk/debug/build-metadata.json app/build/device-inputs/
+          cd app/build/device-inputs
+          sha256sum app-debug.apk app-debug-androidTest.apk build-metadata.json > SHA256SUMS
+      - name: Upload same-run device-test inputs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-device-inputs-${{ github.run_id }}
+          path: android-client/app/build/device-inputs/
+          retention-days: 1
+          if-no-files-found: error
       - name: Upload test reports only
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -89,6 +105,7 @@ jobs:
           if-no-files-found: ignore
 
   instrumentation:
+    needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -106,6 +123,26 @@ jobs:
       - name: Bootstrap checksum-pinned Android SDK
         working-directory: android-client
         run: bash scripts/setup-ci-sdk.sh
+      - name: Test instrumentation result parser
+        working-directory: android-client
+        run: python3 scripts/test-check-instrumentation.py
+      - name: Download exact APKs from this run's successful build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: android-device-inputs-${{ github.run_id }}
+          path: android-client/app/build/device-inputs
+      - name: Verify test inputs and source identity
+        working-directory: android-client
+        run: |
+          set -euo pipefail
+          cd app/build/device-inputs
+          sha256sum --check --strict SHA256SUMS
+          python3 - <<'PYVERIFY'
+          import json, subprocess
+          with open("build-metadata.json") as stream:
+              metadata = json.load(stream)
+          assert metadata["source_commit"] == subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          PYVERIFY
       - name: Offline WebView and manifest acceptance on emulator
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
@@ -115,7 +152,7 @@ jobs:
           disable-animations: true
           disable-linux-hw-accel: auto
           emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          script: cd android-client && bash ./gradlew --no-daemon --console=plain connectedDebugAndroidTest
+          script: cd android-client && bash scripts/run-ci-instrumentation.sh
       - name: Upload synthetic instrumentation results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

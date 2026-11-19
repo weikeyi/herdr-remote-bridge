@@ -43,6 +43,11 @@ phone-to-PC pairing. Keep the device's Android System WebView updated.
 ## CI outputs
 
 The dedicated workflow runs build/lint/unit tests and emulator instrumentation.
+The device job depends on the build job and installs that exact APK plus its
+same-build test APK after verifying checksums and source identity. Once the
+emulator boots it runs adb instrumentation directly, with strict per-test result
+validation, rather than downloading Gradle dependencies again. Test input APKs
+are a separate one-day artifact, not part of the user download.
 APK artifacts contain the debug APK, SHA256SUMS, source/toolchain metadata and the
 signing certificate fingerprint. They expire after 14 days; synthetic test reports
 after one day. Downloaded debug APKs are previews, not signed production releases.
