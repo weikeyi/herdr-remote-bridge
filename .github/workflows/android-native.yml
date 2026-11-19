@@ -1,4 +1,4 @@
-name: Independent native Android Reader
+name: Independent native Android client
 
 on:
   push:
@@ -55,6 +55,20 @@ jobs:
           mkdir -p app/build/reports/wss
           export ANDROID_JAR="$ANDROID_HOME/platforms/android-37.0/android.jar"
           bash ../java/integration/wss/test.sh 2>&1 | tee app/build/reports/wss/trace.txt
+      - name: Controller text and separate Enter without reconnect replay
+        env:
+          RELAY_SOURCE: ${{ github.workspace }}/audit-reference
+          HARNESS_ROLE: controller
+        run: |
+          set -euo pipefail
+          export ANDROID_JAR="$ANDROID_HOME/platforms/android-37.0/android.jar"
+          bash ../java/integration/wss/test.sh 2>&1 | tee app/build/reports/wss/controller-trace.txt
+      - name: Unchanged server role, exact-target and dispatch enforcement
+        env:
+          RELAY_SOURCE: ${{ github.workspace }}/audit-reference
+        run: |
+          set -euo pipefail
+          bash ../java/integration/wss/original-enforcement.sh 2>&1 | tee app/build/reports/wss/server-enforcement.txt
       - name: Inspect debug APK permissions
         run: |
           set -euo pipefail

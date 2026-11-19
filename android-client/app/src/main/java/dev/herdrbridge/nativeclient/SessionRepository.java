@@ -3,17 +3,23 @@ package dev.herdrbridge.nativeclient;
 import java.util.List;
 import java.util.Objects;
 
-/** Read-only boundary. Implementations must deliver only authenticated exact-target snapshots.
- * Callbacks may arrive off the UI thread; no write, resize, upload or delta API exists. */
+/** Authenticated exact-target boundary. Callbacks may arrive off the UI thread. */
 public interface SessionRepository extends AutoCloseable {
     enum State { DISCONNECTED, CONNECTING, ENROLLED, READY, REVOKED, ERROR }
+    enum MutationOutcome { COMPLETED, NOT_STARTED, UNKNOWN }
     interface Listener {
+        default void onAccess(String role) {}
+        default void onInputUncertaintyCleared(SessionTarget target) {}
+        default void onMutationResult(String id, SessionTarget target, MutationOutcome outcome) {}
         void onSessions(List<Session> sessions);
         void onSnapshot(SessionTarget target, String content);
         void onState(State state, String safeMessage);
     }
     void start(Listener listener);
     void requestSnapshot(SessionTarget target);
+    default String sendTerminalText(SessionTarget target,String text) { throw new UnsupportedOperationException(); }
+    default String sendEnter(SessionTarget target) { throw new UnsupportedOperationException(); }
+    default void resetInputUncertainty(SessionTarget target) {}
     @Override void close();
 
     final class SessionTarget {
@@ -46,7 +52,12 @@ public interface SessionRepository extends AutoCloseable {
     final class Session {
         public final SessionTarget target;
         public final String title, status;
+        public final boolean manualTerminalInput;
         public Session(SessionTarget target, String title, String status) {
+            this(target,title,status,false);
+        }
+        public Session(SessionTarget target,String title,String status,boolean manualTerminalInput) {
+            this.manualTerminalInput=manualTerminalInput;
             this.target = Objects.requireNonNull(target);
             this.title = title == null ? "" : title;
             this.status = status == null ? "" : status;

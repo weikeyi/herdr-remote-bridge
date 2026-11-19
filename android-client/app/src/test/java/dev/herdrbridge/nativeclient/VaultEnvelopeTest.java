@@ -24,7 +24,7 @@ public class VaultEnvelopeTest {
  }
  @Test public void typedRecordRejectsControllerAndTrailingData()throws Exception {
   String id="AAAAAAAAAAAAAAAAAAAAAAAA";
-  try{new CredentialRecord("https://example.test",id,id,1,"controller",new byte[32],"AAAAAAAAAAAAAAAAAAAAAA",new byte[32]);fail();}catch(IllegalArgumentException expected){}
+  try{new CredentialRecord("https://example.test",id,id,1,"admin",new byte[32],"AAAAAAAAAAAAAAAAAAAAAA",new byte[32]);fail();}catch(IllegalArgumentException expected){}
   try(CredentialRecord record=new CredentialRecord("https://example.test",id,id,1,"reader",new byte[32],"AAAAAAAAAAAAAAAAAAAAAA",new byte[32])){
    byte[] encoded=record.encode();try(CredentialRecord decoded=CredentialRecord.decode(encoded)){assertEquals(record.origin,decoded.origin);}
    try{CredentialRecord.decode(Arrays.copyOf(encoded,encoded.length+1));fail();}catch(java.io.IOException expected){}

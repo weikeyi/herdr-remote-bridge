@@ -15,6 +15,14 @@ public class DeviceVaultTest {
   try(CredentialRecord record=new CredentialRecord("https://example.test","AAAAAAAAAAAAAAAAAAAAAAAA","BBBBBBBBBBBBBBBBBBBBBBBB",1,"reader",new byte[32],"AAAAAAAAAAAAAAAAAAAAAA",new byte[32])) {
    vault.save(record);assertTrue(vault.hasRecord());
    try(CredentialRecord loaded=vault.load(record.origin)){assertEquals(record.deviceId,loaded.deviceId);}
+   byte[] original=java.nio.file.Files.readAllBytes(path.toPath());
+   for(String role:new String[]{"controller","reader"}) {
+    try(CredentialRecord changed=new CredentialRecord(record.origin,record.credentialId,record.deviceId,role.equals("reader")?2:1,role,new byte[32],record.relayId,new byte[32])) {
+     try{vault.save(changed);fail("Changed role/version must not replace enrolled identity");}catch(IOException expected){}
+    }
+    assertArrayEquals(original,java.nio.file.Files.readAllBytes(path.toPath()));
+    try(CredentialRecord loaded=vault.load(record.origin)){assertEquals("reader",loaded.role);assertEquals(1,loaded.version);}
+   }
    try{vault.load("https://other.test");fail();}catch(IOException expected){}
    KeyStore store=KeyStore.getInstance("AndroidKeyStore");store.load(null);store.deleteEntry(alias);
    try{vault.load(record.origin);fail();}catch(IOException expected){}

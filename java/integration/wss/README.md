@@ -62,3 +62,38 @@ not a real Core terminal, VPS deployment, Android lifecycle, UI rendering or
 AndroidKeyStore. Device CI and eventual real-environment acceptance remain
 separate gates. The scripted reconnect explicitly drives the real client
 factories; the foreground lifecycle coordinator has its own tests.
+
+## Scoped input extension
+
+Run the same isolated test twice, with `HARNESS_ROLE=reader` and
+`HARNESS_ROLE=controller`. The role is assigned by the synthetic resolver and
+is authenticated in the original Go E2EE finish, not selected by an application
+JSON field. No real invitation, terminal or shell is used.
+
+Controller test: fresh snapshot, synthetic single-line text, correlated completed
+result, fresh snapshot, separate Enter, completed result, refreshed counters.
+Two fresh credential reconnects must observe exactly one text and one Enter.
+Reader test: the native client must refuse input with NOT_STARTED; counters stay
+zero. The adapter rejects repeated mutation request IDs rather than hiding a
+native replay behind server deduplication. The displayed counters contain no text.
+
+**Scope boundary:** the WSS application adapter is synthetic, including its role
+and target checks. It is not the original `app.Server` dispatcher. Run
+`RELAY_SOURCE=/absolute/audited/source bash original-enforcement.sh` separately
+for unchanged original Go tests covering Controller/Reader authorization, exact
+pane generation/agent identity, credential revocation/replacement, literal text
+validation, keyed deduplication, ambiguous delivery and dispatch-time checks.
+Those use only temporary test stores and fake Core sockets. A successful WSS run
+alone does not prove original server authorization or live Windows input.
+
+Never auto-retry text or Enter after a missing result. A completed result means
+input delivery, not command execution success. No test executes the synthetic
+text as a command, writes terminal input logs, or changes a deployed service.
+
+Local validation of this extension: both Reader and Controller WSS runs passed,
+including untrusted-CA and wrong-host TLS refusal. Original app authorization,
+exact-target and manual-input admission tests passed; original device-store
+revoked/version-replaced credential test passed. Original coordinator socket
+fixtures could not run in this execution environment (`listen unix ... socket:
+operation not permitted`, including the permitted retry); they remain required
+on a normal Linux runner. Do not report those blocked tests as passing.

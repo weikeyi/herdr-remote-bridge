@@ -15,24 +15,29 @@ import dev.herdrbridge.nativeclient.SessionRepository.SessionTarget;
 public final class NativeSessionProtocol {
     private final Map<String, Session> sessions = new LinkedHashMap<>();
     private boolean configured, inventoryReady, authoritative;
+    private boolean manualInput;
+    private SessionTarget freshTarget;
+    private long freshAt, readStartedAt;
     private String pendingId;
     private SessionTarget pendingTarget;
     private static JSONException invalid() { return new JSONException("Invalid native session protocol message"); }
     public boolean ready() { return configured; }
-    public void reset() { configured = false; inventoryReady = false; authoritative = false; sessions.clear(); clearPending(); }
+    public void reset() { manualInput=false; freshTarget=null; configured = false; inventoryReady = false; authoritative = false; sessions.clear(); clearPending(); }
     private void clearPending() { pendingId = null; pendingTarget = null; }
     public void acceptConfig(JSONObject message) throws JSONException {
         reset();
         if (!"push_config".equals(string(message, "type", 32)) || integer(message, "protocol") != 3) throw invalid();
         JSONObject inventory = message.optJSONObject("inventory");
         inventoryReady = inventory != null && "ready".equals(inventory.opt("state"));
+        JSONArray caps=message.optJSONArray("capabilities");
+        if(caps!=null) for(int i=0;i<caps.length();i++) if("manual_terminal_input".equals(caps.opt(i))) manualInput=true;
         configured = true;
     }
     /** Status transitions do not invent an empty authoritative agent snapshot. */
     public void acceptInventory(JSONObject message) throws JSONException {
         if (!configured || !"inventory_status".equals(string(message, "type", 32))) throw invalid();
         inventoryReady = "ready".equals(message.opt("state"));
-        if (!inventoryReady) { authoritative = false; clearPending(); }
+        if (!inventoryReady) { authoritative = false; freshTarget=null; clearPending(); }
     }
     public List<Session> acceptAgents(JSONObject message) throws JSONException {
         if (!configured || !"agents".equals(string(message, "type", 32))) throw invalid();
@@ -48,6 +53,7 @@ public final class NativeSessionProtocol {
         }
         sessions.clear(); sessions.putAll(next); authoritative = true;
         if (pendingTarget != null && !current(pendingTarget)) clearPending();
+        if(freshTarget!=null && !current(freshTarget))freshTarget=null;
         return snapshot();
     }
     public List<Session> acceptAgentUpdate(JSONObject message) throws JSONException {
@@ -57,6 +63,7 @@ public final class NativeSessionProtocol {
         if (!sessions.containsKey(key(session.target)) && sessions.size() >= 4096) throw invalid();
         sessions.put(key(session.target), session);
         if (pendingTarget != null && !current(pendingTarget)) clearPending();
+        if(freshTarget!=null && !current(freshTarget))freshTarget=null;
         return snapshot();
     }
     private List<Session> snapshot() { return Collections.unmodifiableList(new ArrayList<>(sessions.values())); }
@@ -65,9 +72,9 @@ public final class NativeSessionProtocol {
         Session session = sessions.get(key(target));
         return authoritative && session != null && session.target.equals(target);
     }
-    private static Session parseSession(JSONObject value) throws JSONException {
+    private Session parseSession(JSONObject value) throws JSONException {
         SessionTarget target = parseTarget(value);
-        return new Session(target, optionalString(value, "name", 512), optionalString(value, "status", 64));
+        return new Session(target, optionalString(value, "name", 512), optionalString(value, "status", 64), manualInput && "primary".equals(target.serverSessionId));
     }
     private static SessionTarget parseTarget(JSONObject value) throws JSONException {
         String server = identifier(value, "server_session_id");
@@ -85,7 +92,7 @@ public final class NativeSessionProtocol {
             .put("request_id", requestId).put("server_session_id", target.serverSessionId)
             .put("pane_id", target.paneId).put("target", targetJson(target))
             .put("lines", 80).put("format", "ansi").put("content_fingerprint", "");
-        pendingId = requestId; pendingTarget = target;
+        pendingId = requestId; pendingTarget = target; readStartedAt=System.nanoTime();
         return request;
     }
     public String acceptPaneContent(JSONObject message) throws JSONException {
@@ -99,9 +106,33 @@ public final class NativeSessionProtocol {
         String format = string(message, "format", 16);
         if (!format.equals("ansi") && !format.equals("text") && !format.equals("plain")) throw invalid();
         String content = string(message, "content", TerminalSnapshot.MAX_INPUT_CHARS);
+        freshTarget=target; freshAt=readStartedAt;
         clearPending();
         return content;
     }
+    public boolean inputReady(SessionTarget target) {
+        return configured && inventoryReady && manualInput && target!=null && "primary".equals(target.serverSessionId)
+            && current(target) && target.equals(freshTarget) && System.nanoTime()-freshAt>=0 && System.nanoTime()-freshAt<3_000_000_000L;
+    }
+    public static boolean validInputText(String text) {
+        if(text==null || text.isEmpty() || text.getBytes(java.nio.charset.StandardCharsets.UTF_8).length>4096) return false;
+        for(int i=0;i<text.length();i++) {
+            char c=text.charAt(i);
+            if(Character.isISOControl(c)||c=='\u2028'||c=='\u2029')return false;
+            if(Character.isHighSurrogate(c)){if(++i>=text.length()||!Character.isLowSurrogate(text.charAt(i)))return false;}
+            else if(Character.isLowSurrogate(c))return false;
+        }
+        return true;
+    }
+    public JSONObject input(SessionTarget target,String id,String text,boolean enter) throws JSONException {
+        if(!inputReady(target)||(!enter&&!validInputText(text)))throw invalid();
+        JSONObject out=new JSONObject().put("type",enter?"send_keys":"send_terminal_text").put("protocol",3)
+            .put("request_id",id).put("pane_id",target.paneId).put("server_session_id",target.serverSessionId).put("target",targetJson(target));
+        if(enter)out.put("keys",new JSONArray().put("Enter"));else out.put("text",text);
+        freshTarget=null; // Each mutation requires a new observed terminal snapshot.
+        return out;
+    }
+    public boolean currentInputTarget(SessionTarget target) {return configured && inventoryReady && manualInput && current(target);}
     private static JSONObject targetJson(SessionTarget target) throws JSONException {
         return new JSONObject().put("server_session_id", target.serverSessionId).put("pane_id", target.paneId)
             .put("terminal_id", target.terminalId).put("generation", target.generation).put("agent_session_id", target.agentSessionId);

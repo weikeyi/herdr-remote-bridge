@@ -65,3 +65,20 @@ Fixture traps:
 Gateway cross-language vector: `frontend/tests/unit/transports.test.ts:69,179`, corresponding `internal/gatewaywire` tests. Chunk fixture at transports.test.ts:466 corresponds to Go internal/framing; include it before claiming WSS interoperability.
 
 Native milestone gate: independently reproduce all v2 intermediate bytes and record bytes with JCA, reject wrong proof/key/point/version/sequence/tag/direction/truncation, enforce finish-before-ready, test pending invitation persistence failure/retry, and verify outer gateway chunking. JVM pass is NOT Android-provider/device proof. Follow with Android instrumentation and local Go fixture end-to-end; no live user secrets needed. Still not an installable fully working native client until native screens/storage/lifecycle/reconnect/device testing complete.
+
+
+## Controller input extension (same pinned Bridge baseline)
+
+- `internal/app/bridge_management.go:68-90`: default Reader; explicit controller invitation.
+- `internal/app/server.go:336-389`: current credential/role validation; Reader mutations denied.
+- `server.go:417-462,742-797`: full exact target admission, primary server restriction and dispatch recheck.
+- `frontend/src/components/ManualTerminalInput.svelte:65-95`: independent text and Enter; terminal may be menu/hotkey focus.
+- `internal/coordinator/terminal_input.go:15-57`: single-line text policy and keyed in-memory dedup ledger. Native uses stricter4096-byte limit.
+- `internal/coordinator/dispatch.go:442-465`: send_keys has no explicit dedup ledger, so Enter must never replay.
+- `server.go:3222-3235`: command_result includes request_id/action/pane_id/ok/phase, not full target. Local pending state binds the full target and connection epoch.
+
+Wire requests use `protocol:3`, unique request_id, pane_id/server_session_id and
+all five target fields. Text is `send_terminal_text` with text; Enter is
+`send_keys` with keys:["Enter"]. No send_input/submit_prompt substitute is used.
+Only ok=true and phase=completed means delivery, not command execution success.
+Controller grants device-level authority; exact-pane restriction is per request.

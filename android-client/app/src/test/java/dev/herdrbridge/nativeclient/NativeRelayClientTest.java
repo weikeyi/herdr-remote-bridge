@@ -76,4 +76,28 @@ public class NativeRelayClientTest {
         Method fail=NativeRelayClient.class.getDeclaredMethod("fail",SessionRepository.State.class);fail.setAccessible(true);fail.invoke(client,SessionRepository.State.ERROR);
         assertEquals("CLOSED",field(client,"phase").toString());assertTrue(((java.util.concurrent.ScheduledThreadPoolExecutor)field(client,"serial")).isShutdown());
     }
+    @Test public void controllerRequiresExpectedAuthenticatedRole()throws Exception {
+        Store store=new Store();try(NativeRelayClient c=client(store,null)) {
+            Field expected=NativeRelayClient.class.getDeclaredField("expectedRole");expected.setAccessible(true);expected.set(c,"controller");
+            rejects(c,finish());assertEquals(0,store.writes);
+            invokeFinish(c,finish().put("role","controller"));assertEquals(1,store.writes);
+            assertEquals("controller",((CredentialRecord)field(c,"saved")).role);
+        }
+    }
+    @Test public void mutationAcknowledgmentsBindIdActionPaneAndCurrentTarget()throws Exception {
+        for(String wrong:new String[]{"none","request_id","action","pane_id","generation"})try(NativeRelayClient c=client(new Store(),null)) {
+            NativeSessionProtocol p=(NativeSessionProtocol)field(c,"protocol");
+            p.acceptConfig(new JSONObject().put("type","push_config").put("protocol",3).put("inventory",new JSONObject().put("state","ready")).put("capabilities",new org.json.JSONArray().put("manual_terminal_input")));
+            JSONObject target=new JSONObject().put("server_session_id","primary").put("pane_id","pane-1").put("terminal_id","term-1").put("generation",0).put("agent_session_id","");
+            SessionRepository.SessionTarget t=p.acceptAgents(new JSONObject().put("type","agents").put("agents",new org.json.JSONArray().put(target))).get(0).target;
+            Class<?> type=Class.forName("dev.herdrbridge.nativeclient.NativeRelayClient$Mutation");java.lang.reflect.Constructor<?> ctor=type.getDeclaredConstructors()[0];ctor.setAccessible(true);
+            Field pending=NativeRelayClient.class.getDeclaredField("pendingMutation");pending.setAccessible(true);pending.set(c,ctor.newInstance("mutation-1","send_keys",t));
+            JSONObject ack=new JSONObject().put("request_id","mutation-1").put("action","send_keys").put("pane_id","pane-1").put("ok",true).put("phase","completed");
+            if(wrong.equals("generation"))p.acceptAgentUpdate(target.put("type","agent_update").put("generation",1));
+            else if(!wrong.equals("none"))ack.put(wrong,"wrong");
+            Method accept=NativeRelayClient.class.getDeclaredMethod("acceptMutationResult",JSONObject.class);accept.setAccessible(true);accept.invoke(c,ack);
+            if(wrong.equals("request_id"))assertNotNull(field(c,"pendingMutation"));
+            else {assertNull(field(c,"pendingMutation"));assertEquals(!wrong.equals("none"),field(c,"inputUncertain"));}
+        }
+    }
 }

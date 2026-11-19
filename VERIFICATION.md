@@ -1,6 +1,6 @@
 # Native milestone verification
 
-Status: QR/phone-UX revision locally verified, pending its eighteen-test Android
+Status: explicit Controller input revision locally verified, pending its twenty-test Android
 CI run. Not a physical-device-accepted production release. The preceding native
 core commit b0697bcd passed all CI gates, including eleven actual API 29 tests.
 
@@ -106,3 +106,30 @@ legs, not one integrated Activity → WSS → AndroidKeyStore acceptance trace.
 Physical Android/user Windows/VPS acceptance remains pending. An isolated test
 CA would require a separate acceptance-only build variant; the delivered APK
 must retain system-only trust and must not include that CA or a TLS bypass.
+
+## Native Controller input revision
+
+The user expanded the first-version scope to explicit terminal input. Controller
+requires a separately selected pairing role matching the authenticated server
+finish. Old v1 stored credentials remain Reader. Both a current per-pane
+manual_terminal_input capability and a matching snapshot younger than three
+seconds are required. Native text is limited to 4096 strict UTF-8 bytes without
+controls or multiline; Enter is a separate deliberate action. Only one operation
+may be pending. No input is queued, persisted, logged or replayed on reconnect.
+A non-secret uncertainty latch is persisted before dispatch; unknown delivery
+requires a fresh explicit inspection before another write.
+
+The current local suite passes 54 JVM tests and zero lint errors. Reader and
+Controller real-WSS fixtures pass: Controller text and Enter reach a synthetic
+counter once each, fresh reconnect does not replay, Reader performs zero writes,
+and bad CA/hostname are rejected. Unchanged original Go app/credential tests
+pass six top-level cases locally. Five coordinator cases require Unix sockets
+that the local sandbox denies (EPERM), so those are not local passes; the full
+unchanged original-enforcement script is a required CI step.
+
+Twenty Android runtime cases are compiled, preserving the prior eighteen and
+adding two Controller UI/uncertainty cases. They still require execution against
+the exact final commit. c8f1f045's preceding clipboard-only fix passed build and
+protocol checks but its device job timed out installing the APK, before running
+tests. Installation timeout is now bounded at five minutes for slow software
+emulation; no test is skipped or assertion removed.

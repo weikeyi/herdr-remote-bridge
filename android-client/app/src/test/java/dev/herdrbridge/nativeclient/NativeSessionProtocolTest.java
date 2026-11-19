@@ -110,4 +110,27 @@ public class NativeSessionProtocolTest {
         assertThrows(Exception.class,()->p.acceptPaneContent(response("request-0001").put("content",42)));
         assertThrows(Exception.class,()->p.acceptPaneContent(response("request-0001").put("content",new String(new char[262145]))));
     }
+    @Test public void controllerTextBoundsAndExactFreshTarget() throws Exception {
+        assertTrue(NativeSessionProtocol.validInputText("hello 世界"));
+        assertTrue(NativeSessionProtocol.validInputText("a".repeat(4096)));
+        for(String bad:new String[]{"","a".repeat(4097),"中".repeat(1366),"a\n","a\r","\t","\u001b","\u0085","\u2028","\u2029","\ud800","\udc00"})assertFalse(NativeSessionProtocol.validInputText(bad));
+        NativeSessionProtocol p=new NativeSessionProtocol();p.acceptConfig(config("ready").put("capabilities",new JSONArray().put("manual_terminal_input")));
+        SessionTarget t=initialize(p);assertFalse(p.inputReady(t));p.readPane(t,"request-0001");p.acceptPaneContent(response("request-0001"));assertTrue(p.inputReady(t));
+        JSONObject text=p.input(t,"mutation-0001","echo safe",false);assertEquals("send_terminal_text",text.getString("type"));assertFalse(text.has("keys"));assertEquals("echo safe",text.getString("text"));assertFalse(p.inputReady(t));
+        assertThrows(Exception.class,()->p.input(t,"mutation-0002",null,true));
+        p.readPane(t,"request-0002");p.acceptPaneContent(response("request-0002"));JSONObject enter=p.input(t,"mutation-0003",null,true);assertEquals("Enter",enter.getJSONArray("keys").getString(0));assertFalse(enter.has("text"));
+        p.readPane(t,"request-0003");p.acceptPaneContent(response("request-0003"));p.acceptAgentUpdate(target().put("type","agent_update").put("generation",1));assertFalse(p.inputReady(t));
+    }
+    @Test public void missingCapabilityAndInventoryLossNeverEnableInput() throws Exception {
+        NativeSessionProtocol p=ready();SessionTarget t=initialize(p);p.readPane(t,"request-0001");p.acceptPaneContent(response("request-0001"));assertFalse(p.inputReady(t));
+        p.acceptConfig(config("ready").put("capabilities",new JSONArray().put("manual_terminal_input")));t=initialize(p);p.readPane(t,"request-0002");p.acceptPaneContent(response("request-0002"));assertTrue(p.inputReady(t));
+        p.acceptInventory(new JSONObject().put("type","inventory_status").put("state","loading"));p.acceptInventory(new JSONObject().put("type","inventory_status").put("state","ready"));initialize(p);assertFalse(p.inputReady(t));
+    }
+    @Test public void delayedSnapshotAndNonPrimaryNeverEnableInput()throws Exception {
+        NativeSessionProtocol p=new NativeSessionProtocol();p.acceptConfig(config("ready").put("capabilities",new JSONArray().put("manual_terminal_input")));
+        SessionTarget t=initialize(p);p.readPane(t,"request-0001");
+        java.lang.reflect.Field started=NativeSessionProtocol.class.getDeclaredField("readStartedAt");started.setAccessible(true);started.setLong(p,System.nanoTime()-4_000_000_000L);
+        p.acceptPaneContent(response("request-0001"));assertFalse(p.inputReady(t));
+        JSONObject other=target().put("server_session_id","other");Session row=p.acceptAgents(agents(other)).get(0);assertFalse(row.manualTerminalInput);assertFalse(p.inputReady(row.target));
+    }
 }

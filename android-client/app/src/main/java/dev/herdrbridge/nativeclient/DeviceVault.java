@@ -39,7 +39,7 @@ public final class DeviceVault implements CredentialStore {
         try {
             if(hasRecord()) {
                 try(CredentialRecord existing=load(record.origin)) {
-                    if(!existing.deviceId.equals(record.deviceId)||!existing.credentialId.equals(record.credentialId)||!existing.relayId.equals(record.relayId)) throw new IOException("Existing device identity differs");
+                    if(!existing.deviceId.equals(record.deviceId)||!existing.credentialId.equals(record.credentialId)||!existing.relayId.equals(record.relayId)||!existing.role.equals(record.role)||existing.version!=record.version) throw new IOException("Existing device identity differs");
                 }
             }
             plain=record.encode();byte[] sealed=VaultEnvelope.seal(key(!hasRecord()),record.origin,plain);

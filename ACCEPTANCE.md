@@ -32,5 +32,23 @@ For the QR/UX revision also verify a real user-selected local image, image-picke
 cancellation, two-code rejection, changed origin while selection is pending,
 background cancellation and explicit copy. A successful decode fills the invite
 field only; it must never silently pair or open a decoded URL. Live camera QR
-scanning, full VT behavior, write controls and modern physical-device coverage
+scanning, full VT behavior, modern physical-device coverage
 remain outside this Reader preview.
+
+## Controller input revision gates
+
+Explicit Controller pairing must match the authenticated issued role. A Reader
+credential and old stored v1 records must never acquire input capability. Text
+and Enter are separate explicit actions; only current primary exact targets with
+manual_terminal_input and a fresh matching snapshot may receive them. No queued
+input, IME submit, automatic Enter or reconnect replay is permitted.
+
+Verify one pending operation, strict 4096-byte UTF-8/control bounds, delayed and
+wrong-target acknowledgements, unknown delivery latch and explicit fresh
+inspection before retry. Background and target changes clear drafts. Completed
+delivery means input reached the terminal, not that a shell command succeeded.
+The terminal may be a menu or hotkey surface rather than a shell prompt.
+
+The actual-WSS fixture uses a synthetic application counter, never an executing
+terminal. Original unchanged server authorization and dispatch tests run
+separately, including Reader denial, exact-target and revocation checks.

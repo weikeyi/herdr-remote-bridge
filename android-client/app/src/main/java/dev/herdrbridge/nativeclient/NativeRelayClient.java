@@ -21,6 +21,12 @@ public final class NativeRelayClient implements SessionRepository {
     private final long authVersion,invitationExpiry;
     private byte[] authSecret,rendezvous;
     private CredentialRecord saved;
+    private String expectedRole="reader";
+    private String authenticatedRole;
+    private Mutation pendingMutation;
+    private boolean inputUncertain;
+    private final AtomicBoolean inputReserved=new AtomicBoolean();
+    private static final class Mutation { final String id,action; final SessionTarget target; ScheduledFuture<?> timer; Mutation(String id,String action,SessionTarget target){this.id=id;this.action=action;this.target=target;} }
     private final CredentialStore vault;
     private final java.util.concurrent.atomic.AtomicInteger queued=new java.util.concurrent.atomic.AtomicInteger();
     private final AtomicBoolean closed=new AtomicBoolean();
@@ -42,6 +48,11 @@ public final class NativeRelayClient implements SessionRepository {
         return forInvitation(origin,invitationUrl,(CredentialStore)vault);
     }
     static NativeRelayClient forInvitation(String origin,String invitationUrl,CredentialStore vault)throws Exception {
+        return forInvitation(origin,invitationUrl,vault,"reader");
+    }
+    public static NativeRelayClient forInvitation(String origin,String invitationUrl,DeviceVault vault,String expectedRole)throws Exception {return forInvitation(origin,invitationUrl,(CredentialStore)vault,expectedRole);}
+    static NativeRelayClient forInvitation(String origin,String invitationUrl,CredentialStore vault,String expectedRole)throws Exception {
+        if(!"reader".equals(expectedRole)&&!"controller".equals(expectedRole))throw new IllegalArgumentException();
         String canonical=InvitationValidator.origin(origin);
         InvitationValidator.invitation(invitationUrl,canonical,System.currentTimeMillis());
         Map<String,String> fields=new HashMap<>();
@@ -49,8 +60,9 @@ public final class NativeRelayClient implements SessionRepository {
             int p=piece.indexOf('=');fields.put(URLDecoder.decode(piece.substring(0,p),"UTF-8"),URLDecoder.decode(piece.substring(p+1),"UTF-8"));
         }
         if(vault.hasRecord())throw new IllegalStateException("Already enrolled");
-        return new NativeRelayClient(canonical,fields.get("relay_id"),fields.get("invite"),Long.parseLong(fields.get("invite_version")),
+        NativeRelayClient client=new NativeRelayClient(canonical,fields.get("relay_id"),fields.get("invite"),Long.parseLong(fields.get("invite_version")),
             E2ee.decode(fields.get("setup"),32),E2ee.decode(fields.get("rendezvous"),32),Long.parseLong(fields.get("invite_expires")),null,vault);
+        client.expectedRole=expectedRole; return client;
     }
     public static NativeRelayClient forSaved(CredentialRecord record,DeviceVault vault) {
         return forSaved(record,(CredentialStore)vault);
@@ -58,13 +70,14 @@ public final class NativeRelayClient implements SessionRepository {
     static NativeRelayClient forSaved(CredentialRecord record,CredentialStore vault) {
         byte[] secret=record.secret(),rendezvous=record.rendezvousKey();
         CredentialRecord copy;
-        try{copy=new CredentialRecord(record.origin,record.credentialId,record.deviceId,record.version,"reader",secret,record.relayId,rendezvous);}
+        try{copy=new CredentialRecord(record.origin,record.credentialId,record.deviceId,record.version,record.role,secret,record.relayId,rendezvous);}
         finally{Arrays.fill(secret,(byte)0);Arrays.fill(rendezvous,(byte)0);}
         return new NativeRelayClient(copy.origin,copy.relayId,copy.credentialId,copy.version,copy.secret(),copy.rendezvousKey(),0,copy,vault);
     }
     NativeRelayClient(String origin,String relayId,String authId,long version,byte[] secret,byte[] rendezvous,long expires,CredentialRecord saved,CredentialStore vault) {
         this.origin=origin;this.relayId=relayId;this.authId=authId;this.authVersion=version;this.authSecret=secret;this.rendezvous=rendezvous;
         this.invitationExpiry=expires;this.saved=saved;this.vault=vault;
+        if(saved!=null)this.expectedRole=saved.role;
         serial.setRemoveOnCancelPolicy(true);serial.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
     }
     @Override public synchronized void start(Listener listener) {
@@ -132,13 +145,14 @@ public final class NativeRelayClient implements SessionRepository {
     }
     private void finish(JSONObject data)throws Exception {
         boolean enrolling=saved==null;
-        if(!"e2ee_server_finish".equals(str(data,"type"))||number(data,"version")!=2||!"reader".equals(str(data,"role")))throw new IllegalArgumentException();
+        if(!"e2ee_server_finish".equals(str(data,"type"))||number(data,"version")!=2||!expectedRole.equals(str(data,"role")))throw new IllegalArgumentException();
         String locale=str(data,"locale");if(locale.length()>35||!locale.matches("[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*"))throw new IllegalArgumentException();
         String deviceId=str(data,"device_id"),credentialId=str(data,"credential_id");long version=number(data,"credential_version");
         if(saved==null){
             byte[] secret=E2ee.decode(str(data,"credential_secret"),32);
-            try{CredentialRecord record=new CredentialRecord(origin,credentialId,deviceId,version,"reader",secret,relayId,rendezvous);try{vault.save(record);saved=record;}catch(Exception ex){record.close();throw ex;}}finally{Arrays.fill(secret,(byte)0);}
+            try{CredentialRecord record=new CredentialRecord(origin,credentialId,deviceId,version,expectedRole,secret,relayId,rendezvous);try{vault.save(record);saved=record;}catch(Exception ex){record.close();throw ex;}}finally{Arrays.fill(secret,(byte)0);}
         }else if(data.has("credential_secret")||!saved.deviceId.equals(deviceId)||!saved.credentialId.equals(credentialId)||saved.version!=version)throw new IllegalArgumentException();
+        authenticatedRole=expectedRole; if(listener!=null)listener.onAccess(authenticatedRole);
         phase=Phase.APPLICATION;
         if(enrolling)emitState(State.ENROLLED);
         // Wait for authenticated protocol-3 push_config before presenting READY.
@@ -146,13 +160,14 @@ public final class NativeRelayClient implements SessionRepository {
     private void application(JSONObject message)throws Exception {
         String type=str(message,"type");
         switch(type){
-            case "push_config": protocol.acceptConfig(message);handshakeDeadline.cancel(false);if(!closed.get())emitState(State.READY);break;
+            case "push_config": if(pendingMutation!=null)completeMutation(MutationOutcome.UNKNOWN); protocol.acceptConfig(message);handshakeDeadline.cancel(false);if(!closed.get())emitState(State.READY);break;
             case "inventory_status": protocol.acceptInventory(message);pendingTarget=null;emitState(State.CONNECTING);break;
             case "agents": {List<Session> rows=protocol.acceptAgents(message);if(rows!=null){emitState(State.READY);emitSessions(rows);}break;}
             case "agent_update": {List<Session> rows=protocol.acceptAgentUpdate(message);if(rows!=null){emitState(State.READY);emitSessions(rows);}break;}
             case "pane_content": {String text=protocol.acceptPaneContent(message);if(text!=null&&pendingTarget!=null){emitSnapshot(pendingTarget,text);pendingTarget=null;}break;}
             case "pane_unchanged": break;
-            case "error": throw new IllegalArgumentException();
+            case "command_result": acceptMutationResult(message);break;
+            case "error": if(pendingMutation!=null)completeMutation(MutationOutcome.UNKNOWN);throw new IllegalArgumentException();
             default: break; // Other authenticated pushes are not a write API.
         }
     }
@@ -161,12 +176,48 @@ public final class NativeRelayClient implements SessionRepository {
         if(phase!=Phase.APPLICATION||!protocol.ready())return;
         JSONObject command=protocol.readPane(target,UUID.randomUUID().toString());pendingTarget=target;sendLogical(channel.encrypt(command.toString()));
     });}
+    @Override public String sendTerminalText(SessionTarget target,String text){return submitInput(target,text,false);}
+    @Override public String sendEnter(SessionTarget target){return submitInput(target,null,true);}
+    private String submitInput(SessionTarget target,String text,boolean enter){
+        String id=UUID.randomUUID().toString();
+        if(closed.get() || !inputReserved.compareAndSet(false,true)) {notifyMutation(id,target,MutationOutcome.NOT_STARTED);return id;}
+        enqueue(()->{
+            if(phase!=Phase.APPLICATION || !"controller".equals(authenticatedRole) || inputUncertain || !protocol.inputReady(target) || (!enter&&!NativeSessionProtocol.validInputText(text))) {
+                inputReserved.set(false);notifyMutation(id,target,MutationOutcome.NOT_STARTED);return;
+            }
+            JSONObject command=protocol.input(target,id,text,enter);
+            pendingMutation=new Mutation(id,enter?"send_keys":"send_terminal_text",target);
+            // Once attempting a socket write, any failure may have delivered bytes.
+            pendingMutation.timer=serial.schedule(()->completeMutation(MutationOutcome.UNKNOWN),15,TimeUnit.SECONDS);
+            try {sendLogical(channel.encrypt(command.toString()));}catch(Exception failure){completeMutation(MutationOutcome.UNKNOWN);throw failure;}
+        });
+        return id;
+    }
+    private void acceptMutationResult(JSONObject data)throws Exception {
+        Mutation m=pendingMutation;
+        if(m==null || !m.id.equals(data.opt("request_id")))return;
+        if(!m.action.equals(data.opt("action")) || !m.target.paneId.equals(data.opt("pane_id")) || !protocol.currentInputTarget(m.target)) {completeMutation(MutationOutcome.UNKNOWN);return;}
+        Object ok=data.opt("ok"); String phase=data.optString("phase","");
+        if(Boolean.TRUE.equals(ok)&&"completed".equals(phase))completeMutation(MutationOutcome.COMPLETED);
+        else if("accepted".equals(phase))return;
+        else completeMutation(MutationOutcome.UNKNOWN);
+    }
+    private void completeMutation(MutationOutcome outcome){
+        Mutation m=pendingMutation;if(m==null)return;pendingMutation=null;
+        if(m.timer!=null)m.timer.cancel(false);
+        if(outcome==MutationOutcome.UNKNOWN)inputUncertain=true;
+        inputReserved.set(false);notifyMutation(m.id,m.target,outcome);
+    }
+    private void notifyMutation(String id,SessionTarget target,MutationOutcome outcome){try{if(listener!=null)listener.onMutationResult(id,target,outcome);}catch(RuntimeException ignored){}}
+    @Override public void resetInputUncertainty(SessionTarget target){enqueue(()->{if(pendingMutation==null&&protocol.inputReady(target)){inputUncertain=false;listener.onInputUncertaintyCleared(target);}});}
     private void emitState(State state){if(!closed.get())notifyState(state);}
     private void emitSessions(List<Session> rows){if(!closed.get())listener.onSessions(rows);}
     private void emitSnapshot(SessionTarget target,String text){if(!closed.get())listener.onSnapshot(target,text);}
     private void notifyState(State state){try{if(listener!=null)listener.onState(state,"");}catch(RuntimeException ignored){}}
     private void fail(State state){if(closed.getAndSet(true))return;try{cleanup();}finally{serial.shutdown();notifyState(state);}}
     private void cleanup(){
+        completeMutation(MutationOutcome.UNKNOWN);
+        inputReserved.set(false);
         phase=Phase.CLOSED;
         if(authSecret!=null)Arrays.fill(authSecret,(byte)0);
         Arrays.fill(rendezvous,(byte)0);
