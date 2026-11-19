@@ -13,7 +13,9 @@ import org.junit.Test;
 public final class AndroidCryptoTest {
     @Test public void originalGoldenAndNegativeChecksOnAndroid() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getContext();
-        File fixture = File.createTempFile("synthetic-e2ee-", ".properties", context.getCacheDir());
+        // Instrumentation executes under the target app UID, not the test APK UID.
+        Context target = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        File fixture = File.createTempFile("synthetic-e2ee-", ".properties", target.getCacheDir());
         try {
             try (InputStream in = context.getAssets().open("vector.properties");
                  OutputStream out = new FileOutputStream(fixture)) {

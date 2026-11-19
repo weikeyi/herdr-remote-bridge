@@ -2,11 +2,20 @@ package dev.herdrbridge.protocol;
 import org.junit.Test;
 import static org.junit.Assert.*;
 import java.util.List;
-import java.util.HexFormat;
 import java.util.Arrays;
 
 public class ChunkCodecTest {
-    private byte[] hex(String text) { return HexFormat.of().parseHex(text); }
+    private byte[] hex(String text) {
+        if ((text.length() & 1) != 0) throw new IllegalArgumentException("Odd hex length");
+        byte[] result = new byte[text.length() / 2];
+        for (int i = 0; i < result.length; i++) {
+            int high = Character.digit(text.charAt(i * 2), 16);
+            int low = Character.digit(text.charAt(i * 2 + 1), 16);
+            if (high < 0 || low < 0) throw new IllegalArgumentException("Invalid hex digit");
+            result[i] = (byte) ((high << 4) | low);
+        }
+        return result;
+    }
     @Test public void matchesActualTypescriptExporterVector() {
         byte[] logical=hex("7b2274797065223a2273796e7468657469632d6672616d696e672d6f6e6c79227d");
         String[] expected={"0101000000217b2274797065223a2273","0100796e7468657469632d6672616d69","01026e672d6f6e6c79227d"};

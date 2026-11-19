@@ -64,3 +64,15 @@ emulation are not implemented.
 
 No live user endpoints were contacted, no invitations issued, and no server or
 Windows deployment was modified for these tests.
+
+## First actual Android 10 run
+
+Commit `a5232882`, run 44499480450, successfully built and passed the real-WSS
+CI gate. Its AOSP API 29 emulator booted and executed all eleven tests: seven
+passed, including the AndroidKeyStore case and all four actual Activity/lifecycle
+cases. Four test-harness failures remained: three chunk tests used desktop-only
+`HexFormat`, and the crypto fixture tried to write the test APK's cache while
+executing under the target app UID. The subsequent patch uses a strict portable
+hex decoder and the target app cache, enables lint inspection of test sources,
+and preserves every original assertion. Local chunk tests and the full aggregate
+pass; the corrected eleven-test Android run still needs verification.

@@ -28,6 +28,7 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
     lint {
+        checkTestSources true
         abortOnError true
         warningsAsErrors false
     }
