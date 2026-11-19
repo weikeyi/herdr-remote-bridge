@@ -1,0 +1,10 @@
+Bridge Android Preview is an independent WebView client for a user-hosted
+Herdr Remote Bridge PWA. It is not the official Herdr Android application and
+is not endorsed by its authors.
+
+This Android client is provided under GNU AGPL version 3 or later.
+Its interoperability reference is weikeyi/herdr-remote-bridge commit
+4e80d943579c7213cce78dedeb87df04a428f649, based on Herdr Mobile Relay by
+Christophe Vidal. The hosted PWA remains a separate, AGPL-licensed component;
+its source and notices are available in that Bridge branch. No hosted PWA
+bundle or upstream executable is embedded in this APK.
