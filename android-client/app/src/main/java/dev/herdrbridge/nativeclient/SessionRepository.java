@@ -6,7 +6,7 @@ import java.util.Objects;
 /** Read-only boundary. Implementations must deliver only authenticated exact-target snapshots.
  * Callbacks may arrive off the UI thread; no write, resize, upload or delta API exists. */
 public interface SessionRepository extends AutoCloseable {
-    enum State { DISCONNECTED, CONNECTING, READY, REVOKED, ERROR }
+    enum State { DISCONNECTED, CONNECTING, ENROLLED, READY, REVOKED, ERROR }
     interface Listener {
         void onSessions(List<Session> sessions);
         void onSnapshot(SessionTarget target, String content);

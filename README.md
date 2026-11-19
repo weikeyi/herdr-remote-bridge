@@ -37,7 +37,8 @@ verification remains enabled. No certificate bypass, cleartext, remote HTML,
 external invitation intents, clipboard scraping or secret logging is permitted.
 Only Reader enrollment is accepted. Reconnect always negotiates fresh ephemeral
 keys. Invitations are transient and are not stored. App backgrounding stops the
-connection; connecting again requires a user action.
+connection. Previously authorized, identity-bound saved credentials can recover
+automatically in the foreground with bounded backoff; Disconnect disables it.
 
 Synthetic fixture keys are public test data, not production secrets. Never put
 real invitations, VPS addresses, terminal content or credentials in tests, issues,

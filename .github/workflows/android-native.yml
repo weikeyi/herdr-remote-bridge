@@ -29,6 +29,16 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: weikeyi/herdr-remote-bridge
+          ref: 4e80d943579c7213cce78dedeb87df04a428f649
+          path: audit-reference
+          persist-credentials: false
       - name: Bootstrap checksum-pinned Android SDK
         run: bash scripts/setup-ci-sdk.sh
       - name: Verify Gradle wrapper JAR
@@ -37,6 +47,14 @@ jobs:
         run: bash ../java/test.sh
       - name: Assemble, lint and unit tests
         run: bash ./gradlew --no-daemon --console=plain assembleDebug lintDebug testDebugUnitTest assembleDebugAndroidTest
+      - name: Real WSS pairing, list, snapshot, reconnect and TLS rejection
+        env:
+          RELAY_SOURCE: ${{ github.workspace }}/audit-reference
+        run: |
+          set -euo pipefail
+          mkdir -p app/build/reports/wss
+          export ANDROID_JAR="$ANDROID_HOME/platforms/android-37.0/android.jar"
+          bash ../java/integration/wss/test.sh 2>&1 | tee app/build/reports/wss/trace.txt
       - name: Inspect debug APK permissions
         run: |
           set -euo pipefail
@@ -142,16 +160,18 @@ jobs:
               metadata = json.load(stream)
           assert metadata["source_commit"] == subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           PYVERIFY
-      - name: Android JCA, chunking and KeyStore acceptance on emulator
+      - name: Android 10 JCA, chunking, KeyStore and native UI acceptance
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
-          api-level: 36
+          api-level: 29
           arch: x86_64
-          target: google_apis
+          target: default
           # Avoid optional settings-service writes during slow software boot.
           disable-animations: false
           disable-linux-hw-accel: auto
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          # Software-only AOSP lane; does not change host KVM permissions.
+          # API 29 runtime coverage is not a claim of API 28 or modern-device acceptance.
+          emulator-options: -no-window -gpu swiftshader -feature -Vulkan -accel off -no-audio -no-snapshot -no-boot-anim -camera-back none -memory 2048 -cores 2 -skin 480x800
           script: cd android-client && bash scripts/run-ci-instrumentation.sh
       - name: Upload synthetic instrumentation results
         if: always()

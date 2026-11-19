@@ -1,6 +1,5 @@
 package dev.herdrbridge.nativeclient;
 
-import android.os.SystemClock;
 import dev.herdrbridge.protocol.E2ee;
 import dev.herdrbridge.protocol.ChunkCodec;
 import okhttp3.*;
@@ -40,6 +39,9 @@ public final class NativeRelayClient implements SessionRepository {
     private ScheduledFuture<?> handshakeDeadline,chunkTimer;
 
     public static NativeRelayClient forInvitation(String origin,String invitationUrl,DeviceVault vault)throws Exception {
+        return forInvitation(origin,invitationUrl,(CredentialStore)vault);
+    }
+    static NativeRelayClient forInvitation(String origin,String invitationUrl,CredentialStore vault)throws Exception {
         String canonical=InvitationValidator.origin(origin);
         InvitationValidator.invitation(invitationUrl,canonical,System.currentTimeMillis());
         Map<String,String> fields=new HashMap<>();
@@ -51,6 +53,9 @@ public final class NativeRelayClient implements SessionRepository {
             E2ee.decode(fields.get("setup"),32),E2ee.decode(fields.get("rendezvous"),32),Long.parseLong(fields.get("invite_expires")),null,vault);
     }
     public static NativeRelayClient forSaved(CredentialRecord record,DeviceVault vault) {
+        return forSaved(record,(CredentialStore)vault);
+    }
+    static NativeRelayClient forSaved(CredentialRecord record,CredentialStore vault) {
         byte[] secret=record.secret(),rendezvous=record.rendezvousKey();
         CredentialRecord copy;
         try{copy=new CredentialRecord(record.origin,record.credentialId,record.deviceId,record.version,"reader",secret,record.relayId,rendezvous);}
@@ -68,20 +73,21 @@ public final class NativeRelayClient implements SessionRepository {
         enqueue(()->{
             if(invitationExpiry!=0&&invitationExpiry<=System.currentTimeMillis())throw new IllegalStateException("Invitation expired");
             phase=Phase.GATEWAY_HELLO;emitState(State.CONNECTING);
-            handshakeDeadline=serial.schedule(()->fail(State.ERROR),20,TimeUnit.SECONDS);
-            chunkTimer=serial.scheduleWithFixedDelay(()->{try{chunks.tick(SystemClock.elapsedRealtime());}catch(Exception e){fail(State.ERROR);}},1,1,TimeUnit.SECONDS);
+            handshakeDeadline=serial.schedule(()->fail(State.DISCONNECTED),20,TimeUnit.SECONDS);
+            chunkTimer=serial.scheduleWithFixedDelay(()->{try{chunks.tick(TimeUnit.NANOSECONDS.toMillis(System.nanoTime()));}catch(Exception e){fail(State.ERROR);}},1,1,TimeUnit.SECONDS);
             String endpoint="wss"+origin.substring(5)+"/connect";
             Request request=new Request.Builder().url(endpoint).header("Origin",origin).build();
             socket=http.newWebSocket(request,new WebSocketListener(){
                 @Override public void onOpen(WebSocket ws,Response response){if(closed.get())ws.cancel();}
                 @Override public void onMessage(WebSocket ws,String text){if(text.length()>8192){enqueue(()->{throw new IllegalArgumentException();});return;}enqueue(()->receiveText(text));}
                 @Override public void onMessage(WebSocket ws,ByteString data){if(data.size()>ChunkCodec.MAX_CHUNK_BYTES){enqueue(()->{throw new IllegalArgumentException();});return;}enqueue(()->receiveBinary(data.toByteArray()));}
-                @Override public void onFailure(WebSocket ws,Throwable ignored,Response response){enqueue(()->fail(State.DISCONNECTED));}
-                @Override public void onClosed(WebSocket ws,int code,String ignored){enqueue(()->fail(State.DISCONNECTED));}
-                @Override public void onClosing(WebSocket ws,int code,String ignored){ws.close(1000,null);enqueue(()->fail(State.DISCONNECTED));}
+                @Override public void onFailure(WebSocket ws,Throwable ignored,Response response){enqueue(()->fail(ignored instanceof javax.net.ssl.SSLException||response!=null?State.ERROR:State.DISCONNECTED));}
+                @Override public void onClosed(WebSocket ws,int code,String ignored){enqueue(()->fail(closeState(code)));}
+                @Override public void onClosing(WebSocket ws,int code,String ignored){ws.close(1000,null);enqueue(()->fail(closeState(code)));}
             });
         });
     }
+    private static State closeState(int code){return code==1000||code==1001||code==1006||code==1011||code==1012||code==1013?State.DISCONNECTED:State.ERROR;}
     private interface Work {void run()throws Exception;}
     private void enqueue(Work work){
         if(closed.get())return;
@@ -112,7 +118,7 @@ public final class NativeRelayClient implements SessionRepository {
     }
     private void receiveBinary(byte[] piece)throws Exception {
         if(phase!=Phase.SERVER_HELLO&&phase!=Phase.SERVER_FINISH&&phase!=Phase.APPLICATION)throw new IllegalArgumentException();
-        byte[] logical=chunks.push(piece,SystemClock.elapsedRealtime());if(logical==null)return;
+        byte[] logical=chunks.push(piece,TimeUnit.NANOSECONDS.toMillis(System.nanoTime()));if(logical==null)return;
         if(phase==Phase.SERVER_HELLO){
             if(logical.length>8192)throw new IllegalArgumentException();
             JSONObject hello=StrictJson.object(StandardCharsets.UTF_8.newDecoder().onMalformedInput(java.nio.charset.CodingErrorAction.REPORT).decode(java.nio.ByteBuffer.wrap(logical)).toString());
@@ -125,6 +131,7 @@ public final class NativeRelayClient implements SessionRepository {
         }
     }
     private void finish(JSONObject data)throws Exception {
+        boolean enrolling=saved==null;
         if(!"e2ee_server_finish".equals(str(data,"type"))||number(data,"version")!=2||!"reader".equals(str(data,"role")))throw new IllegalArgumentException();
         String locale=str(data,"locale");if(locale.length()>35||!locale.matches("[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*"))throw new IllegalArgumentException();
         String deviceId=str(data,"device_id"),credentialId=str(data,"credential_id");long version=number(data,"credential_version");
@@ -133,6 +140,7 @@ public final class NativeRelayClient implements SessionRepository {
             try{CredentialRecord record=new CredentialRecord(origin,credentialId,deviceId,version,"reader",secret,relayId,rendezvous);try{vault.save(record);saved=record;}catch(Exception ex){record.close();throw ex;}}finally{Arrays.fill(secret,(byte)0);}
         }else if(data.has("credential_secret")||!saved.deviceId.equals(deviceId)||!saved.credentialId.equals(credentialId)||saved.version!=version)throw new IllegalArgumentException();
         phase=Phase.APPLICATION;
+        if(enrolling)emitState(State.ENROLLED);
         // Wait for authenticated protocol-3 push_config before presenting READY.
     }
     private void application(JSONObject message)throws Exception {
