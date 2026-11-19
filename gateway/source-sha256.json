@@ -1,0 +1,17 @@
+{
+  "frontend/src/lib/transports/gateway.ts": "aba8569acb974433f063f4d4f121ab48d67c195dde2c70088f79bee6efe862d6",
+  "frontend/src/lib/transports/chunking.ts": "30a6f2be08733e2f0fe9bed7e09a8737f64f67ded9dd404527d8a5fe140557a0",
+  "frontend/src/lib/transports/encrypted.ts": "8e7a0b5ca31144c836aac733b8b0f95ff4aa75a075383bdae9d05581fe134767",
+  "frontend/src/lib/gateway-credentials.ts": "118b4bfb8d0344626b4ef501dbde7653adbf9816127a66a373d4a8e74567cfbe",
+  "frontend/src/lib/protocol.ts": "d795810ece3714586cf24a6aca9aafdc1fb63bb317b8638e784b67133b34ef6e",
+  "frontend/src/lib/store.ts": "8c4caba0e4b2756117c5cee92d7cd351b92a3a7c08d0577eebee5253e8febd10",
+  "frontend/src/lib/resource-id.ts": "305963a01c5691848a79ed28b1fbed10543d10e1596b547454ab7944bcaaa766",
+  "internal/gatewaywire/gatewaywire.go": "51ec2cfa93bce152bbfb4ae8d5c714672f65ba00a1d88e753142c55df42aeeb4",
+  "internal/gateway/client.go": "c6e04ae6232fc9d4ec2d77ecc5a340aa475125d8f3ee6a03921029f7700a2926",
+  "internal/app/server.go": "e923393bd4bd6117216174275037d8ef5595ce69d2ce9caefcf5d2330c75ff7a",
+  "internal/app/pane_watch.go": "afd1556f55f5922d567f6f0c3ef15a5b82039adcd1f2cbd9cd296d93511fb099",
+  "internal/coordinator/state.go": "1f9cba68e37481e19212a7f264bf8b3810c076aa5e0a2b34a187cad36bbc8213",
+  "internal/coordinator/dispatch.go": "bc02c6cb0e0e67b68bb68be8b2112a8479d423eac44792ce16a0115916ff6731",
+  "internal/protocol/protocol.go": "4b504b993c0fc9ba8fd95349edfa009897c9fe67e6255b6200760f458be7cc0d",
+  "internal/panedelta/delta.go": "0bec6bf5113608ad69dc52b3f0ca6594f37a9c565b57a3b3f49ec5fed56c46be"
+}

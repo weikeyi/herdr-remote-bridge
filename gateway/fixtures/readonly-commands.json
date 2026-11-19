@@ -1,0 +1,67 @@
+[
+  {
+    "protocol": 3,
+    "type": "refresh_agents"
+  },
+  {
+    "content_fingerprint": "",
+    "format": "ansi",
+    "lines": 80,
+    "pane_id": "synthetic-pane",
+    "protocol": 3,
+    "request_id": "synthetic-read-001",
+    "server_session_id": "synthetic-server-session",
+    "target": {
+      "agent_session_id": "synthetic-agent-session",
+      "generation": 1,
+      "pane_id": "synthetic-pane",
+      "server_session_id": "synthetic-server-session",
+      "terminal_id": "synthetic-terminal"
+    },
+    "type": "read_pane"
+  },
+  {
+    "content_fingerprint": "synthetic-observed-fingerprint",
+    "format": "ansi",
+    "interval_ms": 1000,
+    "lines": 80,
+    "pane_id": "synthetic-pane",
+    "protocol": 3,
+    "server_session_id": "synthetic-server-session",
+    "target": {
+      "agent_session_id": "synthetic-agent-session",
+      "generation": 1,
+      "pane_id": "synthetic-pane",
+      "server_session_id": "synthetic-server-session",
+      "terminal_id": "synthetic-terminal"
+    },
+    "type": "watch_pane"
+  },
+  {
+    "content_fingerprint": "synthetic-observed-fingerprint",
+    "pane_id": "synthetic-pane",
+    "protocol": 3,
+    "server_session_id": "synthetic-server-session",
+    "target": {
+      "agent_session_id": "synthetic-agent-session",
+      "generation": 1,
+      "pane_id": "synthetic-pane",
+      "server_session_id": "synthetic-server-session",
+      "terminal_id": "synthetic-terminal"
+    },
+    "type": "pane_applied"
+  },
+  {
+    "pane_id": "synthetic-pane",
+    "protocol": 3,
+    "server_session_id": "synthetic-server-session",
+    "target": {
+      "agent_session_id": "synthetic-agent-session",
+      "generation": 1,
+      "pane_id": "synthetic-pane",
+      "server_session_id": "synthetic-server-session",
+      "terminal_id": "synthetic-terminal"
+    },
+    "type": "unwatch_pane"
+  }
+]

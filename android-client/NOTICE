@@ -1,0 +1,7 @@
+Bridge Native Internal is an independent, unfinished native Android client,
+licensed under GNU AGPL version 3 or later. It is not an official Herdr app.
+InvitationValidator and its tests are reused from this project's Android Preview
+prototype (android-poc), with package renaming and a native handoff comment.
+No WebView, hosted PWA bundle or upstream executable is embedded.
+Protocol interoperability references Herdr Mobile Relay, originally by
+Christophe Vidal, through the project's bridge/windows-acceptance branch.

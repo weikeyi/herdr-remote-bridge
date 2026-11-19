@@ -1,0 +1,12 @@
+{
+  "current": "first\nsecond\nthird\nnew\n",
+  "previous": "first\nsecond\nthird\nold\n",
+  "segments": [
+    {
+      "copy_lines": 3
+    },
+    {
+      "text": "new\n"
+    }
+  ]
+}
