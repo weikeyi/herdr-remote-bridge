@@ -90,3 +90,19 @@ authored and compiled, including generated PNG decoding, blocked-pipe
 cancellation, stale/invalid picker results, current-origin validation and Reader
 layout/explicit clipboard behavior. Runtime verification of those seven new
 cases must not be inferred from compilation or the previous eleven-test pass.
+
+## QR revision actual runtime result (6d70ea28)
+
+Run 44506025231 build, 42 JVM tests, lint and real-WSS/Go parity passed.
+The first instrumentation attempt timed out installing the APK after emulator
+boot, executing zero tests. The bounded retry executed all eighteen tests:
+seventeen passed, including QR BitmapFactory decoding/cancellation, invitation
+origin checks, KeyStore and foreground recovery. The clipboard UI test failed
+because getPrimaryClip returned null. The next patch investigates Android 10's
+focused-window clipboard requirement without dropping the real clipboard assertion.
+
+Android Activity/lifecycle/vault tests and host-JVM real WSS are separate verified
+legs, not one integrated Activity → WSS → AndroidKeyStore acceptance trace.
+Physical Android/user Windows/VPS acceptance remains pending. An isolated test
+CA would require a separate acceptance-only build variant; the delivered APK
+must retain system-only trust and must not include that CA or a TLS bypass.

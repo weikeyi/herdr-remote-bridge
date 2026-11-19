@@ -27,6 +27,21 @@ public class ReaderQrUiTest {
     private static void set(Activity a,String name,Object value){try{Field f=MainActivity.class.getDeclaredField(name);f.setAccessible(true);f.set(a,value);}catch(Exception e){throw new AssertionError(e);}}
     private static void call(Activity a,String name,Class<?>[] types,Object...args){try{Method m=MainActivity.class.getDeclaredMethod(name,types);m.setAccessible(true);m.invoke(a,args);}catch(Exception e){throw new AssertionError(e);}}
 
+    private static void awaitWindowFocus(ActivityScenario<MainActivity> scenario){
+        // RESUMED/onActivity alone does not mean WindowManager has granted input focus.
+        // Android 10+ permits clipboard reads only for the focused app or current IME.
+        // https://developer.android.com/about/versions/10/privacy/changes#clipboard-data
+        long deadline=SystemClock.uptimeMillis()+5000;
+        java.util.concurrent.atomic.AtomicBoolean focused=new java.util.concurrent.atomic.AtomicBoolean();
+        do{
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+            scenario.onActivity(a->focused.set(a.hasWindowFocus()));
+            if(focused.get())return;
+            SystemClock.sleep(50); // Instrumentation thread only; never blocks Activity callbacks.
+        }while(SystemClock.uptimeMillis()<deadline);
+        fail("Activity did not obtain window focus required for a real clipboard read");
+    }
+
     @Test public void localPickerContractAndCancelledStaleNonContentResultsFailClosed(){
         for(int api:new int[]{28,33}){
             Intent intent=MainActivity.imagePickerIntent(api);
@@ -86,9 +101,14 @@ public class ReaderQrUiTest {
                 assertFalse(((Button)field(a,"copy")).isEnabled());
                 call(a,"displaySnapshot",new Class<?>[]{SessionRepository.SessionTarget.class,String.class},target,"\u001b[31msynthetic snapshot\u001b[0m");
                 assertEquals("synthetic snapshot",((TextView)field(a,"terminal")).getText().toString());
-                ((Button)field(a,"copy")).performClick();
+            });
+            awaitWindowFocus(scenario);
+            scenario.onActivity(a->{
+                assertTrue("Clipboard check requires the app's focused window",a.hasWindowFocus());
+                Button copy=(Button)field(a,"copy");assertTrue(copy.isEnabled());assertTrue(copy.performClick());
+                assertTrue("Production copy handler must run",((TextView)field(a,"state")).getText().toString().contains("已复制"));
                 ClipboardManager clipboard=(ClipboardManager)a.getSystemService(Context.CLIPBOARD_SERVICE);
-                try{ClipData clip=clipboard.getPrimaryClip();assertNotNull(clip);assertEquals("synthetic snapshot",clip.getItemAt(0).getText().toString());if(Build.VERSION.SDK_INT>=33)assertTrue(clip.getDescription().getExtras().getBoolean(ClipDescription.EXTRA_IS_SENSITIVE));}
+                try{ClipData clip=clipboard.getPrimaryClip();assertNotNull("Explicit copy must reach the real system clipboard while focused",clip);assertEquals("synthetic snapshot",clip.getItemAt(0).getText().toString());if(Build.VERSION.SDK_INT>=33)assertTrue(clip.getDescription().getExtras().getBoolean(ClipDescription.EXTRA_IS_SENSITIVE));}
                 finally{clipboard.clearPrimaryClip();}
             });
             InstrumentationRegistry.getInstrumentation().waitForIdleSync();
