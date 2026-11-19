@@ -1,0 +1,19 @@
+{
+  "client_connect": {
+    "type": "connect",
+    "proto": 1,
+    "relay_id": "aeHNknfyRl9qBmmBr08nxA",
+    "proof": "AiRmLArmdTV9GBEjgTmaSEF6CFb53g9zqxNqplonbTc"
+  },
+  "rendezvous_key": "VTVWBKngafGtPAWDgpQWiAIVZ5m9r_EPjgY2WgwgJ8c",
+  "server_hello": {
+    "type": "gateway_hello",
+    "proto": 1,
+    "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+  },
+  "server_ready": {
+    "type": "ready",
+    "proto": 1
+  },
+  "synthetic_relay_key": "synthetic-native-fixture-key-0001"
+}

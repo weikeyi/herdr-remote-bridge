@@ -1,0 +1,24 @@
+package dev.herdrbridge.nativeclient;
+import org.junit.Test;
+import java.util.*;
+import static org.junit.Assert.*;
+public class ForegroundConnectionTest {
+ static class Repo implements SessionRepository {Listener listener;boolean closed;public void start(Listener l){listener=l;}public void close(){closed=true;}public void requestSnapshot(SessionTarget t){}void state(State s){listener.onState(s,"");}}
+ static class Clock implements ForegroundConnection.Scheduler {Runnable pending;long delay;public void execute(Runnable r){r.run();}public void after(long d,Runnable r){delay=d;pending=r;}public void cancel(Runnable r){if(pending==r)pending=null;}void tick(){Runnable r=pending;pending=null;if(r!=null)r.run();}}
+ static class Rig implements ForegroundConnection.Factory,SessionRepository.Listener {boolean saved=true;int opens,snapshots,lists;Repo repo;Clock clock=new Clock();SessionRepository.State state;ForegroundConnection c=new ForegroundConnection(this,clock,this,()->0.5);public boolean hasSaved(){return saved;}public SessionRepository saved(){opens++;repo=new Repo();return repo;}public void onState(SessionRepository.State s,String x){state=s;}public void onSessions(List<SessionRepository.Session> s){lists++;}public void onSnapshot(SessionRepository.SessionTarget t,String x){snapshots++;}void begin(){c.foreground();c.explicitSaved();}}
+ @Test public void noInitialAutoConnectAndForegroundRecoveryUsesFreshSavedClient(){Rig r=new Rig();r.c.foreground();assertEquals(0,r.opens);r.c.explicitSaved();Repo first=r.repo;r.c.background();assertTrue(first.closed);r.c.foreground();assertEquals(2,r.opens);assertNotSame(first,r.repo);}
+ @Test public void disconnectBackoffIsBoundedAndBackgroundCancelsStaleTimer(){Rig r=new Rig();r.begin();r.repo.state(SessionRepository.State.DISCONNECTED);assertEquals(1125,r.clock.delay);Runnable stale=r.clock.pending;r.c.background();assertNull(r.clock.pending);stale.run();assertEquals(1,r.opens);r.c.foreground();for(int i=2;i<5;i++){r.repo.state(SessionRepository.State.DISCONNECTED);assertNotNull(r.clock.pending);r.clock.tick();}r.repo.state(SessionRepository.State.DISCONNECTED);assertNull(r.clock.pending);int count=r.opens;r.c.background();r.c.foreground();assertEquals(count,r.opens);}
+ @Test public void fatalAndRevokedDisableRecovery(){for(SessionRepository.State state:new SessionRepository.State[]{SessionRepository.State.ERROR,SessionRepository.State.REVOKED}){Rig r=new Rig();r.begin();r.repo.state(state);assertTrue(r.repo.closed);assertNull(r.clock.pending);r.c.background();r.c.foreground();assertEquals(1,r.opens);}}
+ @Test public void invitationIsNeverRetriedAndEnrollmentRequiresFreshCredential(){Rig r=new Rig();r.saved=false;r.c.foreground();Repo invite=new Repo();r.c.explicitInvitation(invite);invite.state(SessionRepository.State.READY);assertNotEquals(SessionRepository.State.READY,r.state);invite.state(SessionRepository.State.DISCONNECTED);assertNull(r.clock.pending);assertEquals(0,r.opens);Repo next=new Repo();r.c.explicitInvitation(next);r.saved=true;next.state(SessionRepository.State.ENROLLED);assertTrue(next.closed);assertEquals(1,r.opens);assertNotEquals(SessionRepository.State.READY,r.state);r.repo.state(SessionRepository.State.READY);assertEquals(SessionRepository.State.READY,r.state);}
+ @Test public void staleCallbacksCannotRestoreOldOutputOrRestartConnection(){Rig r=new Rig();r.begin();Repo old=r.repo;r.c.background();r.c.foreground();old.state(SessionRepository.State.READY);old.state(SessionRepository.State.ERROR);old.listener.onSessions(Collections.emptyList());old.listener.onSnapshot(null,"old");assertEquals(0,r.lists);assertEquals(0,r.snapshots);r.repo.state(SessionRepository.State.READY);assertEquals(SessionRepository.State.READY,r.state);}
+ @Test public void explicitStopCancelsRecoveryAndBackgroundEnrollmentUsesOnlySaved(){Rig r=new Rig();r.saved=false;r.c.foreground();Repo invite=new Repo();r.c.explicitInvitation(invite);r.c.background();r.saved=true;invite.state(SessionRepository.State.ENROLLED);assertEquals(0,r.opens);r.c.foreground();assertEquals(1,r.opens);r.c.stop();r.c.foreground();assertEquals(1,r.opens);}
+ @Test public void restoredBudgetCannotResetFailuresButSavedReadyResetsOutage(){
+  Rig r=new Rig();java.util.List<Integer> savedCounts=new ArrayList<>();
+  r.c=new ForegroundConnection(r,r.clock,r,()->0.5,savedCounts::add);
+  r.c.foreground();r.c.restoreSaved(4);assertEquals(1,r.opens);assertEquals(Integer.valueOf(5),savedCounts.get(0));
+  r.repo.state(SessionRepository.State.DISCONNECTED);assertNull(r.clock.pending);r.c.background();r.c.foreground();assertEquals(1,r.opens);
+  r.c.explicitSaved();r.repo.state(SessionRepository.State.READY);assertEquals(Integer.valueOf(0),savedCounts.get(savedCounts.size()-1));
+  r.repo.state(SessionRepository.State.DISCONNECTED);assertEquals(1125,r.clock.delay);
+ }
+
+}

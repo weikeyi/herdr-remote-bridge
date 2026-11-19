@@ -1,0 +1,17 @@
+{
+  "agent": "claude",
+  "cwd": "/home/user/project",
+  "host": "localhost",
+  "pane_id": "pane-1",
+  "project": "project",
+  "raw_pane_id": "pane-1",
+  "session": "",
+  "session_name": "",
+  "status": "working",
+  "tab_id": "tab-1",
+  "tab_label": "main",
+  "tab_number": 1,
+  "type": "agent_update",
+  "updated_at": 1753178400000,
+  "workspace_id": "ws-1"
+}

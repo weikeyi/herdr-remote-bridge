@@ -1,0 +1,17 @@
+Bridge Native Internal is an independent, unfinished native Android client,
+licensed under GNU AGPL version 3 or later. It is not an official Herdr app.
+InvitationValidator and its tests are reused from this project's Android Preview
+prototype (android-poc), with package renaming and a native handoff comment.
+No WebView, hosted PWA bundle or upstream executable is embedded.
+Protocol interoperability references Herdr Mobile Relay, originally by
+Christophe Vidal, through the project's bridge/windows-acceptance branch.
+
+ZXing core 3.5.4, Copyright ZXing authors, is used for offline QR decoding.
+Source: https://github.com/zxing/zxing/tree/zxing-3.5.4
+Its license and bundled third-party notices are included in app assets at
+third-party/ZXing-LICENSE.txt. No ZXing camera, web or Android integration module is used.
+
+Production dependency coordinates and official license/source links are included
+in app assets at third-party/THIRD_PARTY_NOTICES.txt. Apache-2.0.txt preserves the
+full license for OkHttp, Okio, Kotlin and the listed annotation/AndroidX runtime
+components; ZXing-LICENSE.txt additionally preserves its bundled notices.

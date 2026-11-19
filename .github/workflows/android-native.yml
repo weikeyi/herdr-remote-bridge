@@ -1,0 +1,228 @@
+name: Independent native Android client
+
+on:
+  push:
+    branches: [dev, 'android/**']
+    paths: ['android-client/**', 'java/**', '.github/workflows/android-native.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-native-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: android-client
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: weikeyi/herdr-remote-bridge
+          ref: 4e80d943579c7213cce78dedeb87df04a428f649
+          path: audit-reference
+          persist-credentials: false
+      - name: Bootstrap checksum-pinned Android SDK
+        run: bash scripts/setup-ci-sdk.sh
+      - name: Verify Gradle wrapper JAR
+        run: sha256sum -c gradle/wrapper/gradle-wrapper.jar.sha256
+      - name: Verify original crypto vectors
+        run: bash ../java/test.sh
+      - name: Assemble, lint and unit tests
+        run: bash ./gradlew --no-daemon --console=plain assembleDebug lintDebug testDebugUnitTest assembleDebugAndroidTest
+      - name: Real WSS pairing, list, snapshot, reconnect and TLS rejection
+        env:
+          RELAY_SOURCE: ${{ github.workspace }}/audit-reference
+        run: |
+          set -euo pipefail
+          mkdir -p app/build/reports/wss
+          export ANDROID_JAR="$ANDROID_HOME/platforms/android-37.0/android.jar"
+          bash ../java/integration/wss/test.sh 2>&1 | tee app/build/reports/wss/trace.txt
+      - name: Controller text and separate Enter without reconnect replay
+        env:
+          RELAY_SOURCE: ${{ github.workspace }}/audit-reference
+          HARNESS_ROLE: controller
+        run: |
+          set -euo pipefail
+          export ANDROID_JAR="$ANDROID_HOME/platforms/android-37.0/android.jar"
+          bash ../java/integration/wss/test.sh 2>&1 | tee app/build/reports/wss/controller-trace.txt
+      - name: Unchanged server role, exact-target and dispatch enforcement
+        env:
+          RELAY_SOURCE: ${{ github.workspace }}/audit-reference
+        run: |
+          set -euo pipefail
+          bash ../java/integration/wss/original-enforcement.sh 2>&1 | tee app/build/reports/wss/server-enforcement.txt
+      - name: Inspect debug APK permissions
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump permissions app/build/outputs/apk/debug/app-debug.apk | tee app/build/apk-permissions.txt
+          test "$(grep -c '^uses-permission:' app/build/apk-permissions.txt)" = 1
+          grep -qx "uses-permission: name='android.permission.INTERNET'" app/build/apk-permissions.txt
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging app/build/outputs/apk/debug/app-debug.apk > app/build/apk-badging.txt
+          if grep -q '^application-debuggable' app/build/apk-badging.txt; then echo 'Preview must not be debuggable'; exit 1; fi
+      - name: Record source and debug-signing identity
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs app/build/outputs/apk/debug/app-debug.apk > app/build/outputs/apk/debug/signing-certificate.txt
+          python3 - <<'PYMETA'
+          import json, pathlib, subprocess
+          metadata = {
+              "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "version_name": "0.1.0-internal-native", "version_code": 1,
+              "gradle": "9.3.1", "agp": "9.1.1", "compile_sdk": 37, "target_sdk": 36,
+              "build_tools": "36.0.0", "java": "17", "signing": "ephemeral CI debug key", "debuggable": False,
+              "warning": "Not a signed production release. Different runs may use different debug certificates; in-place updates are not guaranteed."
+          }
+          pathlib.Path("app/build/outputs/apk/debug/build-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          PYMETA
+      - name: Create APK checksum
+        run: |
+          cd app/build/outputs/apk/debug
+          sha256sum app-debug.apk > SHA256SUMS
+      - name: Upload internal native APK (not device-accepted release)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bridge-native-internal-apk-${{ github.run_id }}
+          path: |
+            android-client/app/build/outputs/apk/debug/app-debug.apk
+            android-client/app/build/outputs/apk/debug/SHA256SUMS
+            android-client/app/build/outputs/apk/debug/build-metadata.json
+            android-client/app/build/outputs/apk/debug/signing-certificate.txt
+          retention-days: 14
+          if-no-files-found: error
+      - name: Prepare exact device-test APK inputs
+        run: |
+          set -euo pipefail
+          mkdir -p app/build/device-inputs
+          cp app/build/outputs/apk/debug/app-debug.apk app/build/device-inputs/
+          cp app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk app/build/device-inputs/
+          cp app/build/outputs/apk/debug/build-metadata.json app/build/device-inputs/
+          cd app/build/device-inputs
+          sha256sum app-debug.apk app-debug-androidTest.apk build-metadata.json > SHA256SUMS
+      - name: Upload same-run device-test inputs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-device-inputs-${{ github.run_id }}
+          path: android-client/app/build/device-inputs/
+          retention-days: 1
+          if-no-files-found: error
+      - name: Upload test reports only
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-native-reports-${{ github.run_id }}
+          path: |
+            android-client/app/build/reports/
+            android-client/app/build/test-results/
+            android-client/app/build/apk-permissions.txt
+          retention-days: 1
+          if-no-files-found: ignore
+
+  instrumentation:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Verify Gradle wrapper JAR
+        working-directory: android-client
+        run: sha256sum -c gradle/wrapper/gradle-wrapper.jar.sha256
+      - name: Bootstrap checksum-pinned Android SDK
+        working-directory: android-client
+        run: bash scripts/setup-ci-sdk.sh
+      - name: Test instrumentation result parser
+        working-directory: android-client
+        run: python3 scripts/test-check-instrumentation.py
+      - name: Download exact APKs from this run's successful build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: android-device-inputs-${{ github.run_id }}
+          path: android-client/app/build/device-inputs
+      - name: Verify test inputs and source identity
+        working-directory: android-client
+        run: |
+          set -euo pipefail
+          cd app/build/device-inputs
+          sha256sum --check --strict SHA256SUMS
+          python3 - <<'PYVERIFY'
+          import json, subprocess
+          with open("build-metadata.json") as stream:
+              metadata = json.load(stream)
+          assert metadata["source_commit"] == subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          PYVERIFY
+      - name: Android 10 crypto, KeyStore, Reader UI and offline QR acceptance
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
+        with:
+          api-level: 29
+          arch: x86_64
+          target: default
+          # Avoid optional settings-service writes during slow software boot.
+          disable-animations: false
+          disable-linux-hw-accel: auto
+          # Software-only AOSP lane; does not change host KVM permissions.
+          # API 29 runtime coverage is not a claim of API 28 or modern-device acceptance.
+          emulator-options: -no-window -gpu swiftshader -feature -Vulkan -accel off -no-audio -no-snapshot -no-boot-anim -camera-back none -memory 2048 -cores 2 -skin 480x800
+          script: cd android-client && bash scripts/run-ci-instrumentation.sh
+      - name: Upload synthetic instrumentation results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-native-instrumentation-${{ github.run_id }}
+          path: android-client/app/build/reports/androidTests/
+          retention-days: 1
+          if-no-files-found: ignore
+
+  protocol-parity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: weikeyi/herdr-remote-bridge
+          ref: 4e80d943579c7213cce78dedeb87df04a428f649
+          path: audit-reference
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Synthetic randomized interoperability with unchanged Go crypto
+        env:
+          RELAY_SOURCE: ${{ github.workspace }}/audit-reference
+        run: |
+          set -euo pipefail
+          python3 java/fixtures/extract.py --check
+          bash java/test.sh
+          bash java/integration/test.sh

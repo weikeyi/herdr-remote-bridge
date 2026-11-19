@@ -1,0 +1,45 @@
+THIRD-PARTY COMPONENTS — NATIVE ANDROID APPLICATION
+
+This list describes the resolved production runtime for this preview, not build
+plugins or instrumentation-only dependencies. Component licenses are independent
+of this application's AGPL license. Upstream source notices remain applicable.
+
+The following artifacts declare Apache License 2.0 in their official Maven POMs.
+The full license is included as Apache-2.0.txt, copied verbatim from OkHttp's
+parent-5.5.1 LICENSE.txt (also identical to the verified Okio and Kotlin licenses).
+
+com.squareup.okhttp3:okhttp-android:5.5.1
+Source: https://github.com/square/okhttp/tree/parent-5.5.1
+License metadata: https://repo.maven.apache.org/maven2/com/squareup/okhttp3/okhttp-android/5.5.1/okhttp-android-5.5.1.pom
+
+com.squareup.okio:okio-jvm:3.18.1
+Source: https://github.com/square/okio/tree/parent-3.18.1
+License metadata: https://repo.maven.apache.org/maven2/com/squareup/okio/okio-jvm/3.18.1/okio-jvm-3.18.1.pom
+
+org.jetbrains.kotlin:kotlin-stdlib:2.2.21
+Source: https://github.com/JetBrains/kotlin/tree/v2.2.21
+License metadata: https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/2.2.21/kotlin-stdlib-2.2.21.pom
+
+org.jetbrains:annotations:13.0
+Source: https://github.com/JetBrains/java-annotations
+License metadata: https://repo.maven.apache.org/maven2/org/jetbrains/annotations/13.0/annotations-13.0.pom
+
+androidx.annotation:annotation-jvm:1.10.0
+Source: https://android.googlesource.com/platform/frameworks/support/
+License metadata: https://dl.google.com/dl/android/maven2/androidx/annotation/annotation-jvm/1.10.0/annotation-jvm-1.10.0.pom
+
+androidx.startup:startup-runtime:1.2.0
+Source: https://android.googlesource.com/platform/frameworks/support/
+License metadata: https://dl.google.com/dl/android/maven2/androidx/startup/startup-runtime/1.2.0/startup-runtime-1.2.0.pom
+
+androidx.tracing:tracing:1.0.0
+Source: https://android.googlesource.com/platform/frameworks/support/
+License metadata: https://dl.google.com/dl/android/maven2/androidx/tracing/tracing/1.0.0/tracing-1.0.0.pom
+
+com.google.zxing:core:3.5.4
+Source: https://github.com/zxing/zxing/tree/zxing-3.5.4
+License: Apache License 2.0, with additional upstream bundled notices preserved
+verbatim in ZXing-LICENSE.txt. Only core is used, for offline image decoding.
+
+No upstream copyright year or owner is inferred from dependency coordinates.
+Refer to the linked source distributions for per-file copyright notices.
