@@ -50,6 +50,7 @@ GO
 # JVM variant of the SAME pinned OkHttp version, for a host-side test only.
 # No dependency or trust override is added to the production Android app.
 paths=(
+  com/google/zxing/core/3.5.4/core-3.5.4.jar
   com/squareup/okhttp3/okhttp-jvm/5.5.1/okhttp-jvm-5.5.1.jar
   com/squareup/okio/okio-jvm/3.18.1/okio-jvm-3.18.1.jar
   org/jetbrains/kotlin/kotlin-stdlib/2.1.21/kotlin-stdlib-2.1.21.jar

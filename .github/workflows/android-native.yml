@@ -160,7 +160,7 @@ jobs:
               metadata = json.load(stream)
           assert metadata["source_commit"] == subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           PYVERIFY
-      - name: Android 10 JCA, chunking, KeyStore and native UI acceptance
+      - name: Android 10 crypto, KeyStore, Reader UI and offline QR acceptance
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
           api-level: 29

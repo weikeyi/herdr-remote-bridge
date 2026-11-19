@@ -21,10 +21,10 @@ Requirements: JDK17 in JAVA_HOME, Go 1.27.3 on PATH, curl, Python-independent sh
 tools, and the installed Android SDK JAR for compiling platform-only type
 references. No emulator is needed for this host-side gate.
 
-The five test-only JVM dependency JARs are pinned in jars.sha256 and downloaded
+The checksum-pinned host-side dependency JARs are pinned in jars.sha256 and downloaded
 from official Maven Central. They include the JVM variant of the same OkHttp 5.5.1
-version, its exact declared runtime dependencies, and the JVM org.json test
-implementation. WSS_JARS_DIR optionally supplies a local cache; every JAR is still
+version, its exact declared runtime dependencies, the JVM org.json test implementation, and ZXing core required when
+compiling the actual app QR classes. WSS_JARS_DIR optionally supplies a local cache; every JAR is still
 checksum verified. This is not an Android OkHttp-provider/device acceptance test.
 
 ## Acceptance trace

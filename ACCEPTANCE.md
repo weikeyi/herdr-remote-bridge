@@ -7,7 +7,7 @@ against the exact built commit before a user-facing native preview is recommende
 1. CI assembles the app and instrumentation APK, passes unit tests/lint, records
    both hashes and source commit, and verifies only INTERNET permission with
    debugging/backup/cleartext disabled.
-2. An isolated emulator executes all eleven expected crypto/chunk/vault/UI tests from
+2. An isolated emulator executes all eighteen expected crypto/chunk/vault/UI/QR tests from
    that same build. Zero tests, skips, crashes and partial logs are failures.
 3. Real WSS connects to a test Bridge with a valid test TLS certificate. Exercise
    Gateway hello/connect/ready, E2EE enrollment, Reader role and successful
@@ -27,3 +27,10 @@ against the exact built commit before a user-facing native preview is recommende
 The existing user VPS, Windows Core and separate WebView preview are not test
 fixtures and must not be changed automatically. No real credential or terminal
 output belongs in a public test log, issue, screenshot or CI artifact.
+
+For the QR/UX revision also verify a real user-selected local image, image-picker
+cancellation, two-code rejection, changed origin while selection is pending,
+background cancellation and explicit copy. A successful decode fills the invite
+field only; it must never silently pair or open a decoded URL. Live camera QR
+scanning, full VT behavior, write controls and modern physical-device coverage
+remain outside this Reader preview.

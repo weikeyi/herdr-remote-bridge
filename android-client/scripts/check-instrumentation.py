@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Fail closed unless all eleven expected native tests completed successfully."""
+"""Fail closed unless all eighteen expected native tests completed successfully."""
 import pathlib
 import re
 import sys
 
-EXPECTED = {('dev.herdrbridge.protocol.ChunkCodecTest', 'timeoutAndClockFailureAreFatal'), ('dev.herdrbridge.nativeclient.DeviceVaultTest', 'roundTripWrongAuthorityCorruptionAndLostKeyFailClosed'), ('dev.herdrbridge.protocol.ChunkCodecTest', 'closeAndOversizeCarrierFail'), ('dev.herdrbridge.nativeclient.MainActivitySmokeTest', 'backgroundAndRecreationClearTransientInvitationWithoutAutoConnect'), ('dev.herdrbridge.nativeclient.MainActivitySmokeTest', 'restoredAuthorizationRequiresExactOriginAndValidSavedVault'), ('dev.herdrbridge.protocol.ChunkCodecTest', 'zeroAndMaximumMessagesAndNewAssembly'), ('dev.herdrbridge.protocol.ChunkCodecTest', 'rejectsSequenceFlagsLengthAndVersion'), ('dev.herdrbridge.nativeclient.AndroidCryptoTest', 'originalGoldenAndNegativeChecksOnAndroid'), ('dev.herdrbridge.protocol.ChunkCodecTest', 'matchesActualTypescriptExporterVector'), ('dev.herdrbridge.nativeclient.MainActivitySmokeTest', 'nativeInitialUiAndInvalidActionsNeverCreateConnection'), ('dev.herdrbridge.nativeclient.MainActivitySmokeTest', 'foregroundRecoveryClosesOldClientAndDisconnectStopsRecovery')}
+EXPECTED = {('dev.herdrbridge.nativeclient.AndroidCryptoTest', 'originalGoldenAndNegativeChecksOnAndroid'), ('dev.herdrbridge.protocol.ChunkCodecTest', 'rejectsSequenceFlagsLengthAndVersion'), ('dev.herdrbridge.nativeclient.QrImageDecoderTest', 'generatedPngDecodedByRealAndroidBitmapFactory'), ('dev.herdrbridge.nativeclient.QrImageDecoderTest', 'malformedOversizedAndCancelledImagesFailClosed'), ('dev.herdrbridge.nativeclient.DeviceVaultTest', 'roundTripWrongAuthorityCorruptionAndLostKeyFailClosed'), ('dev.herdrbridge.protocol.ChunkCodecTest', 'closeAndOversizeCarrierFail'), ('dev.herdrbridge.protocol.ChunkCodecTest', 'timeoutAndClockFailureAreFatal'), ('dev.herdrbridge.nativeclient.MainActivitySmokeTest', 'foregroundRecoveryClosesOldClientAndDisconnectStopsRecovery'), ('dev.herdrbridge.nativeclient.ReaderQrUiTest', 'localPickerContractAndCancelledStaleNonContentResultsFailClosed'), ('dev.herdrbridge.nativeclient.ReaderQrUiTest', 'nativeReaderLayoutShowsDistinctPaneAndExplicitSensitiveCopy'), ('dev.herdrbridge.nativeclient.ReaderQrUiTest', 'backgroundCancelsDecoderWorkAndClearsInvitation'), ('dev.herdrbridge.protocol.ChunkCodecTest', 'zeroAndMaximumMessagesAndNewAssembly'), ('dev.herdrbridge.nativeclient.MainActivitySmokeTest', 'nativeInitialUiAndInvalidActionsNeverCreateConnection'), ('dev.herdrbridge.nativeclient.QrImageDecoderTest', 'cancellationClosesBlockedPipeReadWithoutRetainingDescriptor'), ('dev.herdrbridge.nativeclient.ReaderQrUiTest', 'verifiedQrResultOnlyPopulatesCurrentForegroundOrigin'), ('dev.herdrbridge.protocol.ChunkCodecTest', 'matchesActualTypescriptExporterVector'), ('dev.herdrbridge.nativeclient.MainActivitySmokeTest', 'backgroundAndRecreationClearTransientInvitationWithoutAutoConnect'), ('dev.herdrbridge.nativeclient.MainActivitySmokeTest', 'restoredAuthorizationRequiresExactOriginAndValidSavedVault')}
 
 
 def validate(text):
@@ -12,8 +12,8 @@ def validate(text):
         raise ValueError("Instrumentation failed or crashed")
     if re.findall(r"^INSTRUMENTATION_CODE:\s*(-?\d+)\s*$", text, re.M) != ["-1"]:
         raise ValueError("Missing or unexpected final instrumentation result")
-    if len(re.findall(r"^OK \(11 tests\)\s*$", text, re.M)) != 1:
-        raise ValueError("Expected exactly eleven successful tests")
+    if len(re.findall(r"^OK \(18 tests\)\s*$", text, re.M)) != 1:
+        raise ValueError("Expected exactly eighteen successful tests")
     fields = {}
     started, passed = set(), set()
     for line in text.splitlines():
@@ -24,7 +24,7 @@ def validate(text):
         elif line.startswith("INSTRUMENTATION_STATUS_CODE: "):
             code = line.split(": ", 1)[1].strip()
             test = (fields.get("class"), fields.get("test"))
-            if test not in EXPECTED or fields.get("numtests") != "11":
+            if test not in EXPECTED or fields.get("numtests") != "18":
                 raise ValueError("Unexpected test identity or test count")
             if code == "1" and test not in started:
                 started.add(test)
@@ -42,4 +42,4 @@ if __name__ == "__main__":
         validate(pathlib.Path(sys.argv[1]).read_text())
     except (ValueError, OSError, IndexError) as exc:
         sys.exit(f"Instrumentation acceptance failed: {exc}")
-    print("PASS: all expected Android crypto/chunk/vault tests completed")
+    print("PASS: all expected Android crypto/chunk/vault/UI/QR tests completed")

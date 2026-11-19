@@ -94,3 +94,57 @@ ENROLLED callback persisted its identity-bound pending-confirmation marker. If t
 process dies before that marker is recorded, explicit saved Connect is required.
 No invitation is persisted or reused.
 No persistent background service or network observer exists.
+
+## Native Reader UI and QR image import
+
+The connection form scrolls independently and collapses after authentication.
+Selecting a pane hides the session list to leave the terminal viewport available;
+use the return-to-list button to choose another pane. The terminal supports native
+horizontal/vertical scrolling, manual refresh and an explicit copy button only.
+Copy exports the currently displayed sanitized snapshot to the system clipboard;
+Android 13+ marks it sensitive. There is no automatic clipboard copy or read.
+
+“从二维码图片导入” opens the platform photo picker (Android 13+) or image document
+picker, requests local-only selection and reads only the selected content URI.
+It is not a camera scanner and asks for no camera/storage permission. Image/QR
+recognition runs on a bounded local worker without uploading the image. A decoded
+invitation is validated against the configured HTTPS origin and placed in the
+transient invitation field; the user must still press Pair. The image and URI are
+not persisted, and the app takes no persistent URI permission. Backgrounding
+cancels decoding and rejects stale callbacks. The expected picker round trip
+retains only a request ID and configured origin, not invitation text.
+
+`ReaderQrUiTest` uses only an isolated unpaired test install and synthetic data.
+It exercises cancellation/lifecycle controls, native Reader layout and explicit
+clipboard behavior; the clipboard test writes then clears a synthetic snapshot.
+These tests do not replace actual-device visual and end-to-end acceptance.
+
+## Offline QR image decoding
+
+The image picker imports an already selected image, not a camera feed. QR decoding
+uses only ZXing core 3.5.4, with no cloud API, MLKit, account or additional device
+permission. The official Maven Central artifact was published on 2025-11-11;
+the pinned version is older than the two-week dependency waiting period.
+Sources: [ZXing release](https://github.com/zxing/zxing/releases/tag/zxing-3.5.4),
+[official artifact](https://repo.maven.apache.org/maven2/com/google/zxing/core/3.5.4/).
+Its license and bundled notices ship in app assets.
+
+Only scoped content URIs are opened. Input is capped at 8 MiB; PNG/JPEG/WebP
+headers must describe at most 32 megapixels and dimensions no larger than 16384.
+Sampling limits decoding to 4 megapixels. Multiple readable codes, structured
+append composites, missing codes and oversized decoded content are rejected.
+All decoded text must still pass the existing configured-origin, expiry and
+invitation-scope validator. Importing never pairs or opens a link automatically.
+
+Cancellation closes the owned stream/descriptor and interrupts the worker.
+Bitmap/QR library work is bounded by image size and checked before/after but
+cannot be promised to stop instantly inside native decoding. A device test uses
+a blocked pipe to check cancellation releases the production descriptor-read path.
+Streams close, bitmaps recycle and owned buffers are cleared on every outcome.
+The app neither saves nor logs the selected image or invitation. Picker-local-only
+requests do not constitute a guarantee about an external content provider's
+implementation.
+
+The APK ships `assets/third-party/THIRD_PARTY_NOTICES.txt`, `Apache-2.0.txt` and
+`ZXing-LICENSE.txt`; these cover the resolved production components and preserve
+the upstream license text. See `../DEPENDENCIES.md` for exact runtime versions.

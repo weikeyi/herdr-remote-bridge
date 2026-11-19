@@ -6,7 +6,7 @@ change the Windows Core, Gateway deployment or the separate WebView preview.
 
 ## Scope
 
-The initial vertical slice imports an explicitly pasted, origin-scoped invitation,
+The initial vertical slice imports an origin-scoped invitation by paste or an explicitly selected QR image,
 performs the existing Gateway and end-to-end cryptographic handshakes, saves a
 Reader credential with AndroidKeyStore-backed encryption, and displays native
 session selection plus manually refreshed text snapshots. It intentionally has
@@ -46,3 +46,17 @@ CI variables or logs.
 
 See `android-client/LICENSE` and `android-client/NOTICE` for licensing and
 attribution of protocol-derived code.
+
+## Phone Reader experience
+
+The connection form collapses after authentication. Selecting a uniquely labeled
+pane opens a larger scrollable native text view; refresh and copy are explicit
+actions. Copy places the displayed sanitized text on the system clipboard and
+marks it sensitive on supported Android versions. No automatic clipboard reads
+or command-entry controls exist.
+
+QR import decodes one user-selected image on the device without uploading it.
+It is **not a live camera scanner**. The system image provider may retrieve a file
+the user selects; the application has no camera, gallery-wide storage or cloud
+recognition permission/SDK. Paste remains available. Identified text must pass
+the same origin/expiry/scope checks, and the user still presses Pair.

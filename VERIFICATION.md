@@ -1,6 +1,8 @@
 # Native milestone verification
 
-Status: implementation in progress, not a device-accepted release.
+Status: QR/phone-UX revision locally verified, pending its eighteen-test Android
+CI run. Not a physical-device-accepted production release. The preceding native
+core commit b0697bcd passed all CI gates, including eleven actual API 29 tests.
 
 ## Passed in the isolated development workspace
 
@@ -76,3 +78,15 @@ executing under the target app UID. The subsequent patch uses a strict portable
 hex decoder and the target app cache, enables lint inspection of test sources,
 and preserves every original assertion. Local chunk tests and the full aggregate
 pass; the corrected eleven-test Android run still needs verification.
+
+## QR/Reader UX revision
+
+The native core's corrected run 44501375389 at b0697bcd completed successfully,
+including all eleven Android 10 tests. The next local revision adds bounded
+offline QR-image decoding, an explicit image-picker workflow and phone Reader
+layout/copy/refresh improvements. Forty-two JVM tests pass, including six real
+ZXing fixture tests; actual WSS regression passes. Eighteen Android cases are
+authored and compiled, including generated PNG decoding, blocked-pipe
+cancellation, stale/invalid picker results, current-origin validation and Reader
+layout/explicit clipboard behavior. Runtime verification of those seven new
+cases must not be inferred from compilation or the previous eleven-test pass.
