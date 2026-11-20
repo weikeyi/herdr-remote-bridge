@@ -64,7 +64,8 @@ for path in "${paths[@]}"; do
 done
 (cd "$work/jars" && sha256sum --check --strict "$here/jars.sha256")
 classpath="$(find "$work/jars" -name '*.jar' -printf '%p:' )$ANDROID_JAR"
-mapfile -t sources < <(find "$native/src/main/java" "$native/../android-client/app/src/main/java" -name '*.java')
+# MainActivity uses the generated Android R class and is covered by the app build and device suite.
+mapfile -t sources < <(find "$native/src/main/java" "$native/../android-client/app/src/main/java" -name '*.java' ! -name 'MainActivity.java')
 "$JAVA_HOME/bin/javac" --release 17 -encoding UTF-8 -cp "$classpath" -d "$work/classes" "${sources[@]}" "$here/NativeWssIntegration.java"
 HARNESS_DIR="$work" "$work/server" > "$work/config.json" 2> "$work/server.log" &
 server_pid=$!
