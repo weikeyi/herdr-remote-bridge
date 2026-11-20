@@ -25,6 +25,9 @@ import static org.junit.Assert.*;
 /** Synthetic-only screenshots of the real Activity. No socket, credential or terminal. */
 public class SyntheticUiScreenshotTest {
     private static final SessionRepository.SessionTarget TARGET = new SessionRepository.SessionTarget("primary","synthetic-pane","synthetic-terminal",1,"synthetic-agent");
+    private static final SessionRepository.SessionTarget OTHER = new SessionRepository.SessionTarget("primary","synthetic-pane-2","synthetic-terminal-2",1,"");
+    private static final String ATLAS_TITLE="Atlas Web · 构建检查";
+    private static final String LONG_TITLE="城市基础地理信息数据库增量更新与高分辨率正射影像质量抽检作业";
     private static Object get(Activity a,String name){try{Field f=MainActivity.class.getDeclaredField(name);f.setAccessible(true);return f.get(a);}catch(Exception e){throw new AssertionError(e);}}
     private static void set(Activity a,String name,Object value){try{Field f=MainActivity.class.getDeclaredField(name);f.setAccessible(true);f.set(a,value);}catch(Exception e){throw new AssertionError(e);}}
     private static void call(Activity a,String name,Class<?>[] types,Object...args){try{Method m=MainActivity.class.getDeclaredMethod(name,types);m.setAccessible(true);m.invoke(a,args);}catch(Exception e){throw new AssertionError(e);}}
@@ -56,8 +59,13 @@ public class SyntheticUiScreenshotTest {
         },()->0.5);
         set(a,"connection",connection);connection.foreground();connection.explicitSaved();
         fake.listener.onAccess(role);fake.listener.onState(SessionRepository.State.READY,"");
-        fake.listener.onSessions(Arrays.asList(new SessionRepository.Session(TARGET,"Atlas Web · 构建检查","working",true),new SessionRepository.Session(new SessionRepository.SessionTarget("primary","synthetic-pane-2","synthetic-terminal-2",1,""),"地图文档 · 预览服务","idle",true)));
+        inventory(fake,ATLAS_TITLE);
         return fake;
+    }
+    private static void inventory(Fake fake,String title){
+        fake.listener.onSessions(Arrays.asList(
+                new SessionRepository.Session(TARGET,title,"working",true),
+                new SessionRepository.Session(OTHER,"地图文档 · 预览服务","idle",true)));
     }
     private static void snapshot(Fake fake){
         fake.listener.onSnapshot(TARGET,
@@ -144,10 +152,10 @@ public class SyntheticUiScreenshotTest {
             return insets!=null&&insets.isVisible(android.view.WindowInsets.Type.ime());
         }
     }
-    private static ImeState probeIme(ActivityScenario<MainActivity> scenario,int initialBottom){
+    private static ImeState probeIme(ActivityScenario<MainActivity> scenario,String editor,int initialBottom){
         ImeState result=new ImeState();
         scenario.onActivity(a->{
-            EditText draft=(EditText)get(a,"terminalDraft");
+            EditText draft=(EditText)get(a,editor);
             result.appFocused=a.hasWindowFocus();
             result.editorFocused=draft.hasFocus();
             result.editorServed=((InputMethodManager)a.getSystemService(Context.INPUT_METHOD_SERVICE)).isActive(draft);
@@ -161,12 +169,12 @@ public class SyntheticUiScreenshotTest {
         }
         return result;
     }
-    private static void tapDraft(ActivityScenario<MainActivity> scenario){
+    private static void tapEditor(ActivityScenario<MainActivity> scenario,String editor){
         int[] xy=new int[2];
         scenario.onActivity(a->{
-            View draft=(View)get(a,"terminalDraft");
+            View draft=(View)get(a,editor);
             assertTrue("Activity must own window focus before input tap",a.hasWindowFocus());
-            assertFullyVisibleAboveIme(a,"terminalDraft",0);
+            assertFullyVisibleAboveIme(a,editor,0);
             draft.getLocationOnScreen(xy);xy[0]+=draft.getWidth()/2;xy[1]+=draft.getHeight()/2;
         });
         long now=SystemClock.uptimeMillis();
@@ -177,9 +185,9 @@ public class SyntheticUiScreenshotTest {
             finally{event.recycle();}
         }
     }
-    private static void requestImeForServedEditor(ActivityScenario<MainActivity> scenario){
+    private static void requestImeForServedEditor(ActivityScenario<MainActivity> scenario,String editor){
         scenario.onActivity(a->{
-            EditText draft=(EditText)get(a,"terminalDraft");
+            EditText draft=(EditText)get(a,editor);
             InputMethodManager manager=(InputMethodManager)a.getSystemService(Context.INPUT_METHOD_SERVICE);
             if(!a.hasWindowFocus()||!draft.hasFocus()||!manager.isActive(draft))return;
             boolean requested=manager.showSoftInput(draft,InputMethodManager.SHOW_IMPLICIT,
@@ -211,6 +219,17 @@ public class SyntheticUiScreenshotTest {
         assertTrue("Terminal viewport too short above keyboard: "+exposed.height()+"px, required "+minHeight+"px",exposed.height()>=minHeight);
         int[] where=new int[2];output.getLocationOnScreen(where);
         assertTrue("Terminal viewport must lie above keyboard",where[1]+output.getHeight()<=visibleFrame.bottom);
+        float density=activity.getResources().getDisplayMetrics().density;
+        int heightDp=Math.round(exposed.height()/density);
+        int frameBottomDp=Math.round(visibleFrame.bottom/density);
+        int baselineComparable=heightDp+552-frameBottomDp;
+        android.util.Log.i("BridgeSyntheticIme","terminalHeightDp="+heightDp+" frameBottomDp="+frameBottomDp
+                +" baselineComparableDp="+baselineComparable+" baseline61b84c7Dp=330");
+        Rect frame=visibleFrame(activity);
+        if(Math.abs(frame.width()/density-400)<=2&&Math.abs(activity.getResources().getConfiguration().fontScale-1f)<.01f){
+            assertTrue("Terminal gain below one baseline line (17dp): normalized height "+baselineComparable+"dp",baselineComparable>=347);
+        }
+
     }
     private static void systemBack(){
         long now=SystemClock.uptimeMillis();
@@ -219,23 +238,85 @@ public class SyntheticUiScreenshotTest {
         assertTrue("System Back up was not injected",ui.injectInputEvent(new KeyEvent(now,SystemClock.uptimeMillis(),KeyEvent.ACTION_UP,KeyEvent.KEYCODE_BACK,0),true));
         InstrumentationRegistry.getInstrumentation().waitForIdleSync();
     }
-    private static void awaitIme(ActivityScenario<MainActivity> scenario,int initialBottom,boolean visible)throws InterruptedException{
+    private static void awaitIme(ActivityScenario<MainActivity> scenario,String editor,int initialBottom,boolean visible)throws InterruptedException{
         long start=SystemClock.uptimeMillis(),deadline=start+15000;
         boolean retried=false;int consecutive=0;
         ImeState state;
         do{
-            state=probeIme(scenario,initialBottom);
+            state=probeIme(scenario,editor,initialBottom);
             boolean matches=visible?state.visible()&&state.appFocused&&state.editorFocused:state.hidden();
             if(matches){
                 if(++consecutive>=2){android.util.Log.i("BridgeSyntheticIme",(visible?"visible: ":"hidden: ")+state);return;}
             }else consecutive=0;
             if(visible&&!retried&&SystemClock.uptimeMillis()-start>=3000&&state.editorServed){
-                retried=true;requestImeForServedEditor(scenario);
+                retried=true;requestImeForServedEditor(scenario,editor);
             }
             Thread.sleep(180);
         }while(SystemClock.uptimeMillis()<deadline);
         android.util.Log.i("BridgeSyntheticIme","timeout: "+state);
         fail("Actual IME did not become "+(visible?"visible":"hidden")+": "+state);
+    }
+    private static void exerciseSearch(ActivityScenario<MainActivity> scenario,Fake fake)throws Exception{
+        android.app.UiAutomation automation=InstrumentationRegistry.getInstrumentation().getUiAutomation();
+        android.accessibilityservice.AccessibilityServiceInfo info=automation.getServiceInfo();
+        int flags=info.flags;info.flags|=android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
+        automation.setServiceInfo(info);
+        try{
+            int bottom=probeIme(scenario,"searchQuery",0).aboveKeyboardBottom;
+            scenario.onActivity(a->{
+                assertIconAction(a,"searchButton","搜索会话");
+                assertTrue(((View)get(a,"searchButton")).performClick());
+                assertEquals(true,get(a,"searchOpen"));
+            });
+            if(!probeIme(scenario,"searchQuery",bottom).visible())tapEditor(scenario,"searchQuery");
+            awaitIme(scenario,"searchQuery",bottom,true);
+            scenario.onActivity(a->{
+                EditText query=(EditText)get(a,"searchQuery");
+                LinearLayout rows=(LinearLayout)get(a,"sessions");
+                query.setText("aTLaS");
+                assertTrue(hasRecent(a));assertEquals(0,rows.getChildCount());
+                query.setText("无匹配的示例关键字");
+                assertFalse(hasRecent(a));assertEquals(0,rows.getChildCount());
+                assertTrue(((View)get(a,"searchEmpty")).isShown());
+                assertTrue(((View)get(a,"searchClear")).performClick());
+                assertEquals("",query.getText().toString());
+                assertTrue(hasRecent(a));assertEquals(1,rows.getChildCount());
+                query.setText("地图");
+                assertFalse(hasRecent(a));assertEquals(1,rows.getChildCount());
+                assertTrue(((TextView)rows.getChildAt(0)).getText().toString().contains("地图文档"));
+                // An authoritative live rename refreshes the filtered view, without
+                // closing search or resetting the query.
+                query.setText("Atlas");
+                inventory(fake,"绘图工程 · 构建检查");
+                assertEquals("Atlas",query.getText().toString());
+                assertEquals(true,get(a,"searchOpen"));
+                assertFalse(hasRecent(a));assertTrue(((View)get(a,"searchEmpty")).isShown());
+                inventory(fake,ATLAS_TITLE);
+                assertTrue(hasRecent(a));
+                query.setText("地图");
+            });
+            capture(scenario,"06-home-search");
+            assertTrue("Search IME disappeared during screenshot",probeIme(scenario,"searchQuery",bottom).visible());
+            systemBack();awaitIme(scenario,"searchQuery",bottom,false);
+            scenario.onActivity(a->{assertEquals("HOME",get(a,"currentScreen"));assertEquals(true,get(a,"searchOpen"));});
+            systemBack();
+            scenario.onActivity(a->{
+                assertEquals("HOME",get(a,"currentScreen"));assertEquals(false,get(a,"searchOpen"));
+                assertEquals("",((EditText)get(a,"searchQuery")).getText().toString());
+                assertTrue(hasRecent(a));assertEquals(1,((LinearLayout)get(a,"sessions")).getChildCount());
+            });
+        }finally{info.flags=flags;automation.setServiceInfo(info);}
+    }
+    private static void assertLongHeading(Activity activity){
+        TextView heading=(TextView)get(activity,"detailHeading");
+        assertEquals(LONG_TITLE,heading.getText().toString());
+        assertFullyVisibleAboveIme(activity,"detailHeading",0);
+        android.text.Layout layout=heading.getLayout();
+        assertNotNull("Long title must have a real text layout",layout);
+        assertTrue("Long title must wrap rather than shrink away",layout.getLineCount()>=2);
+        for(int i=0;i<layout.getLineCount();i++)assertEquals("Long title is visually ellipsized",0,layout.getEllipsisCount(i));
+        assertEquals("Long title layout dropped trailing characters",LONG_TITLE.length(),layout.getLineEnd(layout.getLineCount()-1));
+        assertTrue("Long title must fit vertically",layout.getHeight()<=heading.getHeight()-heading.getCompoundPaddingTop()-heading.getCompoundPaddingBottom());
     }
     @Test public void syntheticScreensAndControllerComposer()throws Exception{
         try(ActivityScenario<MainActivity> scenario=ActivityScenario.launch(MainActivity.class)){
@@ -248,6 +329,23 @@ public class SyntheticUiScreenshotTest {
                     ((EditText)get(a,"origin")).setText("");((EditText)get(a,"invitation")).setText("");
                     assertTrue(((View)get(a,"setup")).isShown());
                 });
+                String profile=InstrumentationRegistry.getArguments().getString("bridge_visual_profile","");
+                if("narrow".equals(profile)){
+                    scenario.onActivity(a->{
+                        android.content.res.Configuration config=a.getResources().getConfiguration();
+                        assertTrue("Expected a 360dp viewport: "+config.screenWidthDp,config.screenWidthDp>=355&&config.screenWidthDp<=365);
+                        assertEquals("Expected changed font scale",1.20f,config.fontScale,.02f);
+                        fixture.set(install(a,"controller"));
+                        inventory(fixture.get(),LONG_TITLE);
+                        assertTrue(((LinearLayout)get(a,"sessions")).getChildAt(0).performClick());
+                        assertEquals(TARGET,get(a,"selected"));snapshot(fixture.get());
+                    });
+                    InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+                    scenario.onActivity(SyntheticUiScreenshotTest::assertLongHeading);
+                    capture(scenario,"08-long-cjk-360-font120");
+                    return;
+                }
+                assertEquals("Unexpected synthetic profile","",profile);
                 capture(scenario,"01-pairing-empty");
                 scenario.onActivity(a->{
                     fixture.set(install(a,"controller"));
@@ -272,6 +370,7 @@ public class SyntheticUiScreenshotTest {
                     assertTrue(((TextView)get(a,"accessLabel")).getText().toString().contains("Controller"));
                 });
                 capture(scenario,"02-session-home");
+                exerciseSearch(scenario,fixture.get());
                 scenario.onActivity(a->{
                     fixture.set(install(a,"reader"));
                     assertTrue(((TextView)get(a,"accessLabel")).getText().toString().contains("Reader"));
@@ -294,22 +393,25 @@ public class SyntheticUiScreenshotTest {
                 original.flags|=android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
                 automation.setServiceInfo(original);
                 try{
-                    int beforeIme=probeIme(scenario,0).aboveKeyboardBottom;
-                    ImeState baseline=probeIme(scenario,beforeIme);
+                    int beforeIme=probeIme(scenario,"terminalDraft",0).aboveKeyboardBottom;
+                    ImeState baseline=probeIme(scenario,"terminalDraft",beforeIme);
                     assertTrue("Expected no keyboard before tapping editor: "+baseline,baseline.hidden());
-                    tapDraft(scenario);
-                    awaitIme(scenario,beforeIme,true);
+                    tapEditor(scenario,"terminalDraft");
+                    awaitIme(scenario,"terminalDraft",beforeIme,true);
                     scenario.onActivity(a->{
                         assertFullyVisibleAboveIme(a,"terminalDraft",0);
                         assertFullyVisibleAboveIme(a,"sendText",44);
                         assertFullyVisibleAboveIme(a,"sendEnter",44);
+                        assertIconAction(a,"sendText","发送文字（不回车）");
+                        assertIconAction(a,"sendEnter","发送 Enter（执行当前行）");
+                        assertEquals("Standard IME composer must be inline",LinearLayout.HORIZONTAL,((LinearLayout)get(a,"composerControls")).getOrientation());
                         assertTerminalSpaceAboveIme(a);
                     });
                     capture(scenario,"05-controller-ime-visible");
-                    ImeState capturedIme=probeIme(scenario,beforeIme);
+                    ImeState capturedIme=probeIme(scenario,"terminalDraft",beforeIme);
                     assertTrue("IME disappeared during screenshot: "+capturedIme,capturedIme.visible());
                     systemBack();
-                    awaitIme(scenario,beforeIme,false);
+                    awaitIme(scenario,"terminalDraft",beforeIme,false);
                     scenario.onActivity(a->assertEquals("DETAIL",get(a,"currentScreen")));
                     systemBack();
                     scenario.onActivity(a->{
@@ -318,6 +420,15 @@ public class SyntheticUiScreenshotTest {
                         assertFalse(((View)get(a,"terminal")).isShown());
                         assertEquals("",((EditText)get(a,"terminalDraft")).getText().toString());
                     });
+                    scenario.onActivity(a->{
+                        inventory(fixture.get(),LONG_TITLE);
+                        assertTrue(hasRecent(a));
+                        assertTrue(recent(a).performClick());
+                        assertEquals(TARGET,get(a,"selected"));snapshot(fixture.get());
+                    });
+                    InstrumentationRegistry.getInstrumentation().waitForIdleSync();
+                    scenario.onActivity(SyntheticUiScreenshotTest::assertLongHeading);
+                    capture(scenario,"07-long-cjk-title");
                 }finally{
                     original.flags=originalFlags;
                     automation.setServiceInfo(original);

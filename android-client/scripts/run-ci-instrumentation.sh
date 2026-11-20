@@ -41,8 +41,50 @@ python3 scripts/check-instrumentation.py "$ui_report/instrumentation.txt" --scre
 python3 - "$ui_report" <<'PYCHECK'
 import pathlib,sys
 root=pathlib.Path(sys.argv[1])
-for name in ('01-pairing-empty','02-session-home','03-reader-detail','04-controller-composer','05-controller-ime-visible'):
+for name in ('01-pairing-empty','02-session-home','03-reader-detail','04-controller-composer','05-controller-ime-visible','06-home-search','07-long-cjk-title'):
     data=(root/(name+'.png')).read_bytes()
     assert data.startswith(b'\x89PNG\r\n\x1a\n') and len(data)>1000, name
-print('PASS five real synthetic-screen PNGs captured; no placeholder images')
+print('PASS seven real synthetic-screen PNGs captured; no placeholder images')
 PYCHECK
+
+# Optional same-APK, same-emulator narrow profile, separate from the standard
+# seven-image capture. Only the disposable CI device is resized.
+if [[ "${NATIVE_NARROW_UI:-0}" == 1 ]]; then
+  narrow_report="$ui_report/narrow-360-font120"
+  mkdir -p "$narrow_report"
+  prior_font="$(timeout 20s adb shell settings get system font_scale | tr -d '\r')"
+  restore_emulator(){
+    timeout 20s adb shell wm size reset || true
+    if [[ "$prior_font" == null || -z "$prior_font" ]]; then
+      timeout 20s adb shell settings delete system font_scale || true
+    else
+      timeout 20s adb shell settings put system font_scale "$prior_font" || true
+    fi
+  }
+  trap restore_emulator EXIT
+  timeout 20s adb shell wm size 360x800
+  timeout 20s adb shell settings put system font_scale 1.20
+  sleep 2
+  set +e
+  timeout 90s adb shell am instrument -w -r \
+    -e class dev.herdrbridge.nativeclient.SyntheticUiScreenshotTest \
+    -e bridge_visual_profile narrow \
+    dev.herdrbridge.nativeclient.preview.test/androidx.test.runner.AndroidJUnitRunner \
+    2>&1 | tee "$narrow_report/instrumentation.txt"
+  narrow_status=${PIPESTATUS[0]}
+  timeout 30s adb pull /sdcard/Android/data/dev.herdrbridge.nativeclient.preview/files/synthetic-ui/08-long-cjk-360-font120.png \
+    "$narrow_report/" > "$narrow_report/pull.txt" 2>&1
+  narrow_pull=$?
+  set -e
+  restore_emulator
+  trap - EXIT
+  python3 scripts/check-instrumentation.py "$narrow_report/instrumentation.txt" --screenshots
+  [[ "$narrow_status" == 0 && "$narrow_pull" == 0 ]]
+  python3 - "$narrow_report/08-long-cjk-360-font120.png" <<'PYCHECK'
+import pathlib,struct,sys
+data=pathlib.Path(sys.argv[1]).read_bytes()
+assert data.startswith(b'\x89PNG\r\n\x1a\n') and len(data)>1000
+assert struct.unpack('>I',data[16:20])[0] == 360, 'expected actual 360px emulator capture'
+print('PASS same-APK 360dp font 1.20 multiline CJK title')
+PYCHECK
+fi

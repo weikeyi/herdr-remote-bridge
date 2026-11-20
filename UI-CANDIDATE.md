@@ -55,3 +55,13 @@ a row in the remaining list. Nothing is featured as recent on first use.
 The terminal view is unboxed. Terminal text is not synthetically highlighted
 or altered by this UI iteration. Input gating, exact target checks, refresh and
 credential behavior remain unchanged.
+
+### Night Voyage usability polish
+
+Search filters visible, live session titles in the app only. The query is cleared
+on leaving Home; search does not change pairing, capabilities or remote state.
+The terminal has a separate wrapping heading and adapts the composer to the
+keyboard and system font size. Explicit text without Enter and deliberate Enter
+remain separate. Exact build visual QA exercises the standard 400dp profile and
+a 360dp profile with 1.20 font scaling; the standard IME view is measured
+against the prior 400dp snapshot.

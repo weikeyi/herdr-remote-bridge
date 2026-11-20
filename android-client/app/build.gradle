@@ -11,8 +11,8 @@ android {
         applicationId 'dev.herdrbridge.nativeclient.preview'
         minSdk 28
         targetSdk 36
-        versionCode 3
-        versionName '0.4.0-night-preview'
+        versionCode 4
+        versionName '0.5.0-night-preview'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
     buildTypes {
