@@ -9,7 +9,7 @@ timeout 300s adb install -r -t app/build/device-inputs/app-debug-androidTest.apk
 # -r preserves per-test statuses; pipefail preserves adb/timeout failure.
 timeout 300s adb shell am instrument -w -r \
   -e class dev.herdrbridge.nativeclient.AndroidCryptoTest,dev.herdrbridge.nativeclient.DeviceVaultTest,dev.herdrbridge.protocol.ChunkCodecTest,dev.herdrbridge.nativeclient.MainActivitySmokeTest,dev.herdrbridge.nativeclient.ReaderQrUiTest,dev.herdrbridge.nativeclient.QrImageDecoderTest,dev.herdrbridge.nativeclient.TerminalInputUiTest \
-  dev.herdrbridge.nativeclient.internal.test/androidx.test.runner.AndroidJUnitRunner \
+  dev.herdrbridge.nativeclient.preview.test/androidx.test.runner.AndroidJUnitRunner \
   2>&1 | tee "$report/instrumentation.txt"
 python3 scripts/check-instrumentation.py "$report/instrumentation.txt"
 
@@ -20,10 +20,10 @@ printf '%s\n' 'API29 emulator; real Activity with synthetic test-only repositori
 set +e
 timeout 180s adb shell am instrument -w -r \
   -e class dev.herdrbridge.nativeclient.SyntheticUiScreenshotTest \
-  dev.herdrbridge.nativeclient.internal.test/androidx.test.runner.AndroidJUnitRunner \
+  dev.herdrbridge.nativeclient.preview.test/androidx.test.runner.AndroidJUnitRunner \
   2>&1 | tee "$ui_report/instrumentation.txt"
 ui_status=${PIPESTATUS[0]}
-timeout 60s adb pull /sdcard/Android/data/dev.herdrbridge.nativeclient.internal/files/synthetic-ui/. "$ui_report/" > "$ui_report/pull.txt" 2>&1
+timeout 60s adb pull /sdcard/Android/data/dev.herdrbridge.nativeclient.preview/files/synthetic-ui/. "$ui_report/" > "$ui_report/pull.txt" 2>&1
 pull_status=$?
 set -e
 python3 scripts/check-instrumentation.py "$ui_report/instrumentation.txt" --screenshots

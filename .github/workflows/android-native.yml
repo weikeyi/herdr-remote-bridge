@@ -76,6 +76,7 @@ jobs:
           test "$(grep -c '^uses-permission:' app/build/apk-permissions.txt)" = 1
           grep -qx "uses-permission: name='android.permission.INTERNET'" app/build/apk-permissions.txt
           "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging app/build/outputs/apk/debug/app-debug.apk > app/build/apk-badging.txt
+          grep -q "^package: name='dev.herdrbridge.nativeclient.preview' " app/build/apk-badging.txt
           if grep -q '^application-debuggable' app/build/apk-badging.txt; then echo 'Preview must not be debuggable'; exit 1; fi
       - name: Record source and debug-signing identity
         run: |
@@ -85,7 +86,8 @@ jobs:
           import json, pathlib, subprocess
           metadata = {
               "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-              "version_name": "0.1.0-internal-native", "version_code": 1,
+              "version_name": "0.2.0-phone-preview", "version_code": 1,
+              "application_id": "dev.herdrbridge.nativeclient.preview",
               "gradle": "9.3.1", "agp": "9.1.1", "compile_sdk": 37, "target_sdk": 36,
               "build_tools": "36.0.0", "java": "17", "signing": "ephemeral CI debug key", "debuggable": False,
               "warning": "Not a signed production release. Different runs may use different debug certificates; in-place updates are not guaranteed."
@@ -139,7 +141,7 @@ jobs:
   instrumentation:
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -176,6 +178,9 @@ jobs:
           assert metadata["source_commit"] == subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
           PYVERIFY
       - name: Android 10 regression and synthetic phone UI screenshots
+        env:
+          # Emulator 37.3+ requires explicit opt-in for -accel off.
+          ANDROID_I_WANT_MY_TCG: "yes"
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2
         with:
           api-level: 29
@@ -184,6 +189,7 @@ jobs:
           # Avoid optional settings-service writes during slow software boot.
           disable-animations: false
           disable-linux-hw-accel: auto
+          emulator-boot-timeout: 900
           # Software-only AOSP lane; does not change host KVM permissions.
           # API 29 runtime coverage is not a claim of API 28 or modern-device acceptance.
           emulator-options: -no-window -gpu swiftshader -feature -Vulkan -accel off -no-audio -no-snapshot -no-boot-anim -camera-back none -memory 2048 -cores 2 -skin 480x800

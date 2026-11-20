@@ -119,6 +119,7 @@ public final class MainActivity extends Activity {
         currentScreen=screen;setup.setVisibility("PAIR".equals(screen)?View.VISIBLE:View.GONE);homeScreen.setVisibility("HOME".equals(screen)?View.VISIBLE:View.GONE);detailScreen.setVisibility("DETAIL".equals(screen)?View.VISIBLE:View.GONE);
         screenTitle.setText("PAIR".equals(screen)?"连接电脑":"HOME".equals(screen)?"会话":"终端");showSessions.setVisibility("DETAIL".equals(screen)?View.VISIBLE:View.GONE);showSessions.setEnabled(!inputPending);accessLabel.setVisibility("PAIR".equals(screen)?View.GONE:View.VISIBLE);
         updateScreenBack();
+        if(connection!=null)connection.setPassiveTarget("DETAIL".equals(screen)?selected:null);
     }
     private void showPairing(){hideKeyboard();clearTerminalDraft();if(connection!=null)connection.selectTarget(null);selected=null;terminal.setText("");copy.setEnabled(false);refresh.setEnabled(false);showScreen("PAIR");}
     private void showHome(){hideKeyboard();clearTerminalDraft();if(connection!=null)connection.selectTarget(null);selected=null;terminal.setText("");copy.setEnabled(false);refresh.setEnabled(false);sessionList.setVisibility(View.VISIBLE);showScreen("HOME");updateInputControls();}
@@ -335,6 +336,12 @@ public final class MainActivity extends Activity {
                     if(generation==epoch)displayMutationResult(id,outcome);
                 });}
                 public void onInputUncertaintyCleared(SessionRepository.SessionTarget target){runOnUiThread(()->{if(generation==epoch)displayInputUncertaintyCleared(target);});}
+                public void onPassiveSnapshotTimeout(SessionRepository.SessionTarget target,long token){
+                    runOnUiThread(()->{if(generation==epoch&&foreground&&ready&&"DETAIL".equals(currentScreen)&&target.equals(selected))state.setText("自动更新暂缓；请点刷新重试。");});
+                }
+                public void onPassiveSnapshot(SessionRepository.SessionTarget target,long token,String content){
+                    runOnUiThread(()->{if(generation==epoch)displayPassiveSnapshot(target,content);});
+                }
                 public void onSnapshot(SessionRepository.SessionTarget target,String content) { runOnUiThread(()->{
                     if(generation==epoch)displaySnapshot(target,content);
                 }); }
@@ -359,6 +366,13 @@ public final class MainActivity extends Activity {
                     if(!retained){clearTerminalDraft();if(connection!=null)connection.selectTarget(null);sessionList.setVisibility(View.VISIBLE);selected=null;terminal.setText("");copy.setEnabled(false);refresh.setEnabled(false);selectedLabel.setText("未选中会话");showHome();}
                     if(rows.isEmpty())state.setText("已连接，服务器没有可显示的会话。");else if(selected==null)state.setText("已连接："+Math.min(rows.size(),256)+" 个会话。请选择一个读取快照。");
         updateInputControls();
+    }
+    private void displayPassiveSnapshot(SessionRepository.SessionTarget target,String content){
+        if(!foreground||!ready||!"DETAIL".equals(currentScreen)||!target.equals(selected)||inputPending||getPreferences(MODE_PRIVATE).getBoolean("input_uncertain",false))return;
+        // Observation only: never touch the input timer, inspection state or selected target.
+        String rendered=TerminalSnapshot.render(content);
+        if(!rendered.contentEquals(terminal.getText()))terminal.setText(rendered);
+        copy.setEnabled(terminal.length()>0);
     }
     private void displaySnapshot(SessionRepository.SessionTarget target,String content){
         if(ready&&target.equals(selected)){terminal.setText(TerminalSnapshot.render(content));copy.setEnabled(terminal.length()>0);state.setText("快照已更新。内容不会自动发送到剪贴板。");updateInputControls();if(inputExpiry!=null)handler.removeCallbacks(inputExpiry);inputExpiry=this::updateInputControls;handler.postDelayed(inputExpiry,connection==null?1:Math.max(1,connection.inputFreshMillis(target)));}

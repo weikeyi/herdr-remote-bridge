@@ -13,17 +13,22 @@ import dev.herdrbridge.nativeclient.SessionRepository.SessionTarget;
 
 /** Application v3 only. All methods run on the transport's serialized executor. */
 public final class NativeSessionProtocol {
+    public static final class PassiveReadFailure extends JSONException {
+        private static final long serialVersionUID=1L;
+        PassiveReadFailure(){super("Passive observation unavailable");}
+    }
     private final Map<String, Session> sessions = new LinkedHashMap<>();
     private boolean configured, inventoryReady, authoritative;
     private boolean manualInput;
     private SessionTarget freshTarget;
     private long freshAt, readStartedAt;
+    private boolean pendingPassive;
     private String pendingId;
     private SessionTarget pendingTarget;
     private static JSONException invalid() { return new JSONException("Invalid native session protocol message"); }
     public boolean ready() { return configured; }
     public void reset() { manualInput=false; freshTarget=null; configured = false; inventoryReady = false; authoritative = false; sessions.clear(); clearPending(); }
-    private void clearPending() { pendingId = null; pendingTarget = null; }
+    private void clearPending() { pendingId = null; pendingTarget = null; pendingPassive=false; }
     public void acceptConfig(JSONObject message) throws JSONException {
         reset();
         if (!"push_config".equals(string(message, "type", 32)) || integer(message, "protocol") != 3) throw invalid();
@@ -92,8 +97,20 @@ public final class NativeSessionProtocol {
             .put("request_id", requestId).put("server_session_id", target.serverSessionId)
             .put("pane_id", target.paneId).put("target", targetJson(target))
             .put("lines", 80).put("format", "ansi").put("content_fingerprint", "");
-        pendingId = requestId; pendingTarget = target; readStartedAt=System.nanoTime();
+        pendingId = requestId; pendingTarget = target; pendingPassive=false; readStartedAt=System.nanoTime();
         return request;
+    }
+    /** Passive observation is never evidence authorizing a terminal mutation. */
+    public JSONObject readPanePassive(SessionTarget target,String requestId)throws JSONException {
+        if(pendingId!=null || hasFreshInputObservation())throw invalid();
+        JSONObject command=readPane(target,requestId);pendingPassive=true;return command;
+    }
+    public boolean canReadTarget(SessionTarget target){return configured && inventoryReady && target!=null && current(target);}
+    public boolean hasPendingRead(){return pendingId!=null;}
+    public void cancelPendingRead(){clearPending();}
+    public boolean hasFreshInputObservation(){
+        long age=System.nanoTime()-freshAt;
+        return freshTarget!=null && current(freshTarget) && age>=0 && age<3_000_000_000L;
     }
     public String acceptPaneContent(JSONObject message) throws JSONException {
         if (!configured || !"pane_content".equals(string(message, "type", 32))) throw invalid();
@@ -102,11 +119,16 @@ public final class NativeSessionProtocol {
         if (rawTarget == null) return null;
         SessionTarget target = parseTarget(rawTarget);
         if (!target.equals(pendingTarget) || !current(target) || !target.paneId.equals(message.opt("pane_id"))) return null;
-        if (message.has("error") && !"".equals(message.opt("error"))) { clearPending(); throw invalid(); }
+        if (message.has("error") && !"".equals(message.opt("error"))) {
+            if(!(message.opt("error") instanceof String))throw invalid();
+            boolean passive=pendingPassive;clearPending();
+            if(passive)throw new PassiveReadFailure();
+            throw invalid();
+        }
         String format = string(message, "format", 16);
         if (!format.equals("ansi") && !format.equals("text") && !format.equals("plain")) throw invalid();
         String content = string(message, "content", TerminalSnapshot.MAX_INPUT_CHARS);
-        freshTarget=target; freshAt=readStartedAt;
+        if(!pendingPassive){freshTarget=target; freshAt=readStartedAt;}
         clearPending();
         return content;
     }

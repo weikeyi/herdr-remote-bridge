@@ -100,4 +100,19 @@ public class NativeRelayClientTest {
             else {assertNull(field(c,"pendingMutation"));assertEquals(!wrong.equals("none"),field(c,"inputUncertain"));}
         }
     }
+    @Test public void passiveTimeoutPausesPollingWithoutClosingAndDropsLateReply()throws Exception {
+        try(NativeRelayClient c=client(new Store(),null)) {
+            NativeSessionProtocol p=(NativeSessionProtocol)field(c,"protocol");
+            p.acceptConfig(new JSONObject().put("type","push_config").put("protocol",3).put("inventory",new JSONObject().put("state","ready")));
+            JSONObject target=new JSONObject().put("server_session_id","primary").put("pane_id","pane-1").put("terminal_id","term-1").put("generation",0).put("agent_session_id","");
+            SessionRepository.SessionTarget t=p.acceptAgents(new JSONObject().put("type","agents").put("agents",new org.json.JSONArray().put(target))).get(0).target;
+            p.readPanePassive(t,"passive-0001");
+            Field pending=NativeRelayClient.class.getDeclaredField("pendingTarget");pending.setAccessible(true);pending.set(c,t);
+            Field passive=NativeRelayClient.class.getDeclaredField("pendingPassive");passive.setAccessible(true);passive.setBoolean(c,true);
+            Method timeout=NativeRelayClient.class.getDeclaredMethod("readTimedOut");timeout.setAccessible(true);timeout.invoke(c);
+            assertTrue((Boolean)field(c,"passivePaused"));assertFalse(((java.util.concurrent.atomic.AtomicBoolean)field(c,"closed")).get());assertFalse(p.hasPendingRead());
+            assertNull(p.acceptPaneContent(new JSONObject().put("type","pane_content").put("request_id","passive-0001")));assertFalse(p.inputReady(t));
+            pending.set(c,t);timeout.invoke(c);assertFalse(((java.util.concurrent.atomic.AtomicBoolean)field(c,"closed")).get());
+        }
+    }
 }

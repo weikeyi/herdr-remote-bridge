@@ -8,11 +8,11 @@ android {
     buildToolsVersion '36.0.0'
 
     defaultConfig {
-        applicationId 'dev.herdrbridge.nativeclient.internal'
+        applicationId 'dev.herdrbridge.nativeclient.preview'
         minSdk 28
         targetSdk 36
         versionCode 1
-        versionName '0.1.0-internal-native'
+        versionName '0.2.0-phone-preview'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
     buildTypes {

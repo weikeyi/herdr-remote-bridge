@@ -41,7 +41,10 @@ public final class NativeRelayClient implements SessionRepository {
     private Listener listener;
     private E2ee.Handshake handshake;
     private E2ee.Session channel;
-    private SessionTarget pendingTarget;
+    private SessionTarget pendingTarget, deferredExplicitRead;
+    private boolean pendingPassive, passivePaused;
+    private long passiveToken;
+    private ScheduledFuture<?> readDeadline;
     private ScheduledFuture<?> handshakeDeadline,chunkTimer;
 
     public static NativeRelayClient forInvitation(String origin,String invitationUrl,DeviceVault vault)throws Exception {
@@ -160,11 +163,15 @@ public final class NativeRelayClient implements SessionRepository {
     private void application(JSONObject message)throws Exception {
         String type=str(message,"type");
         switch(type){
-            case "push_config": if(pendingMutation!=null)completeMutation(MutationOutcome.UNKNOWN); protocol.acceptConfig(message);handshakeDeadline.cancel(false);if(!closed.get())emitState(State.READY);break;
-            case "inventory_status": protocol.acceptInventory(message);pendingTarget=null;emitState(State.CONNECTING);break;
+            case "push_config": clearRead();deferredExplicitRead=null; if(pendingMutation!=null)completeMutation(MutationOutcome.UNKNOWN); protocol.acceptConfig(message);handshakeDeadline.cancel(false);if(!closed.get())emitState(State.READY);break;
+            case "inventory_status": protocol.acceptInventory(message);clearRead();deferredExplicitRead=null;emitState(State.CONNECTING);break;
             case "agents": {List<Session> rows=protocol.acceptAgents(message);if(rows!=null){emitState(State.READY);emitSessions(rows);}break;}
             case "agent_update": {List<Session> rows=protocol.acceptAgentUpdate(message);if(rows!=null){emitState(State.READY);emitSessions(rows);}break;}
-            case "pane_content": {String text=protocol.acceptPaneContent(message);if(text!=null&&pendingTarget!=null){emitSnapshot(pendingTarget,text);pendingTarget=null;}break;}
+            case "pane_content": {String text;try{text=protocol.acceptPaneContent(message);}catch(NativeSessionProtocol.PassiveReadFailure unavailable){readTimedOut();break;}if(text!=null&&pendingTarget!=null){
+                SessionTarget target=pendingTarget;boolean passive=pendingPassive;long token=passiveToken;clearRead();
+                if(passive){if(!closed.get())listener.onPassiveSnapshot(target,token,text);}else {passivePaused=false;emitSnapshot(target,text);}
+                drainExplicitRead();
+            }break;}
             case "pane_unchanged": break;
             case "command_result": acceptMutationResult(message);break;
             case "error": if(pendingMutation!=null)completeMutation(MutationOutcome.UNKNOWN);throw new IllegalArgumentException();
@@ -174,8 +181,37 @@ public final class NativeRelayClient implements SessionRepository {
     private void sendLogical(byte[] bytes){for(byte[] part:ChunkCodec.encode(bytes))if(!socket.send(ByteString.of(part)))throw new IllegalStateException();}
     @Override public void requestSnapshot(SessionTarget target){enqueue(()->{
         if(phase!=Phase.APPLICATION||!protocol.ready())return;
-        JSONObject command=protocol.readPane(target,UUID.randomUUID().toString());pendingTarget=target;sendLogical(channel.encrypt(command.toString()));
+        if(pendingTarget!=null){deferredExplicitRead=target;return;}
+        startRead(target,false);
     });}
+    @Override public void requestPassiveSnapshot(SessionTarget target,long token){enqueue(()->{
+        if(phase!=Phase.APPLICATION || !protocol.ready() || pendingTarget!=null || deferredExplicitRead!=null
+            || passivePaused || pendingMutation!=null || inputReserved.get() || inputUncertain || protocol.hasFreshInputObservation())return;
+        passiveToken=token; startRead(target,true);
+    });}
+    private void startRead(SessionTarget target,boolean passive)throws Exception {
+        if(!protocol.canReadTarget(target))return;
+        JSONObject command=passive?protocol.readPanePassive(target,UUID.randomUUID().toString()):protocol.readPane(target,UUID.randomUUID().toString());
+        pendingTarget=target;pendingPassive=passive;
+        // Passive misses expire only their logical correlation, never the connection.
+        readDeadline=serial.schedule(this::readTimedOut,passive?3:15,TimeUnit.SECONDS);
+        sendLogical(channel.encrypt(command.toString()));
+    }
+    private void readTimedOut(){
+        if(!pendingPassive){clearRead();try{drainExplicitRead();}catch(Exception error){fail(State.ERROR);}return;}
+        SessionTarget target=pendingTarget;long token=passiveToken;
+        passivePaused=true;clearRead();
+        try{if(listener!=null)listener.onPassiveSnapshotTimeout(target,token);drainExplicitRead();}
+        catch(Exception error){fail(State.ERROR);}
+    }
+    private void clearRead(){
+        if(readDeadline!=null){readDeadline.cancel(false);readDeadline=null;}
+        pendingTarget=null;pendingPassive=false;protocol.cancelPendingRead();
+    }
+    private void drainExplicitRead()throws Exception {
+        SessionTarget target=deferredExplicitRead;deferredExplicitRead=null;
+        if(target!=null && phase==Phase.APPLICATION && protocol.ready())startRead(target,false);
+    }
     @Override public String sendTerminalText(SessionTarget target,String text){return submitInput(target,text,false);}
     @Override public String sendEnter(SessionTarget target){return submitInput(target,null,true);}
     private String submitInput(SessionTarget target,String text,boolean enter){
@@ -226,7 +262,7 @@ public final class NativeRelayClient implements SessionRepository {
         if(channel!=null)channel.close();
         if(handshakeDeadline!=null)handshakeDeadline.cancel(false);
         if(chunkTimer!=null)chunkTimer.cancel(false);
-        chunks.close();protocol.reset();pendingTarget=null;
+        clearRead();deferredExplicitRead=null;chunks.close();protocol.reset();pendingTarget=null;
         try{if(socket!=null)socket.cancel();}
         finally{http.dispatcher().executorService().shutdown();http.connectionPool().evictAll();}
     }

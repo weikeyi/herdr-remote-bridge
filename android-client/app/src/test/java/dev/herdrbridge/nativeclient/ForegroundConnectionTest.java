@@ -3,9 +3,9 @@ import org.junit.Test;
 import java.util.*;
 import static org.junit.Assert.*;
 public class ForegroundConnectionTest {
- static class Repo implements SessionRepository {Listener listener;boolean closed;public void start(Listener l){listener=l;}public void close(){closed=true;}public void requestSnapshot(SessionTarget t){}void state(State s){listener.onState(s,"");}}
+ static class Repo implements SessionRepository {Listener listener;boolean closed;int passiveReads,explicitReads;long token;SessionTarget passive;public void start(Listener l){listener=l;}public void close(){closed=true;}public void requestSnapshot(SessionTarget t){explicitReads++;}public void requestPassiveSnapshot(SessionTarget t,long id){passiveReads++;passive=t;token=id;}public String sendEnter(SessionTarget t){return "enter";}void state(State s){listener.onState(s,"");}}
  static class Clock implements ForegroundConnection.Scheduler {Runnable pending;long delay;public void execute(Runnable r){r.run();}public void after(long d,Runnable r){delay=d;pending=r;}public void cancel(Runnable r){if(pending==r)pending=null;}void tick(){Runnable r=pending;pending=null;if(r!=null)r.run();}}
- static class Rig implements ForegroundConnection.Factory,SessionRepository.Listener {boolean saved=true;int opens,snapshots,lists;Repo repo;Clock clock=new Clock();SessionRepository.State state;ForegroundConnection c=new ForegroundConnection(this,clock,this,()->0.5);public boolean hasSaved(){return saved;}public SessionRepository saved(){opens++;repo=new Repo();return repo;}public void onState(SessionRepository.State s,String x){state=s;}public void onSessions(List<SessionRepository.Session> s){lists++;}public void onSnapshot(SessionRepository.SessionTarget t,String x){snapshots++;}void begin(){c.foreground();c.explicitSaved();}}
+ static class Rig implements ForegroundConnection.Factory,SessionRepository.Listener {boolean saved=true;int opens,snapshots,lists,passiveSnapshots;Repo repo;Clock clock=new Clock();SessionRepository.State state;ForegroundConnection c=new ForegroundConnection(this,clock,this,()->0.5);public boolean hasSaved(){return saved;}public SessionRepository saved(){opens++;repo=new Repo();return repo;}public void onState(SessionRepository.State s,String x){state=s;}public void onSessions(List<SessionRepository.Session> s){lists++;}public void onSnapshot(SessionRepository.SessionTarget t,String x){snapshots++;}public void onPassiveSnapshot(SessionRepository.SessionTarget t,long id,String x){passiveSnapshots++;}void begin(){c.foreground();c.explicitSaved();}}
  @Test public void noInitialAutoConnectAndForegroundRecoveryUsesFreshSavedClient(){Rig r=new Rig();r.c.foreground();assertEquals(0,r.opens);r.c.explicitSaved();Repo first=r.repo;r.c.background();assertTrue(first.closed);r.c.foreground();assertEquals(2,r.opens);assertNotSame(first,r.repo);}
  @Test public void disconnectBackoffIsBoundedAndBackgroundCancelsStaleTimer(){Rig r=new Rig();r.begin();r.repo.state(SessionRepository.State.DISCONNECTED);assertEquals(1125,r.clock.delay);Runnable stale=r.clock.pending;r.c.background();assertNull(r.clock.pending);stale.run();assertEquals(1,r.opens);r.c.foreground();for(int i=2;i<5;i++){r.repo.state(SessionRepository.State.DISCONNECTED);assertNotNull(r.clock.pending);r.clock.tick();}r.repo.state(SessionRepository.State.DISCONNECTED);assertNull(r.clock.pending);int count=r.opens;r.c.background();r.c.foreground();assertEquals(count,r.opens);}
  @Test public void fatalAndRevokedDisableRecovery(){for(SessionRepository.State state:new SessionRepository.State[]{SessionRepository.State.ERROR,SessionRepository.State.REVOKED}){Rig r=new Rig();r.begin();r.repo.state(state);assertTrue(r.repo.closed);assertNull(r.clock.pending);r.c.background();r.c.foreground();assertEquals(1,r.opens);}}
@@ -19,6 +19,39 @@ public class ForegroundConnectionTest {
   r.repo.state(SessionRepository.State.DISCONNECTED);assertNull(r.clock.pending);r.c.background();r.c.foreground();assertEquals(1,r.opens);
   r.c.explicitSaved();r.repo.state(SessionRepository.State.READY);assertEquals(Integer.valueOf(0),savedCounts.get(savedCounts.size()-1));
   r.repo.state(SessionRepository.State.DISCONNECTED);assertEquals(1125,r.clock.delay);
+ }
+
+ private static final SessionRepository.SessionTarget PANE=new SessionRepository.SessionTarget("primary","pane","terminal",1,"");
+ @Test public void passivePollingOnlyWhileSelectedAndIgnoresBackgroundAndSamePaneStaleResults(){
+  Rig r=new Rig();r.begin();r.repo.state(SessionRepository.State.READY);Repo repo=r.repo;
+  assertNull(r.clock.pending);
+  r.c.selectTarget(PANE);r.c.setPassiveTarget(PANE);
+  assertEquals(4000,r.clock.delay);r.clock.tick();assertEquals(1,repo.passiveReads);
+  long first=repo.token;
+  repo.listener.onPassiveSnapshot(PANE,first,"fresh");
+  repo.listener.onPassiveSnapshot(PANE,first,"duplicate");
+  assertEquals(1,r.passiveSnapshots);
+  r.clock.tick();long older=repo.token;
+  r.c.selectTarget(null);assertNull(r.clock.pending);
+  r.c.selectTarget(PANE);r.c.setPassiveTarget(PANE);
+  repo.listener.onPassiveSnapshot(PANE,older,"stale");
+  assertEquals(1,r.passiveSnapshots);r.clock.tick();long foreground=repo.token;
+  Runnable staleTimer=r.clock.pending;r.c.background();
+  assertTrue(repo.closed);assertNull(r.clock.pending);staleTimer.run();
+  repo.listener.onPassiveSnapshot(PANE,foreground,"background");
+  assertEquals(3,repo.passiveReads);assertEquals(1,r.passiveSnapshots);
+ }
+ @Test public void passivePollingNeverMintsFreshnessAndCannotReplaceManualReview(){
+  Rig r=new Rig();r.begin();r.repo.listener.onAccess("controller");r.repo.state(SessionRepository.State.READY);
+  r.repo.listener.onSessions(Collections.singletonList(new SessionRepository.Session(PANE,"","",true)));
+  r.c.selectTarget(PANE);r.c.setPassiveTarget(PANE);r.clock.tick();long passive=r.repo.token;
+  r.repo.listener.onPassiveSnapshot(PANE,passive,"passive");assertFalse(r.c.canSend(PANE));assertEquals(1,r.passiveSnapshots);
+  r.c.requestSnapshot(PANE);r.repo.listener.onSnapshot(PANE,"explicit");assertTrue(r.c.canSend(PANE));assertEquals(1,r.repo.explicitReads);
+  r.clock.tick();r.repo.listener.onPassiveSnapshot(PANE,passive,"late");assertTrue(r.c.canSend(PANE));assertEquals(1,r.repo.passiveReads);assertEquals(1,r.passiveSnapshots);
+  r.c.sendEnter(PANE);assertNull(r.clock.pending);
+  r.repo.listener.onMutationResult("enter",PANE,SessionRepository.MutationOutcome.UNKNOWN);
+  assertNull(r.clock.pending);assertFalse(r.c.canSend(PANE));
+  r.c.restoreInputUncertainty(false);assertNotNull(r.clock.pending);r.clock.tick();assertEquals(2,r.repo.passiveReads);
  }
 
 }

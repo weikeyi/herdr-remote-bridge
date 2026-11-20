@@ -133,4 +133,23 @@ public class NativeSessionProtocolTest {
         p.acceptPaneContent(response("request-0001"));assertFalse(p.inputReady(t));
         JSONObject other=target().put("server_session_id","other");Session row=p.acceptAgents(agents(other)).get(0);assertFalse(row.manualTerminalInput);assertFalse(p.inputReady(row.target));
     }
+    @Test public void passiveSnapshotsNeverArmOrRefreshInput()throws Exception {
+        NativeSessionProtocol p=new NativeSessionProtocol();p.acceptConfig(config("ready").put("capabilities",new JSONArray().put("manual_terminal_input")));
+        SessionTarget t=initialize(p);
+        p.readPanePassive(t,"passive-0001");assertTrue(p.hasPendingRead());
+        assertThrows(Exception.class,()->p.readPanePassive(t,"passive-0002"));
+        assertEquals("hello\n",p.acceptPaneContent(response("passive-0001")));assertFalse(p.hasPendingRead());assertFalse(p.inputReady(t));
+        p.readPane(t,"explicit-0001");assertThrows(Exception.class,()->p.readPanePassive(t,"passive-0002"));
+        p.acceptPaneContent(response("explicit-0001"));assertTrue(p.inputReady(t));assertThrows(Exception.class,()->p.readPanePassive(t,"passive-0002"));assertTrue(p.inputReady(t));
+        java.lang.reflect.Field fresh=NativeSessionProtocol.class.getDeclaredField("freshAt");fresh.setAccessible(true);fresh.setLong(p,System.nanoTime()-4_000_000_000L);
+        p.readPanePassive(t,"passive-0003");p.acceptPaneContent(response("passive-0003"));assertFalse(p.inputReady(t));
+        p.readPanePassive(t,"passive-0004");p.cancelPendingRead();assertNull(p.acceptPaneContent(response("passive-0004")));assertFalse(p.inputReady(t));
+    }
+    @Test public void onlyExactCorrelatedPassiveReadErrorIsRecoverable()throws Exception {
+        NativeSessionProtocol p=ready();SessionTarget t=initialize(p);p.readPanePassive(t,"passive-0001");
+        assertNull(p.acceptPaneContent(response("wrong-request").put("error","unavailable")));assertTrue(p.hasPendingRead());
+        assertThrows(NativeSessionProtocol.PassiveReadFailure.class,()->p.acceptPaneContent(response("passive-0001").put("error","unavailable")));assertFalse(p.hasPendingRead());
+        p.readPanePassive(t,"passive-0002");
+        try{p.acceptPaneContent(response("passive-0002").put("error",true));fail();}catch(org.json.JSONException expected){assertFalse(expected instanceof NativeSessionProtocol.PassiveReadFailure);}
+    }
 }

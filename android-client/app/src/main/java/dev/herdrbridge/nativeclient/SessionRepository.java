@@ -9,6 +9,8 @@ public interface SessionRepository extends AutoCloseable {
     enum MutationOutcome { COMPLETED, NOT_STARTED, UNKNOWN }
     interface Listener {
         default void onAccess(String role) {}
+        default void onPassiveSnapshot(SessionTarget target,long token,String content) {}
+        default void onPassiveSnapshotTimeout(SessionTarget target,long token) {}
         default void onInputUncertaintyCleared(SessionTarget target) {}
         default void onMutationResult(String id, SessionTarget target, MutationOutcome outcome) {}
         void onSessions(List<Session> sessions);
@@ -17,6 +19,7 @@ public interface SessionRepository extends AutoCloseable {
     }
     void start(Listener listener);
     void requestSnapshot(SessionTarget target);
+    default void requestPassiveSnapshot(SessionTarget target,long token) {}
     default String sendTerminalText(SessionTarget target,String text) { throw new UnsupportedOperationException(); }
     default String sendEnter(SessionTarget target) { throw new UnsupportedOperationException(); }
     default void resetInputUncertainty(SessionTarget target) {}
