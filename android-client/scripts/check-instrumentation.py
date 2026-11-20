@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail closed unless all twenty expected native tests completed successfully."""
+"""Fail closed unless all expected native tests completed successfully."""
 import pathlib
 import re
 import sys
@@ -7,6 +7,7 @@ import sys
 EXPECTED = {('dev.herdrbridge.nativeclient.AndroidCryptoTest', 'originalGoldenAndNegativeChecksOnAndroid'), ('dev.herdrbridge.protocol.ChunkCodecTest', 'rejectsSequenceFlagsLengthAndVersion'), ('dev.herdrbridge.nativeclient.QrImageDecoderTest', 'generatedPngDecodedByRealAndroidBitmapFactory'), ('dev.herdrbridge.nativeclient.QrImageDecoderTest', 'malformedOversizedAndCancelledImagesFailClosed'), ('dev.herdrbridge.nativeclient.DeviceVaultTest', 'roundTripWrongAuthorityCorruptionAndLostKeyFailClosed'), ('dev.herdrbridge.protocol.ChunkCodecTest', 'closeAndOversizeCarrierFail'), ('dev.herdrbridge.protocol.ChunkCodecTest', 'timeoutAndClockFailureAreFatal'), ('dev.herdrbridge.nativeclient.MainActivitySmokeTest', 'foregroundRecoveryClosesOldClientAndDisconnectStopsRecovery'), ('dev.herdrbridge.nativeclient.ReaderQrUiTest', 'localPickerContractAndCancelledStaleNonContentResultsFailClosed'), ('dev.herdrbridge.nativeclient.ReaderQrUiTest', 'nativeReaderLayoutShowsDistinctPaneAndExplicitSensitiveCopy'), ('dev.herdrbridge.nativeclient.ReaderQrUiTest', 'backgroundCancelsDecoderWorkAndClearsInvitation'), ('dev.herdrbridge.protocol.ChunkCodecTest', 'zeroAndMaximumMessagesAndNewAssembly'), ('dev.herdrbridge.nativeclient.MainActivitySmokeTest', 'nativeInitialUiAndInvalidActionsNeverCreateConnection'), ('dev.herdrbridge.nativeclient.QrImageDecoderTest', 'cancellationClosesBlockedPipeReadWithoutRetainingDescriptor'), ('dev.herdrbridge.nativeclient.ReaderQrUiTest', 'verifiedQrResultOnlyPopulatesCurrentForegroundOrigin'), ('dev.herdrbridge.protocol.ChunkCodecTest', 'matchesActualTypescriptExporterVector'), ('dev.herdrbridge.nativeclient.MainActivitySmokeTest', 'backgroundAndRecreationClearTransientInvitationWithoutAutoConnect'), ('dev.herdrbridge.nativeclient.MainActivitySmokeTest', 'restoredAuthorizationRequiresExactOriginAndValidSavedVault')}
 
 EXPECTED.update({
+    ('dev.herdrbridge.nativeclient.MainActivitySmokeTest', 'connectedSettingsStaysOpenOnReadyAndInventoryUpdates'),
     ('dev.herdrbridge.nativeclient.TerminalInputUiTest', 'readerCannotWriteAndControllerRequiresFreshSnapshotAndExplicitButtons'),
     ('dev.herdrbridge.nativeclient.TerminalInputUiTest', 'unknownPersistsAcrossRecreationUntilFreshExplicitInspection'),
 })

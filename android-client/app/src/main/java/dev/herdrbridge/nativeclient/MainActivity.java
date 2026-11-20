@@ -17,6 +17,7 @@ public final class MainActivity extends Activity {
     private TextView screenTitle,homeSummary,homeEmpty;
     private Button disconnectButton,homeReconnect;
     private String currentScreen="PAIR";
+    private boolean settingsOpen;
     private Runnable unregisterScreenBack;
     private SessionRepository.SessionTarget pendingMutationTarget;
     private TextView inputStatus, accessLabel;
@@ -58,7 +59,7 @@ public final class MainActivity extends Activity {
         LinearLayout bar=new LinearLayout(this);bar.setGravity(android.view.Gravity.CENTER_VERTICAL);root.addView(bar,new LinearLayout.LayoutParams(-1,dp(52)));
         showSessions=button("‹ 会话",false);showSessions.setOnClickListener(v->showHome());bar.addView(showSessions,new LinearLayout.LayoutParams(dp(84),dp(44)));
         screenTitle=text("连接电脑",22,INK);screenTitle.setTypeface(null,Typeface.BOLD);bar.addView(screenTitle,new LinearLayout.LayoutParams(0,-2,1));
-        Button settings=button("设置",false);settings.setOnClickListener(v->showPairing());bar.addView(settings,new LinearLayout.LayoutParams(dp(70),dp(44)));
+        Button settings=button("设置",false);settings.setOnClickListener(v->openSettings());bar.addView(settings,new LinearLayout.LayoutParams(dp(70),dp(44)));
         state=text("填写服务器地址，导入邀请后完成配对。",13,MUTED);state.setPadding(dp(12),dp(10),dp(12),dp(10));state.setBackground(shape(0xFFE9EFF8,12));state.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);state.setMaxLines(3);root.addView(state,spaced(-1,-2,8));
         accessLabel=text("端到端加密 · 默认只读",12,MUTED);root.addView(accessLabel,spaced(-1,-2,8));
         FrameLayout host=new FrameLayout(this);root.addView(host,new LinearLayout.LayoutParams(-1,0,1));
@@ -117,15 +118,17 @@ public final class MainActivity extends Activity {
     private void hideKeyboard(){android.view.inputmethod.InputMethodManager ime=(android.view.inputmethod.InputMethodManager)getSystemService(INPUT_METHOD_SERVICE);if(ime!=null)ime.hideSoftInputFromWindow(getWindow().getDecorView().getWindowToken(),0);}
     private void showScreen(String screen){
         currentScreen=screen;setup.setVisibility("PAIR".equals(screen)?View.VISIBLE:View.GONE);homeScreen.setVisibility("HOME".equals(screen)?View.VISIBLE:View.GONE);detailScreen.setVisibility("DETAIL".equals(screen)?View.VISIBLE:View.GONE);
-        screenTitle.setText("PAIR".equals(screen)?"连接电脑":"HOME".equals(screen)?"会话":"终端");showSessions.setVisibility("DETAIL".equals(screen)?View.VISIBLE:View.GONE);showSessions.setEnabled(!inputPending);accessLabel.setVisibility("PAIR".equals(screen)?View.GONE:View.VISIBLE);
+        screenTitle.setText("PAIR".equals(screen)?(settingsOpen?"连接设置":"连接电脑"):"HOME".equals(screen)?"会话":"终端");showSessions.setVisibility("DETAIL".equals(screen)||settingsOpen?View.VISIBLE:View.GONE);showSessions.setEnabled(!inputPending);accessLabel.setVisibility("PAIR".equals(screen)?View.GONE:View.VISIBLE);
         updateScreenBack();
         if(connection!=null)connection.setPassiveTarget("DETAIL".equals(screen)?selected:null);
     }
-    private void showPairing(){hideKeyboard();clearTerminalDraft();if(connection!=null)connection.selectTarget(null);selected=null;terminal.setText("");copy.setEnabled(false);refresh.setEnabled(false);showScreen("PAIR");}
-    private void showHome(){hideKeyboard();clearTerminalDraft();if(connection!=null)connection.selectTarget(null);selected=null;terminal.setText("");copy.setEnabled(false);refresh.setEnabled(false);sessionList.setVisibility(View.VISIBLE);showScreen("HOME");updateInputControls();}
+    private void showPairing(){showSetup(false);}
+    private void openSettings(){showSetup(true);}
+    private void showSetup(boolean settings){settingsOpen=settings;hideKeyboard();clearTerminalDraft();if(connection!=null)connection.selectTarget(null);selected=null;terminal.setText("");copy.setEnabled(false);refresh.setEnabled(false);showScreen("PAIR");}
+    private void showHome(){settingsOpen=false;hideKeyboard();clearTerminalDraft();if(connection!=null)connection.selectTarget(null);selected=null;terminal.setText("");copy.setEnabled(false);refresh.setEnabled(false);sessionList.setVisibility(View.VISIBLE);showScreen("HOME");updateInputControls();}
     private void showDetail(){showScreen("DETAIL");}
     private boolean handlesScreenBack(){
-        return "DETAIL".equals(currentScreen)||("PAIR".equals(currentScreen)&&ready);
+        return "DETAIL".equals(currentScreen)||("PAIR".equals(currentScreen)&&(ready||settingsOpen));
     }
 
     private void updateScreenBack(){
@@ -317,14 +320,14 @@ public final class MainActivity extends Activity {
                 public void onState(SessionRepository.State status,String safeMessage) { runOnUiThread(()->{
                     if(generation!=epoch)return;
                     // Deliberately do not render exception/network strings that may contain secrets.
-                    state.setText(stateText(status));
+                    if(!settingsOpen||status!=SessionRepository.State.READY)state.setText(stateText(status));
                     if(status==SessionRepository.State.READY||status==SessionRepository.State.ENROLLED){
                         if(!armRecovery(configured,status==SessionRepository.State.ENROLLED)){stopConnection();state.setText("无法验证已保存凭证；自动恢复已停止。");return;}
                     }
                     if(status==SessionRepository.State.ERROR||status==SessionRepository.State.REVOKED)clearRecovery();
                     ready=status==SessionRepository.State.READY;updateScreenBack();showSessions.setEnabled(ready&&!inputPending);
                     if(!ready){homeEmpty.setText("连接正在恢复\n后台不会保持网络连接。");homeEmpty.setVisibility(View.VISIBLE);refresh.setEnabled(false);copy.setEnabled(false);terminal.setText("");sessions.removeAllViews();selected=null;selectedLabel.setText("未选中会话");clearTerminalDraft();inputTargets.clear();}
-                    else {refresh.setEnabled(selected!=null);disconnectButton.setVisibility(View.VISIBLE);if(selected==null&&!"HOME".equals(currentScreen))showHome();}
+                    else {refresh.setEnabled(selected!=null);disconnectButton.setVisibility(View.VISIBLE);showHomeOnReadyIfAppropriate();}
                     updateInputControls();
                 }); }
                 public void onSessions(List<SessionRepository.Session> rows) { runOnUiThread(()->{
@@ -351,6 +354,9 @@ public final class MainActivity extends Activity {
             if(pair)connection.explicitInvitation(invitationClient);else if(restoring)connection.restoreSaved(priorRetries);else connection.explicitSaved();
         } catch(Exception ignored) {clearRecovery();stopConnection();invitation.setText("");state.setText("无法连接或凭证校验失败。检查地址、邀请权限或电脑端撤销状态；不会跳过安全检查。");}
     }
+    private void showHomeOnReadyIfAppropriate(){
+        if(!settingsOpen&&selected==null&&!"HOME".equals(currentScreen))showHome();
+    }
     private void displaySessions(List<SessionRepository.Session> rows){
                     sessions.removeAllViews();inputTargets.clear();boolean retained=false;
                     int count=0;
@@ -363,8 +369,8 @@ public final class MainActivity extends Activity {
                         item.setOnClickListener(v->{if(!ready||connection==null||inputPending)return;clearTerminalDraft();selected=row.target;connection.selectTarget(selected);hideKeyboard();showDetail();screenTitle.setText(shortText(row.title.isEmpty()?"终端":row.title,24));sessionList.setVisibility(View.GONE);terminal.setText("");copy.setEnabled(false);selectedLabel.setText("服务器 "+shortText(selected.serverSessionId,40)+" / 窗格 "+shortText(selected.paneId,50)+" / 代次 "+selected.generation);state.setText("正在读取选中会话的新快照…");refresh.setEnabled(true);updateInputControls();connection.requestSnapshot(selected);});sessions.addView(item,spaced(-1,-2,10));
                     }
                     homeSummary.setText("电脑会话 · "+Math.min(rows.size(),256));homeEmpty.setVisibility(rows.isEmpty()?View.VISIBLE:View.GONE);homeEmpty.setText("暂无会话\n在电脑上打开终端或启动会话后，这里会自动更新。");
-                    if(!retained){clearTerminalDraft();if(connection!=null)connection.selectTarget(null);sessionList.setVisibility(View.VISIBLE);selected=null;terminal.setText("");copy.setEnabled(false);refresh.setEnabled(false);selectedLabel.setText("未选中会话");showHome();}
-                    if(rows.isEmpty())state.setText("已连接，服务器没有可显示的会话。");else if(selected==null)state.setText("已连接："+Math.min(rows.size(),256)+" 个会话。请选择一个读取快照。");
+                    if(!retained){clearTerminalDraft();if(connection!=null)connection.selectTarget(null);sessionList.setVisibility(View.VISIBLE);selected=null;terminal.setText("");copy.setEnabled(false);refresh.setEnabled(false);selectedLabel.setText("未选中会话");if(!settingsOpen)showHome();}
+                    if(!settingsOpen&&rows.isEmpty())state.setText("已连接，服务器没有可显示的会话。");else if(!settingsOpen&&selected==null)state.setText("已连接："+Math.min(rows.size(),256)+" 个会话。请选择一个读取快照。");
         updateInputControls();
     }
     private void displayPassiveSnapshot(SessionRepository.SessionTarget target,String content){

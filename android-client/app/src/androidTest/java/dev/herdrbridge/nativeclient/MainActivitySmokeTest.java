@@ -13,6 +13,7 @@ import androidx.lifecycle.Lifecycle;
 import androidx.test.core.app.ActivityScenario;
 import org.junit.Test;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -214,4 +215,46 @@ public class MainActivitySmokeTest {
         }
     }
 
+
+    @Test public void connectedSettingsStaysOpenOnReadyAndInventoryUpdates() {
+        try (ActivityScenario<MainActivity> scenario=ActivityScenario.launch(MainActivity.class)) {
+            scenario.onActivity(activity->{
+                try {
+                    Field ready=MainActivity.class.getDeclaredField("ready");
+                    ready.setAccessible(true);
+                    ready.setBoolean(activity,true);
+                    Method land=MainActivity.class.getDeclaredMethod("showHomeOnReadyIfAppropriate");
+                    land.setAccessible(true);
+                    Method refresh=MainActivity.class.getDeclaredMethod("displaySessions",java.util.List.class);
+                    refresh.setAccessible(true);
+                    // READY on initial pairing still goes to the home page.
+                    land.invoke(activity);
+                    assertEquals("HOME",field(activity,"currentScreen",String.class));
+                    Button settings=button(activity.getWindow().getDecorView(),"设置");
+                    assertNotNull(settings);
+                    assertTrue(settings.performClick());
+                    EditText origin=field(activity,"origin",EditText.class);
+                    origin.setText("https://example.invalid");
+                    TextView state=field(activity,"state",TextView.class);
+                    state.setText("synthetic settings feedback");
+                    land.invoke(activity); // repeated READY
+                    SessionRepository.SessionTarget target=new SessionRepository.SessionTarget("primary","pane-settings","terminal-settings",1,"");
+                    refresh.invoke(activity,java.util.Collections.singletonList(new SessionRepository.Session(target,"synthetic","idle",false)));
+                    refresh.invoke(activity,java.util.Collections.emptyList());
+                    refresh.invoke(activity,java.util.Collections.singletonList(new SessionRepository.Session(target,"synthetic","idle",false)));
+                    assertEquals("PAIR",field(activity,"currentScreen",String.class));
+                    assertTrue(origin.isShown());
+                    assertEquals("https://example.invalid",origin.getText().toString());
+                    assertEquals("synthetic settings feedback",state.getText().toString());
+                    Button back=field(activity,"showSessions",Button.class);
+                    assertTrue(back.isShown());
+                    assertTrue(back.performClick());
+                    assertEquals("HOME",field(activity,"currentScreen",String.class));
+                    assertEquals(1,field(activity,"sessions",ViewGroup.class).getChildCount());
+                } catch (ReflectiveOperationException error) {
+                    throw new AssertionError(error);
+                }
+            });
+        }
+    }
 }

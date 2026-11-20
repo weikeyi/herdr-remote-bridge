@@ -7,15 +7,17 @@ checker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(checker)
 
 
+COUNT = len(checker.EXPECTED)
+
 def success():
     lines = []
     for cls, test in sorted(checker.EXPECTED):
         for code in (1, 0):
             lines += [f"INSTRUMENTATION_STATUS: class={cls}",
                       f"INSTRUMENTATION_STATUS: test={test}",
-                      "INSTRUMENTATION_STATUS: numtests=20",
+                      f"INSTRUMENTATION_STATUS: numtests={COUNT}",
                       f"INSTRUMENTATION_STATUS_CODE: {code}"]
-    return "\n".join(lines + ["INSTRUMENTATION_RESULT: stream=", "OK (20 tests)", "INSTRUMENTATION_CODE: -1", ""])
+    return "\n".join(lines + ["INSTRUMENTATION_RESULT: stream=", f"OK ({COUNT} tests)", "INSTRUMENTATION_CODE: -1", ""])
 
 
 class ResultTests(unittest.TestCase):
@@ -43,7 +45,7 @@ class ResultTests(unittest.TestCase):
             checker.validate(success().replace("INSTRUMENTATION_CODE: -1", ""))
 
     def test_wrong_count_or_identity(self):
-        for old, new in [("numtests=20", "numtests=1"), ("AndroidCryptoTest", "OtherTest"), ("OK (20 tests)", "OK (0 tests)")]:
+        for old, new in [(f"numtests={COUNT}", "numtests=1"), ("AndroidCryptoTest", "OtherTest"), (f"OK ({COUNT} tests)", "OK (0 tests)")]:
             with self.subTest(old=old), self.assertRaises(ValueError):
                 checker.validate(success().replace(old, new))
 
