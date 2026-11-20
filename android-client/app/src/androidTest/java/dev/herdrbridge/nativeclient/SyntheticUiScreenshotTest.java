@@ -385,7 +385,15 @@ public class SyntheticUiScreenshotTest {
                 capture(scenario,"03-reader-detail");
                 systemBack();
                 scenario.onActivity(a->assertEquals("HOME",get(a,"currentScreen")));
-                scenario.onActivity(a->{fixture.set(install(a,"controller"));openAtlas(a);snapshot(fixture.get());assertTrue(((View)get(a,"inputPanel")).isShown());assertTrue(((TextView)get(a,"accessLabel")).getText().toString().contains("Controller"));assertTrue(((View)get(a,"sendEnter")).isEnabled());assertEquals("",((EditText)get(a,"terminalDraft")).getText().toString());});
+                scenario.onActivity(a->{
+                    fixture.set(install(a,"controller"));openAtlas(a);snapshot(fixture.get());
+                    assertTrue("Controller composer is shown",((View)get(a,"inputPanel")).isShown());
+                    TextView role=(TextView)get(a,"detailRole");
+                    assertTrue("Controller role is visible in the detail layout",role.isShown());
+                    assertTrue("Controller role is explicitly labeled",role.getText().toString().contains("Controller"));
+                    assertTrue("Authorized fresh snapshot enables the separate Enter action",((View)get(a,"sendEnter")).isEnabled());
+                    assertEquals("",((EditText)get(a,"terminalDraft")).getText().toString());
+                });
                 capture(scenario,"04-controller-composer");
                 android.app.UiAutomation automation=InstrumentationRegistry.getInstrumentation().getUiAutomation();
                 android.accessibilityservice.AccessibilityServiceInfo original=automation.getServiceInfo();
