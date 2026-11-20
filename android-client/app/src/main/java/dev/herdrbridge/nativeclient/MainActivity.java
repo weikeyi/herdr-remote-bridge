@@ -17,6 +17,7 @@ public final class MainActivity extends Activity {
     private TextView screenTitle,homeSummary,homeEmpty;
     private Button disconnectButton,homeReconnect;
     private String currentScreen="PAIR";
+    private Runnable unregisterScreenBack;
     private SessionRepository.SessionTarget pendingMutationTarget;
     private TextView inputStatus, accessLabel;
     private Button sendText, sendEnter, acknowledgeInput;
@@ -117,11 +118,44 @@ public final class MainActivity extends Activity {
     private void showScreen(String screen){
         currentScreen=screen;setup.setVisibility("PAIR".equals(screen)?View.VISIBLE:View.GONE);homeScreen.setVisibility("HOME".equals(screen)?View.VISIBLE:View.GONE);detailScreen.setVisibility("DETAIL".equals(screen)?View.VISIBLE:View.GONE);
         screenTitle.setText("PAIR".equals(screen)?"连接电脑":"HOME".equals(screen)?"会话":"终端");showSessions.setVisibility("DETAIL".equals(screen)?View.VISIBLE:View.GONE);showSessions.setEnabled(!inputPending);accessLabel.setVisibility("PAIR".equals(screen)?View.GONE:View.VISIBLE);
+        updateScreenBack();
     }
     private void showPairing(){hideKeyboard();clearTerminalDraft();if(connection!=null)connection.selectTarget(null);selected=null;terminal.setText("");copy.setEnabled(false);refresh.setEnabled(false);showScreen("PAIR");}
     private void showHome(){hideKeyboard();clearTerminalDraft();if(connection!=null)connection.selectTarget(null);selected=null;terminal.setText("");copy.setEnabled(false);refresh.setEnabled(false);sessionList.setVisibility(View.VISIBLE);showScreen("HOME");updateInputControls();}
     private void showDetail(){showScreen("DETAIL");}
-    @Override public void onBackPressed(){if("DETAIL".equals(currentScreen)){showHome();return;}if("PAIR".equals(currentScreen)&&ready){showHome();return;}super.onBackPressed();}
+    private boolean handlesScreenBack(){
+        return "DETAIL".equals(currentScreen)||("PAIR".equals(currentScreen)&&ready);
+    }
+
+    private void updateScreenBack(){
+        if(android.os.Build.VERSION.SDK_INT<33)return;
+        boolean enabled=foreground&&handlesScreenBack();
+        if(enabled&&unregisterScreenBack==null){
+            unregisterScreenBack=Api33Back.register(this,()->{
+                if(foreground&&handlesScreenBack())showHome();
+            });
+        }else if(!enabled&&unregisterScreenBack!=null){
+            unregisterScreenBack.run();
+            unregisterScreenBack=null;
+        }
+    }
+
+    @android.annotation.TargetApi(33)
+    private static final class Api33Back {
+        static Runnable register(Activity activity,Runnable action){
+            android.window.OnBackInvokedDispatcher dispatcher=activity.getOnBackInvokedDispatcher();
+            android.window.OnBackInvokedCallback callback=action::run;
+            // Leave the IME's own back handling ahead of our screen navigation.
+            dispatcher.registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,callback);
+            return ()->dispatcher.unregisterOnBackInvokedCallback(callback);
+        }
+    }
+
+    @Override @SuppressWarnings("deprecation")
+    public void onBackPressed(){
+        if(android.os.Build.VERSION.SDK_INT<33&&handlesScreenBack()){showHome();return;}
+        super.onBackPressed();
+    }
     private static final String UNKNOWN_INPUT="可能已发送，未确认，请刷新终端核对后再决定是否重试。";
     private void displayMutationResult(String id,SessionRepository.MutationOutcome outcome){
                     if(!id.equals(pendingMutationId))return;
@@ -285,9 +319,8 @@ public final class MainActivity extends Activity {
                         if(!armRecovery(configured,status==SessionRepository.State.ENROLLED)){stopConnection();state.setText("无法验证已保存凭证；自动恢复已停止。");return;}
                     }
                     if(status==SessionRepository.State.ERROR||status==SessionRepository.State.REVOKED)clearRecovery();
-                    ready=status==SessionRepository.State.READY;showSessions.setEnabled(ready&&!inputPending);
-                    if(!ready){homeEmpty.setText("连接正在恢复
-后台不会保持网络连接。");homeEmpty.setVisibility(View.VISIBLE);refresh.setEnabled(false);copy.setEnabled(false);terminal.setText("");sessions.removeAllViews();selected=null;selectedLabel.setText("未选中会话");clearTerminalDraft();inputTargets.clear();}
+                    ready=status==SessionRepository.State.READY;updateScreenBack();showSessions.setEnabled(ready&&!inputPending);
+                    if(!ready){homeEmpty.setText("连接正在恢复\n后台不会保持网络连接。");homeEmpty.setVisibility(View.VISIBLE);refresh.setEnabled(false);copy.setEnabled(false);terminal.setText("");sessions.removeAllViews();selected=null;selectedLabel.setText("未选中会话");clearTerminalDraft();inputTargets.clear();}
                     else {refresh.setEnabled(selected!=null);disconnectButton.setVisibility(View.VISIBLE);if(selected==null&&!"HOME".equals(currentScreen))showHome();}
                     updateInputControls();
                 }); }
@@ -328,7 +361,7 @@ public final class MainActivity extends Activity {
     private void displaySnapshot(SessionRepository.SessionTarget target,String content){
         if(ready&&target.equals(selected)){terminal.setText(TerminalSnapshot.render(content));copy.setEnabled(terminal.length()>0);state.setText("快照已更新。内容不会自动发送到剪贴板。");updateInputControls();if(inputExpiry!=null)handler.removeCallbacks(inputExpiry);inputExpiry=this::updateInputControls;handler.postDelayed(inputExpiry,connection==null?1:Math.max(1,connection.inputFreshMillis(target)));}
     }
-    private void stopConnection() {epoch++;ready=false;clearTerminalDraft();inputPending=false;pendingMutationId=null;pendingMutationTarget=null;inputTargets.clear();verifiedRole="reader";if(connection!=null){connection.stop();connection=null;}if(repository!=null){repository.close();repository=null;}selected=null;if(terminal!=null)terminal.setText("");if(sessions!=null)sessions.removeAllViews();if(refresh!=null)refresh.setEnabled(false);if(copy!=null)copy.setEnabled(false);if(showSessions!=null)showSessions.setEnabled(false);if(selectedLabel!=null)selectedLabel.setText("未选中会话");updateInputControls();}
+    private void stopConnection() {epoch++;ready=false;updateScreenBack();clearTerminalDraft();inputPending=false;pendingMutationId=null;pendingMutationTarget=null;inputTargets.clear();verifiedRole="reader";if(connection!=null){connection.stop();connection=null;}if(repository!=null){repository.close();repository=null;}selected=null;if(terminal!=null)terminal.setText("");if(sessions!=null)sessions.removeAllViews();if(refresh!=null)refresh.setEnabled(false);if(copy!=null)copy.setEnabled(false);if(showSessions!=null)showSessions.setEnabled(false);if(selectedLabel!=null)selectedLabel.setText("未选中会话");updateInputControls();}
     private boolean armRecovery(String configured,boolean confirming){
         try(CredentialRecord record=new DeviceVault(this).load(configured)){
             getPreferences(MODE_PRIVATE).edit().putBoolean("auto_connect",true).putString("auto_origin",configured)
@@ -342,7 +375,7 @@ public final class MainActivity extends Activity {
     }
     private void clearRecovery(){getPreferences(MODE_PRIVATE).edit().remove("auto_connect").remove("auto_origin").remove("auto_retries").remove("auto_device").remove("auto_credential").remove("auto_confirming").apply();}
     @Override public void onStart(){
-        super.onStart();foreground=true;
+        super.onStart();foreground=true;updateScreenBack();
         if(pendingQrUri!=null){android.net.Uri uri=pendingQrUri;pendingQrUri=null;decodeQr(uri);}
         if(connection!=null)connection.foreground();
         else if(!restoreChecked){
@@ -355,6 +388,6 @@ public final class MainActivity extends Activity {
             }
         }
     }
-    @Override public void onStop(){foreground=false;clearTerminalDraft();inputPending=false;pendingMutationId=null;pendingMutationTarget=null;cancelQr(false);copy.setEnabled(false);showSessions.setEnabled(false);selectedLabel.setText("未选中会话");if(connection!=null)connection.background();ready=false;selected=null;terminal.setText("");sessions.removeAllViews();refresh.setEnabled(false);invitation.setText("");state.setText("后台已断开；返回后仅用已保存凭证恢复，不重试邀请。");updateInputControls();super.onStop();}
-    @Override public void onDestroy(){cancelQr(true);qrWorker.shutdownNow();stopConnection();super.onDestroy();}
+    @Override public void onStop(){foreground=false;updateScreenBack();clearTerminalDraft();inputPending=false;pendingMutationId=null;pendingMutationTarget=null;cancelQr(false);copy.setEnabled(false);showSessions.setEnabled(false);selectedLabel.setText("未选中会话");if(connection!=null)connection.background();ready=false;selected=null;terminal.setText("");sessions.removeAllViews();refresh.setEnabled(false);invitation.setText("");state.setText("后台已断开；返回后仅用已保存凭证恢复，不重试邀请。");updateInputControls();super.onStop();}
+    @Override public void onDestroy(){foreground=false;updateScreenBack();cancelQr(true);qrWorker.shutdownNow();stopConnection();super.onDestroy();}
 }
