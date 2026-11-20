@@ -6,12 +6,20 @@ mkdir -p "$report"
 timeout 60s adb wait-for-device
 timeout 300s adb install -r app/build/device-inputs/app-debug.apk > "$report/install-app.txt" 2>&1
 timeout 300s adb install -r -t app/build/device-inputs/app-debug-androidTest.apk > "$report/install-tests.txt" 2>&1
-# -r preserves per-test statuses; pipefail preserves adb/timeout failure.
+# -r preserves per-test statuses; preserve regression failure while still capturing visual QA.
+set +e
 timeout 300s adb shell am instrument -w -r \
   -e class dev.herdrbridge.nativeclient.AndroidCryptoTest,dev.herdrbridge.nativeclient.DeviceVaultTest,dev.herdrbridge.protocol.ChunkCodecTest,dev.herdrbridge.nativeclient.MainActivitySmokeTest,dev.herdrbridge.nativeclient.ReaderQrUiTest,dev.herdrbridge.nativeclient.QrImageDecoderTest,dev.herdrbridge.nativeclient.TerminalInputUiTest \
   dev.herdrbridge.nativeclient.preview.test/androidx.test.runner.AndroidJUnitRunner \
   2>&1 | tee "$report/instrumentation.txt"
+regression_adb=${PIPESTATUS[0]}
 python3 scripts/check-instrumentation.py "$report/instrumentation.txt"
+regression_check=$?
+set -e
+
+# This is a disposable emulator setting, applied only after boot and APK install.
+# Its emulated hardware keyboard must not suppress the real on-screen IME.
+timeout 20s adb shell settings put secure show_ime_with_hard_keyboard 1
 
 # Screenshot suite is separate: the original 20-test acceptance stays unchanged.
 ui_report=app/build/reports/synthetic-ui
@@ -27,7 +35,7 @@ timeout 60s adb pull /sdcard/Android/data/dev.herdrbridge.nativeclient.preview/f
 pull_status=$?
 set -e
 python3 scripts/check-instrumentation.py "$ui_report/instrumentation.txt" --screenshots
-[[ "$ui_status" == 0 && "$pull_status" == 0 ]]
+[[ "$regression_adb" == 0 && "$regression_check" == 0 && "$ui_status" == 0 && "$pull_status" == 0 ]]
 python3 - "$ui_report" <<'PYCHECK'
 import pathlib,sys
 root=pathlib.Path(sys.argv[1])

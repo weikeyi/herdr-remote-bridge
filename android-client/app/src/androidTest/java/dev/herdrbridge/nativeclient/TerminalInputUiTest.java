@@ -52,6 +52,7 @@ public class TerminalInputUiTest {
     ((Button)get(a,"sendText")).performClick();assertEquals("echo test",controller.text);assertEquals(1,controller.textSends);assertEquals(0,controller.enters);assertEquals("",draft.getText().toString());assertTrue(a.getPreferences(0).getBoolean("input_uncertain",false));
     ((Button)get(a,"sendText")).performClick();((Button)get(a,"sendEnter")).performClick();assertEquals(1,controller.textSends);assertEquals(0,controller.enters);
     controller.listener.onMutationResult(controller.id,TARGET,SessionRepository.MutationOutcome.NOT_STARTED);assertFalse(a.getPreferences(0).getBoolean("input_uncertain",false));assertFalse(((Button)get(a,"sendEnter")).isEnabled());
+    assertTrue(((Button)get(a,"refresh")).performClick()); // NOT_STARTED does not implicitly refresh.
     controller.listener.onSnapshot(TARGET,"fresh before explicit second attempt");draft.setText("synthetic text");((Button)get(a,"sendText")).performClick();int readsBefore=controller.reads;
     controller.listener.onMutationResult(controller.id,TARGET,SessionRepository.MutationOutcome.COMPLETED);
     assertEquals(readsBefore+1,controller.reads);assertEquals(2,controller.textSends);assertEquals(0,controller.enters);assertFalse(((Button)get(a,"sendEnter")).isEnabled());
