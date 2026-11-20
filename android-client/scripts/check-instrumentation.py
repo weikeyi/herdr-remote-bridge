@@ -12,13 +12,16 @@ EXPECTED.update({
 })
 
 
-def validate(text):
+SCREENSHOTS = {('dev.herdrbridge.nativeclient.SyntheticUiScreenshotTest', 'syntheticScreensAndControllerComposer')}
+
+def validate(text, expected=EXPECTED):
+    count = len(expected)
     if re.search(r"INSTRUMENTATION_(?:FAILED|ABORTED)|shortMsg=|FAILURES!!!|Process crashed", text):
         raise ValueError("Instrumentation failed or crashed")
     if re.findall(r"^INSTRUMENTATION_CODE:\s*(-?\d+)\s*$", text, re.M) != ["-1"]:
         raise ValueError("Missing or unexpected final instrumentation result")
-    if len(re.findall(r"^OK \(20 tests\)\s*$", text, re.M)) != 1:
-        raise ValueError("Expected exactly twenty successful tests")
+    if len(re.findall(rf"^OK \({count} tests?\)\s*$", text, re.M)) != 1:
+        raise ValueError("Expected exact successful test count")
     fields = {}
     started, passed = set(), set()
     for line in text.splitlines():
@@ -29,7 +32,7 @@ def validate(text):
         elif line.startswith("INSTRUMENTATION_STATUS_CODE: "):
             code = line.split(": ", 1)[1].strip()
             test = (fields.get("class"), fields.get("test"))
-            if test not in EXPECTED or fields.get("numtests") != "20":
+            if test not in expected or fields.get("numtests") != str(count):
                 raise ValueError("Unexpected test identity or test count")
             if code == "1" and test not in started:
                 started.add(test)
@@ -38,13 +41,13 @@ def validate(text):
             else:
                 raise ValueError("Failure, skip, duplicate or invalid test status")
             fields = {}
-    if started != EXPECTED or passed != EXPECTED:
+    if started != expected or passed != expected:
         raise ValueError("Not all expected tests started and passed")
 
 
 if __name__ == "__main__":
     try:
-        validate(pathlib.Path(sys.argv[1]).read_text())
+        validate(pathlib.Path(sys.argv[1]).read_text(), SCREENSHOTS if len(sys.argv) == 3 and sys.argv[2] == "--screenshots" else EXPECTED)
     except (ValueError, OSError, IndexError) as exc:
         sys.exit(f"Instrumentation acceptance failed: {exc}")
     print("PASS: all expected Android crypto/chunk/vault/UI/QR/input tests completed")

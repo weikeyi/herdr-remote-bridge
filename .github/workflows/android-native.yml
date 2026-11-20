@@ -97,6 +97,7 @@ jobs:
           cd app/build/outputs/apk/debug
           sha256sum app-debug.apk > SHA256SUMS
       - name: Upload internal native APK (not device-accepted release)
+        if: ${{ false }} # UI candidate: no user APK publication
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: bridge-native-internal-apk-${{ github.run_id }}
@@ -193,6 +194,14 @@ jobs:
         with:
           name: android-native-instrumentation-${{ github.run_id }}
           path: android-client/app/build/reports/androidTests/
+          retention-days: 1
+          if-no-files-found: ignore
+      - name: Upload synthetic UI screenshots (not real-device acceptance)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android-native-synthetic-ui-${{ github.run_id }}
+          path: android-client/app/build/reports/synthetic-ui/
           retention-days: 1
           if-no-files-found: ignore
 

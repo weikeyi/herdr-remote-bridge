@@ -22,6 +22,13 @@ class ResultTests(unittest.TestCase):
     def test_success(self):
         checker.validate(success())
 
+    def test_screenshot_suite_is_separate_and_strict(self):
+        cls, test = next(iter(checker.SCREENSHOTS))
+        text = "\n".join([f"INSTRUMENTATION_STATUS: class={cls}\nINSTRUMENTATION_STATUS: test={test}\nINSTRUMENTATION_STATUS: numtests=1\nINSTRUMENTATION_STATUS_CODE: {code}" for code in (1, 0)]) + "\nOK (1 test)\nINSTRUMENTATION_CODE: -1\n"
+        checker.validate(text, checker.SCREENSHOTS)
+        with self.assertRaises(ValueError): checker.validate(text)
+        with self.assertRaises(ValueError): checker.validate(text.replace("STATUS_CODE: 0", "STATUS_CODE: -3"), checker.SCREENSHOTS)
+
     def test_crash(self):
         with self.assertRaises(ValueError):
             checker.validate(success() + "INSTRUMENTATION_RESULT: shortMsg=Process crashed\n")

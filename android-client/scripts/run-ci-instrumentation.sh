@@ -12,3 +12,27 @@ timeout 300s adb shell am instrument -w -r \
   dev.herdrbridge.nativeclient.internal.test/androidx.test.runner.AndroidJUnitRunner \
   2>&1 | tee "$report/instrumentation.txt"
 python3 scripts/check-instrumentation.py "$report/instrumentation.txt"
+
+# Screenshot suite is separate: the original 20-test acceptance stays unchanged.
+ui_report=app/build/reports/synthetic-ui
+mkdir -p "$ui_report"
+printf '%s\n' 'API29 emulator; real Activity with synthetic test-only repositories. No real endpoint, credentials or terminal. PNGs may be partial when a test fails; keyboard PNG exists only after observed IME visibility.' > "$ui_report/README.txt"
+set +e
+timeout 180s adb shell am instrument -w -r \
+  -e class dev.herdrbridge.nativeclient.SyntheticUiScreenshotTest \
+  dev.herdrbridge.nativeclient.internal.test/androidx.test.runner.AndroidJUnitRunner \
+  2>&1 | tee "$ui_report/instrumentation.txt"
+ui_status=${PIPESTATUS[0]}
+timeout 60s adb pull /sdcard/Android/data/dev.herdrbridge.nativeclient.internal/files/synthetic-ui/. "$ui_report/" > "$ui_report/pull.txt" 2>&1
+pull_status=$?
+set -e
+python3 scripts/check-instrumentation.py "$ui_report/instrumentation.txt" --screenshots
+[[ "$ui_status" == 0 && "$pull_status" == 0 ]]
+python3 - "$ui_report" <<'PYCHECK'
+import pathlib,sys
+root=pathlib.Path(sys.argv[1])
+for name in ('01-pairing-empty','02-session-home','03-reader-detail','04-controller-composer','05-controller-ime-visible'):
+    data=(root/(name+'.png')).read_bytes()
+    assert data.startswith(b'\x89PNG\r\n\x1a\n') and len(data)>1000, name
+print('PASS five real synthetic-screen PNGs captured; no placeholder images')
+PYCHECK

@@ -19,10 +19,10 @@ public class TerminalInputUiTest {
  private static void call(Activity a,String n,Class<?>[] types,Object...args){try{Method m=MainActivity.class.getDeclaredMethod(n,types);m.setAccessible(true);m.invoke(a,args);}catch(Exception e){throw new AssertionError(e);}}
  private static final SessionRepository.SessionTarget TARGET=new SessionRepository.SessionTarget("primary","pane","terminal",1,"");
  private static class Fake implements SessionRepository {
-  Listener listener;int textSends,enters;String text,id;boolean closed;
+  Listener listener;int textSends,enters,reads;String text,id;boolean closed;
   public void start(Listener l){listener=l;}
   public void close(){closed=true;}
-  public void requestSnapshot(SessionTarget target){assertEquals(TARGET,target);}
+  public void requestSnapshot(SessionTarget target){assertEquals(TARGET,target);reads++;}
   public String sendTerminalText(SessionTarget target,String value){assertEquals(TARGET,target);text=value;textSends++;return id="text-"+textSends;}
   public String sendEnter(SessionTarget target){assertEquals(TARGET,target);enters++;return id="enter-"+enters;}
   public void resetInputUncertainty(SessionTarget target){listener.onInputUncertaintyCleared(target);}
@@ -52,6 +52,10 @@ public class TerminalInputUiTest {
     ((Button)get(a,"sendText")).performClick();assertEquals("echo test",controller.text);assertEquals(1,controller.textSends);assertEquals(0,controller.enters);assertEquals("",draft.getText().toString());assertTrue(a.getPreferences(0).getBoolean("input_uncertain",false));
     ((Button)get(a,"sendText")).performClick();((Button)get(a,"sendEnter")).performClick();assertEquals(1,controller.textSends);assertEquals(0,controller.enters);
     controller.listener.onMutationResult(controller.id,TARGET,SessionRepository.MutationOutcome.NOT_STARTED);assertFalse(a.getPreferences(0).getBoolean("input_uncertain",false));assertFalse(((Button)get(a,"sendEnter")).isEnabled());
+    controller.listener.onSnapshot(TARGET,"fresh before explicit second attempt");draft.setText("synthetic text");((Button)get(a,"sendText")).performClick();int readsBefore=controller.reads;
+    controller.listener.onMutationResult(controller.id,TARGET,SessionRepository.MutationOutcome.COMPLETED);
+    assertEquals(readsBefore+1,controller.reads);assertEquals(2,controller.textSends);assertEquals(0,controller.enters);assertFalse(((Button)get(a,"sendEnter")).isEnabled());
+    controller.listener.onSnapshot(TARGET,"fresh post-text snapshot");assertTrue(((Button)get(a,"sendEnter")).isEnabled());
    });
   }
  }
@@ -62,7 +66,9 @@ public class TerminalInputUiTest {
    scenario.onActivity(a->{
     assertTrue(a.getPreferences(0).getBoolean("input_uncertain",false));Fake fresh=install(a,"controller");assertFalse(((Button)get(a,"acknowledgeInput")).isEnabled());fresh.listener.onSnapshot(TARGET,"inspect current terminal");assertFalse(((Button)get(a,"sendEnter")).isEnabled());assertTrue(((Button)get(a,"acknowledgeInput")).isEnabled());assertEquals(0,fresh.enters);
     ((Button)get(a,"acknowledgeInput")).performClick();assertFalse(a.getPreferences(0).getBoolean("input_uncertain",false));assertTrue(((Button)get(a,"sendEnter")).isEnabled());assertEquals(0,fresh.enters);
-    ((Button)get(a,"sendEnter")).performClick();assertEquals(1,fresh.enters);fresh.listener.onMutationResult(fresh.id,TARGET,SessionRepository.MutationOutcome.COMPLETED);assertFalse(a.getPreferences(0).getBoolean("input_uncertain",false));
+    ((Button)get(a,"sendEnter")).performClick();assertEquals(1,fresh.enters);int beforeReads=fresh.reads;fresh.listener.onMutationResult(fresh.id,TARGET,SessionRepository.MutationOutcome.COMPLETED);assertFalse(a.getPreferences(0).getBoolean("input_uncertain",false));
+    assertEquals(beforeReads+1,fresh.reads);assertEquals(1,fresh.enters);assertEquals(0,fresh.textSends);assertFalse(((Button)get(a,"sendEnter")).isEnabled());
+    fresh.listener.onSnapshot(TARGET,"fresh correlated post-delivery snapshot");assertTrue(((Button)get(a,"sendEnter")).isEnabled());
    });
   }
  }
