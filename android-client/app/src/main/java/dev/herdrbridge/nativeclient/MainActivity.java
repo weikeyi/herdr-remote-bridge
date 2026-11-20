@@ -284,7 +284,7 @@ public final class MainActivity extends Activity {
             terminalDraft.setLayoutParams(draft);inputActions.setLayoutParams(actions);
             terminalDraft.setHint(inline?"终端文字":"终端文字 · 默认隐藏");
             sendText.setText(inline?"只发文字":"发送文字（不回车）");
-            sendEnter.setText(inline?"发 Enter":"发送 Enter（执行当前行）");
+            sendEnter.setText(inline?"Enter 执行":"发送 Enter（执行当前行）");
             decorate(sendText,0,inline?0:R.drawable.ic_bridge_send);
             decorate(sendEnter,inline?0:R.drawable.ic_bridge_enter,0);
         }
