@@ -39,7 +39,10 @@ public class TerminalInputUiTest {
   },()->0.5);
   set(a,"connection",connection);connection.restoreInputUncertainty(a.getPreferences(0).getBoolean("input_uncertain",false));connection.foreground();connection.explicitSaved();
   fake.listener.onAccess(role);fake.listener.onState(SessionRepository.State.READY,"");fake.listener.onSessions(Collections.singletonList(new SessionRepository.Session(TARGET,"test","idle",true)));
-  ((LinearLayout)get(a,"sessions")).getChildAt(0).performClick();return fake;
+  call(a,"showHome",new Class<?>[]{});
+  View recent=(View)get(a,"recentButton");
+  View item=recent!=null&&recent.isShown()?recent:((LinearLayout)get(a,"sessions")).getChildAt(0);
+  assertNotNull(item);assertTrue(item.performClick());return fake;
  }
  @Test public void readerCannotWriteAndControllerRequiresFreshSnapshotAndExplicitButtons(){
   try(ActivityScenario<MainActivity> scenario=ActivityScenario.launch(MainActivity.class)){

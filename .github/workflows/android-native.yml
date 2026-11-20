@@ -86,7 +86,7 @@ jobs:
           import json, pathlib, subprocess
           metadata = {
               "source_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-              "version_name": "0.3.0-phone-preview", "version_code": 2,
+              "version_name": "0.4.0-night-preview", "version_code": 3,
               "application_id": "dev.herdrbridge.nativeclient.preview",
               "gradle": "9.3.1", "agp": "9.1.1", "compile_sdk": 37, "target_sdk": 36,
               "build_tools": "36.0.0", "java": "17", "signing": "ephemeral CI debug key", "debuggable": False,
@@ -192,7 +192,7 @@ jobs:
           emulator-boot-timeout: 900
           # Software-only AOSP lane; does not change host KVM permissions.
           # API 29 runtime coverage is not a claim of API 28 or modern-device acceptance.
-          emulator-options: -no-window -gpu swiftshader -feature -Vulkan -accel off -no-audio -no-snapshot -no-boot-anim -camera-back none -memory 2048 -cores 2 -skin 480x800
+          emulator-options: -no-window -gpu swiftshader -feature -Vulkan -accel off -no-audio -no-snapshot -no-boot-anim -camera-back none -memory 2048 -cores 2 -skin 400x800
           script: cd android-client && bash scripts/run-ci-instrumentation.sh
       - name: Upload synthetic instrumentation results
         if: always()

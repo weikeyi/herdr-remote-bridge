@@ -71,6 +71,23 @@ public class SyntheticUiScreenshotTest {
                 +"   Duration  1.43s\n\n"
                 +"C:\\work\\atlas-web> ");
     }
+    private static View recent(Activity activity){return (View)get(activity,"recentButton");}
+    private static boolean hasRecent(Activity activity){View card=recent(activity);return card!=null&&card.isShown();}
+    private static void openAtlas(Activity activity){
+        if(hasRecent(activity)){
+            assertTrue(((TextView)recent(activity)).getText().toString().contains("Atlas Web"));
+            assertTrue(recent(activity).performClick());
+            return;
+        }
+        LinearLayout rows=(LinearLayout)get(activity,"sessions");
+        for(int i=0;i<rows.getChildCount();i++){
+            View row=rows.getChildAt(i);
+            if(row instanceof TextView&&((TextView)row).getText().toString().contains("Atlas Web")){
+                assertTrue(row.performClick());return;
+            }
+        }
+        fail("Missing Atlas Web in synthetic inventory");
+    }
     private static void capture(ActivityScenario<MainActivity> scenario,String name)throws Exception{
         InstrumentationRegistry.getInstrumentation().waitForIdleSync();
         Thread.sleep(400);
@@ -232,10 +249,33 @@ public class SyntheticUiScreenshotTest {
                     assertTrue(((View)get(a,"setup")).isShown());
                 });
                 capture(scenario,"01-pairing-empty");
-                scenario.onActivity(a->{fixture.set(install(a,"reader"));call(a,"showHome",new Class<?>[]{});assertEquals(2,((LinearLayout)get(a,"sessions")).getChildCount());assertTrue(((View)get(a,"sessions")).isShown());assertIconAction(a,"settingsButton","设置");assertTrue(((TextView)get(a,"accessLabel")).getText().toString().contains("Reader"));});
+                scenario.onActivity(a->{
+                    fixture.set(install(a,"controller"));
+                    call(a,"showHome",new Class<?>[]{});
+                    assertFalse("First-use home cannot invent a recent session",hasRecent(a));
+                    assertEquals(2,((LinearLayout)get(a,"sessions")).getChildCount());
+                    openAtlas(a);
+                    snapshot(fixture.get());
+                    assertEquals(TARGET,get(a,"selected"));
+                });
+                systemBack();
+                scenario.onActivity(a->{
+                    assertEquals("HOME",get(a,"currentScreen"));
+                    assertTrue("Returning from Atlas creates a real recent entry",hasRecent(a));
+                    LinearLayout rows=(LinearLayout)get(a,"sessions");
+                    assertEquals("The recent entry may not also appear in the other sessions list",1,rows.getChildCount());
+                    assertTrue(((TextView)rows.getChildAt(0)).getText().toString().contains("地图文档"));
+                    assertIconAction(a,"settingsButton","设置");
+                    assertEquals("Herdr Bridge",((TextView)get(a,"screenTitle")).getText().toString());
+                    assertEquals("02",((TextView)get(a,"homeCount")).getText().toString());
+                    assertEquals("可控制",((TextView)get(a,"footRole")).getText().toString());
+                    assertTrue(((TextView)get(a,"accessLabel")).getText().toString().contains("Controller"));
+                });
                 capture(scenario,"02-session-home");
                 scenario.onActivity(a->{
-                    ((LinearLayout)get(a,"sessions")).getChildAt(0).performClick();
+                    fixture.set(install(a,"reader"));
+                    assertTrue(((TextView)get(a,"accessLabel")).getText().toString().contains("Reader"));
+                    openAtlas(a);
                     snapshot(fixture.get());
                     assertTrue(((View)get(a,"terminal")).isShown());
                     assertEquals(View.GONE,((View)get(a,"inputPanel")).getVisibility());
@@ -244,7 +284,7 @@ public class SyntheticUiScreenshotTest {
                     assertIconAction(a,"copy","复制终端内容");
                 });
                 capture(scenario,"03-reader-detail");
-                scenario.onActivity(a->{fixture.set(install(a,"controller"));((LinearLayout)get(a,"sessions")).getChildAt(0).performClick();snapshot(fixture.get());assertTrue(((View)get(a,"inputPanel")).isShown());assertTrue(((TextView)get(a,"accessLabel")).getText().toString().contains("Controller"));assertTrue(((View)get(a,"sendEnter")).isEnabled());assertEquals("",((EditText)get(a,"terminalDraft")).getText().toString());});
+                scenario.onActivity(a->{fixture.set(install(a,"controller"));openAtlas(a);snapshot(fixture.get());assertTrue(((View)get(a,"inputPanel")).isShown());assertTrue(((TextView)get(a,"accessLabel")).getText().toString().contains("Controller"));assertTrue(((View)get(a,"sendEnter")).isEnabled());assertEquals("",((EditText)get(a,"terminalDraft")).getText().toString());});
                 capture(scenario,"04-controller-composer");
                 android.app.UiAutomation automation=InstrumentationRegistry.getInstrumentation().getUiAutomation();
                 android.accessibilityservice.AccessibilityServiceInfo original=automation.getServiceInfo();

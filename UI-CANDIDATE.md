@@ -43,3 +43,15 @@ larger version code. Preserve the installed build and its pairing until a new
 invitation is ready and you decide to switch. A reinstall loses the phone's
 local credential; the existing bridge credential is not remotely revoked by
 uninstall. No signing key or real invitation is created in this candidate.
+
+## 夜航
+
+The approved direction uses a neutral dark canvas and one citrine accent.
+The featured recent entry is the last terminal opened in the current Activity,
+only when its full live target still appears in the session inventory. It is
+not written to disk, does not survive a fresh Activity, and never duplicates
+a row in the remaining list. Nothing is featured as recent on first use.
+
+The terminal view is unboxed. Terminal text is not synthetically highlighted
+or altered by this UI iteration. Input gating, exact target checks, refresh and
+credential behavior remain unchanged.

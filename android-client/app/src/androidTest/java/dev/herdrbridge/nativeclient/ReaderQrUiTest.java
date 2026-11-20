@@ -80,6 +80,17 @@ public class ReaderQrUiTest {
         }
     }
 
+    private static View recentButton(MainActivity activity){return (View)field(activity,"recentButton");}
+    private static boolean recentVisible(MainActivity activity){
+        View current=recentButton(activity);
+        return current!=null&&current.isShown();
+    }
+    private static void inventory(MainActivity activity,SessionRepository.SessionTarget target,SessionRepository.SessionTarget other){
+        List<SessionRepository.Session> rows=new ArrayList<>();
+        if(target!=null)rows.add(new SessionRepository.Session(target,"构建检查","idle"));
+        if(other!=null)rows.add(new SessionRepository.Session(other,"\u001b[31m标题","running"));
+        call(activity,"displaySessions",new Class<?>[]{List.class},rows);
+    }
     @Test public void nativeReaderLayoutShowsDistinctPaneAndExplicitSensitiveCopy(){
         SessionRepository.SessionTarget target=new SessionRepository.SessionTarget("server-A","pane-A","terminal-A",1,"");
         SessionRepository.SessionTarget other=new SessionRepository.SessionTarget("server-A","pane-B","terminal-B",1,"");
@@ -96,6 +107,7 @@ public class ReaderQrUiTest {
                 assertTrue(((TextView)field(a,"state")).getText().toString().contains("没有可显示"));
                 call(a,"displaySessions",new Class<?>[]{List.class},Arrays.asList(new SessionRepository.Session(target,"构建检查","idle"),new SessionRepository.Session(other,"\u001b[31m标题","running")));
                 LinearLayout sessions=(LinearLayout)field(a,"sessions");assertEquals(2,sessions.getChildCount());
+                assertFalse("First-use inventory must not create a recent entry",recentVisible(a));
                 assertTrue(((Button)sessions.getChildAt(0)).getText().toString().contains("构建检查"));
                 assertTrue(((Button)sessions.getChildAt(0)).getText().toString().contains("空闲"));
                 assertTrue(((Button)sessions.getChildAt(1)).getText().toString().contains("标题"));
@@ -104,6 +116,10 @@ public class ReaderQrUiTest {
                 assertTrue(sessions.getChildAt(1).performClick());
                 assertEquals(Collections.singletonList(other),requested);
                 assertTrue(((View)field(a,"showSessions")).performClick());
+                assertTrue(recentVisible(a));
+                assertTrue(((TextView)recentButton(a)).getText().toString().contains("标题"));
+                assertEquals("Recent target is shown just once",1,sessions.getChildCount());
+                assertTrue(((TextView)sessions.getChildAt(0)).getText().toString().contains("构建检查"));
                 assertTrue(sessions.getChildAt(0).performClick());
                 assertEquals(Arrays.asList(other,target),requested);
                 assertEquals(View.GONE,((ScrollView)field(a,"sessionList")).getVisibility());
@@ -122,7 +138,43 @@ public class ReaderQrUiTest {
                 finally{clipboard.clearPrimaryClip();}
             });
             InstrumentationRegistry.getInstrumentation().waitForIdleSync();
-            scenario.onActivity(a->{View output=(View)field(a,"output");assertTrue("Reader leaves a usable terminal viewport",output.getHeight()>a.getWindow().getDecorView().getHeight()/3);});
+            scenario.onActivity(a->{
+                View output=(View)field(a,"output");assertTrue("Reader leaves a usable terminal viewport",output.getHeight()>a.getWindow().getDecorView().getHeight()/3);
+                LinearLayout sessions=(LinearLayout)field(a,"sessions");
+                View back=(View)field(a,"showSessions");
+                assertTrue(back.performClick());
+                assertTrue(recentVisible(a));
+                assertEquals(1,sessions.getChildCount());
+                assertTrue(((TextView)recentButton(a)).getText().toString().contains("构建检查"));
+                assertTrue(recentButton(a).performClick());
+                assertEquals(Arrays.asList(other,target,target),requested);
+                assertTrue(back.performClick());
+
+                // A newer inventory that drops the row invalidates the shortcut, even
+                // when the original exact target later returns without being opened.
+                inventory(a,null,other);
+                assertFalse(recentVisible(a));assertEquals(1,sessions.getChildCount());
+                inventory(a,target,other);
+                assertFalse(recentVisible(a));assertEquals(2,sessions.getChildCount());
+                assertTrue(sessions.getChildAt(0).performClick());assertTrue(back.performClick());
+                assertTrue(recentVisible(a));
+
+                View staleShortcut=recentButton(a);
+                int readsBeforeReplacement=requested.size();
+                SessionRepository.SessionTarget newer=new SessionRepository.SessionTarget(target.serverSessionId,target.paneId,target.terminalId,target.generation+1,target.agentSessionId);
+                inventory(a,newer,other);
+                assertFalse("A stale generation cannot remain recent",recentVisible(a));assertEquals(2,sessions.getChildCount());
+                staleShortcut.performClick();
+                assertEquals("Detached stale shortcut must not read",readsBeforeReplacement,requested.size());
+                assertEquals("HOME",field(a,"currentScreen"));
+                assertTrue(sessions.getChildAt(0).performClick());assertTrue(back.performClick());
+                assertTrue(recentVisible(a));
+                SessionRepository.SessionTarget replaced=new SessionRepository.SessionTarget(newer.serverSessionId,newer.paneId,"new-terminal",newer.generation,newer.agentSessionId);
+                inventory(a,replaced,other);
+                assertFalse("A new terminal ID at the same pane is not recent",recentVisible(a));assertEquals(2,sessions.getChildCount());
+                assertTrue(sessions.getChildAt(0).performClick());
+                assertEquals(Arrays.asList(other,target,target,target,newer,replaced),requested);
+            });
         }
     }
     @Test public void verifiedQrResultOnlyPopulatesCurrentForegroundOrigin(){

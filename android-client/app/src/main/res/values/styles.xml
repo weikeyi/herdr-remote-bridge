@@ -1,11 +1,11 @@
 <resources>
     <style name="BridgeTerminalTheme" parent="android:style/Theme.Material.NoActionBar">
         <item name="android:fontFamily">sans</item>
-        <item name="android:windowBackground">#0D1117</item>
-        <item name="android:colorAccent">#62E6CE</item>
-        <item name="android:colorControlActivated">#62E6CE</item>
-        <item name="android:statusBarColor">#0D1117</item>
-        <item name="android:navigationBarColor">#0D1117</item>
+        <item name="android:windowBackground">#101113</item>
+        <item name="android:colorAccent">#E0F786</item>
+        <item name="android:colorControlActivated">#E0F786</item>
+        <item name="android:statusBarColor">#101113</item>
+        <item name="android:navigationBarColor">#101113</item>
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:windowLightNavigationBar">false</item>
         <item name="android:windowActionModeOverlay">true</item>
