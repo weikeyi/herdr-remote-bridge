@@ -78,7 +78,7 @@ public final class MainActivity extends Activity {
         root.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
         LinearLayout bar=new LinearLayout(this);bar.setGravity(android.view.Gravity.CENTER_VERTICAL);root.addView(bar,new LinearLayout.LayoutParams(-1,dp(52)));
         showSessions=iconButton("返回会话",R.drawable.ic_bridge_back);showSessions.setOnClickListener(v->showHome());bar.addView(showSessions,new LinearLayout.LayoutParams(dp(48),dp(48)));
-        brandMark=new ImageView(this);brandMark.setImageDrawable(glyph(R.drawable.ic_terminal_mark,19));brandMark.setColorFilter(BG);brandMark.setPadding(dp(7),dp(7),dp(7),dp(7));brandMark.setBackground(shape(TEAL,8));brandMark.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        brandMark=new ImageView(this);brandMark.setImageResource(R.drawable.ic_terminal_mark);brandMark.setScaleType(ImageView.ScaleType.FIT_CENTER);brandMark.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         LinearLayout.LayoutParams markSpace=new LinearLayout.LayoutParams(dp(34),dp(34));markSpace.setMarginEnd(dp(10));bar.addView(brandMark,markSpace);
         screenTitle=text("连接电脑",19,INK);screenTitle.setTypeface(null,Typeface.BOLD);screenTitle.setSingleLine(true);screenTitle.setEllipsize(android.text.TextUtils.TruncateAt.END);bar.addView(screenTitle,new LinearLayout.LayoutParams(0,-2,1));
         settingsButton=iconButton("设置",R.drawable.ic_bridge_settings);settingsButton.setOnClickListener(v->openSettings());bar.addView(settingsButton,new LinearLayout.LayoutParams(dp(48),dp(48)));

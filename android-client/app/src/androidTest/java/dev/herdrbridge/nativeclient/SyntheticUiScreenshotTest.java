@@ -284,6 +284,8 @@ public class SyntheticUiScreenshotTest {
                     assertIconAction(a,"copy","复制终端内容");
                 });
                 capture(scenario,"03-reader-detail");
+                systemBack();
+                scenario.onActivity(a->assertEquals("HOME",get(a,"currentScreen")));
                 scenario.onActivity(a->{fixture.set(install(a,"controller"));openAtlas(a);snapshot(fixture.get());assertTrue(((View)get(a,"inputPanel")).isShown());assertTrue(((TextView)get(a,"accessLabel")).getText().toString().contains("Controller"));assertTrue(((View)get(a,"sendEnter")).isEnabled());assertEquals("",((EditText)get(a,"terminalDraft")).getText().toString());});
                 capture(scenario,"04-controller-composer");
                 android.app.UiAutomation automation=InstrumentationRegistry.getInstrumentation().getUiAutomation();
