@@ -6,6 +6,9 @@ import android.graphics.Bitmap;
 import android.graphics.Rect;
 import android.view.View;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
+import android.view.InputDevice;
+import android.view.accessibility.AccessibilityWindowInfo;
 import android.os.SystemClock;
 import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
@@ -103,12 +106,71 @@ public class SyntheticUiScreenshotTest {
         assertEquals(field+" must have an exact accessible action label",expectedDescription,
                 view.getContentDescription()==null?null:view.getContentDescription().toString());
     }
-    private static boolean imeVisible(Activity activity){
+    private static Rect visibleFrame(Activity activity){
         Rect frame=new Rect();
         activity.getWindow().getDecorView().getWindowVisibleDisplayFrame(frame);
-        android.util.DisplayMetrics screen=new android.util.DisplayMetrics();
-        activity.getWindowManager().getDefaultDisplay().getRealMetrics(screen);
-        return screen.heightPixels-frame.bottom>180*activity.getResources().getDisplayMetrics().density;
+        return frame;
+    }
+    private static final class ImeState {
+        boolean appFocused, editorFocused, editorServed, nativeVisible;
+        int aboveKeyboardBottom, missingDp, imeWindows;
+        boolean visible(){return (nativeVisible||imeWindows>0)&&missingDp>=64;}
+        boolean hidden(){return !nativeVisible&&imeWindows==0&&missingDp<32;}
+        @Override public String toString(){return "windowFocus="+appFocused+" editorFocus="+editorFocused
+                +" served="+editorServed+" nativeIme="+nativeVisible+" imeWindows="+imeWindows
+                +" frameBottom="+aboveKeyboardBottom+" missingDp="+missingDp;}
+    }
+    @android.annotation.TargetApi(30)
+    private static final class ModernIme {
+        static boolean visible(View decor){
+            android.view.WindowInsets insets=decor.getRootWindowInsets();
+            return insets!=null&&insets.isVisible(android.view.WindowInsets.Type.ime());
+        }
+    }
+    private static ImeState probeIme(ActivityScenario<MainActivity> scenario,int initialBottom){
+        ImeState result=new ImeState();
+        scenario.onActivity(a->{
+            EditText draft=(EditText)get(a,"terminalDraft");
+            result.appFocused=a.hasWindowFocus();
+            result.editorFocused=draft.hasFocus();
+            result.editorServed=((InputMethodManager)a.getSystemService(Context.INPUT_METHOD_SERVICE)).isActive(draft);
+            result.aboveKeyboardBottom=visibleFrame(a).bottom;
+            result.missingDp=Math.round((initialBottom-result.aboveKeyboardBottom)/a.getResources().getDisplayMetrics().density);
+            if(android.os.Build.VERSION.SDK_INT>=30)result.nativeVisible=ModernIme.visible(a.getWindow().getDecorView());
+        });
+        for(AccessibilityWindowInfo window:InstrumentationRegistry.getInstrumentation().getUiAutomation().getWindows()){
+            try{if(window.getType()==AccessibilityWindowInfo.TYPE_INPUT_METHOD)result.imeWindows++;}
+            finally{window.recycle();}
+        }
+        return result;
+    }
+    private static void tapDraft(ActivityScenario<MainActivity> scenario){
+        int[] xy=new int[2];
+        scenario.onActivity(a->{
+            View draft=(View)get(a,"terminalDraft");
+            assertTrue("Activity must own window focus before input tap",a.hasWindowFocus());
+            assertFullyVisibleAboveIme(a,"terminalDraft",0);
+            draft.getLocationOnScreen(xy);xy[0]+=draft.getWidth()/2;xy[1]+=draft.getHeight()/2;
+        });
+        long now=SystemClock.uptimeMillis();
+        android.app.UiAutomation ui=InstrumentationRegistry.getInstrumentation().getUiAutomation();
+        for(int action:new int[]{MotionEvent.ACTION_DOWN,MotionEvent.ACTION_UP}){
+            MotionEvent event=MotionEvent.obtain(now,SystemClock.uptimeMillis(),action,xy[0],xy[1],0);
+            try{event.setSource(InputDevice.SOURCE_TOUCHSCREEN);assertTrue("Draft tap injection failed",ui.injectInputEvent(event,true));}
+            finally{event.recycle();}
+        }
+    }
+    private static void requestImeForServedEditor(ActivityScenario<MainActivity> scenario){
+        scenario.onActivity(a->{
+            EditText draft=(EditText)get(a,"terminalDraft");
+            InputMethodManager manager=(InputMethodManager)a.getSystemService(Context.INPUT_METHOD_SERVICE);
+            if(!a.hasWindowFocus()||!draft.hasFocus()||!manager.isActive(draft))return;
+            boolean requested=manager.showSoftInput(draft,InputMethodManager.SHOW_IMPLICIT,
+                    new android.os.ResultReceiver(new android.os.Handler(android.os.Looper.getMainLooper())){
+                        @Override protected void onReceiveResult(int code,android.os.Bundle data){android.util.Log.i("BridgeSyntheticIme","show result="+code);}
+                    });
+            android.util.Log.i("BridgeSyntheticIme","show request accepted="+requested);
+        });
     }
     private static void assertFullyVisibleAboveIme(Activity activity,String name,int minimumDp){
         View control=(View)get(activity,name);
@@ -140,14 +202,23 @@ public class SyntheticUiScreenshotTest {
         assertTrue("System Back up was not injected",ui.injectInputEvent(new KeyEvent(now,SystemClock.uptimeMillis(),KeyEvent.ACTION_UP,KeyEvent.KEYCODE_BACK,0),true));
         InstrumentationRegistry.getInstrumentation().waitForIdleSync();
     }
-    private static boolean awaitIme(ActivityScenario<MainActivity> scenario,boolean visible)throws InterruptedException{
-        for(int attempt=0;attempt<20;attempt++){
-            AtomicReference<Boolean> shown=new AtomicReference<>();
-            scenario.onActivity(a->shown.set(imeVisible(a)));
-            if(shown.get()==visible)return true;
-            Thread.sleep(150);
-        }
-        return false;
+    private static void awaitIme(ActivityScenario<MainActivity> scenario,int initialBottom,boolean visible)throws InterruptedException{
+        long start=SystemClock.uptimeMillis(),deadline=start+15000;
+        boolean retried=false;int consecutive=0;
+        ImeState state;
+        do{
+            state=probeIme(scenario,initialBottom);
+            boolean matches=visible?state.visible()&&state.appFocused&&state.editorFocused:state.hidden();
+            if(matches){
+                if(++consecutive>=2){android.util.Log.i("BridgeSyntheticIme",(visible?"visible: ":"hidden: ")+state);return;}
+            }else consecutive=0;
+            if(visible&&!retried&&SystemClock.uptimeMillis()-start>=3000&&state.editorServed){
+                retried=true;requestImeForServedEditor(scenario);
+            }
+            Thread.sleep(180);
+        }while(SystemClock.uptimeMillis()<deadline);
+        android.util.Log.i("BridgeSyntheticIme","timeout: "+state);
+        fail("Actual IME did not become "+(visible?"visible":"hidden")+": "+state);
     }
     @Test public void syntheticScreensAndControllerComposer()throws Exception{
         try(ActivityScenario<MainActivity> scenario=ActivityScenario.launch(MainActivity.class)){
@@ -175,27 +246,40 @@ public class SyntheticUiScreenshotTest {
                 capture(scenario,"03-reader-detail");
                 scenario.onActivity(a->{fixture.set(install(a,"controller"));((LinearLayout)get(a,"sessions")).getChildAt(0).performClick();snapshot(fixture.get());assertTrue(((View)get(a,"inputPanel")).isShown());assertTrue(((TextView)get(a,"accessLabel")).getText().toString().contains("Controller"));assertTrue(((View)get(a,"sendEnter")).isEnabled());assertEquals("",((EditText)get(a,"terminalDraft")).getText().toString());});
                 capture(scenario,"04-controller-composer");
-                scenario.onActivity(a->{EditText draft=(EditText)get(a,"terminalDraft");draft.requestFocus();((InputMethodManager)a.getSystemService(Context.INPUT_METHOD_SERVICE)).showSoftInput(draft,InputMethodManager.SHOW_IMPLICIT);});
-                // API29 has no WindowInsets.Type.ime; verify the actual app-visible
-                // frame shrank by a keyboard-sized amount, never label a hidden IME.
-                assertTrue("Actual IME must be visible for keyboard screenshot",awaitIme(scenario,true));
-                scenario.onActivity(a->{
-                    assertFullyVisibleAboveIme(a,"terminalDraft",0);
-                    assertFullyVisibleAboveIme(a,"sendText",44);
-                    assertFullyVisibleAboveIme(a,"sendEnter",44);
-                    assertTerminalSpaceAboveIme(a);
-                });
-                capture(scenario,"05-controller-ime-visible");
-                systemBack();
-                assertTrue("First system Back must dismiss IME",awaitIme(scenario,false));
-                scenario.onActivity(a->assertEquals("DETAIL",get(a,"currentScreen")));
-                systemBack();
-                scenario.onActivity(a->{
-                    assertEquals("HOME",get(a,"currentScreen"));
-                    assertTrue(((View)get(a,"sessions")).isShown());
-                    assertFalse(((View)get(a,"terminal")).isShown());
-                    assertEquals("",((EditText)get(a,"terminalDraft")).getText().toString());
-                });
+                android.app.UiAutomation automation=InstrumentationRegistry.getInstrumentation().getUiAutomation();
+                android.accessibilityservice.AccessibilityServiceInfo original=automation.getServiceInfo();
+                int originalFlags=original.flags;
+                original.flags|=android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
+                automation.setServiceInfo(original);
+                try{
+                    int beforeIme=probeIme(scenario,0).aboveKeyboardBottom;
+                    ImeState baseline=probeIme(scenario,beforeIme);
+                    assertTrue("Expected no keyboard before tapping editor: "+baseline,baseline.hidden());
+                    tapDraft(scenario);
+                    awaitIme(scenario,beforeIme,true);
+                    scenario.onActivity(a->{
+                        assertFullyVisibleAboveIme(a,"terminalDraft",0);
+                        assertFullyVisibleAboveIme(a,"sendText",44);
+                        assertFullyVisibleAboveIme(a,"sendEnter",44);
+                        assertTerminalSpaceAboveIme(a);
+                    });
+                    capture(scenario,"05-controller-ime-visible");
+                    ImeState capturedIme=probeIme(scenario,beforeIme);
+                    assertTrue("IME disappeared during screenshot: "+capturedIme,capturedIme.visible());
+                    systemBack();
+                    awaitIme(scenario,beforeIme,false);
+                    scenario.onActivity(a->assertEquals("DETAIL",get(a,"currentScreen")));
+                    systemBack();
+                    scenario.onActivity(a->{
+                        assertEquals("HOME",get(a,"currentScreen"));
+                        assertTrue(((View)get(a,"sessions")).isShown());
+                        assertFalse(((View)get(a,"terminal")).isShown());
+                        assertEquals("",((EditText)get(a,"terminalDraft")).getText().toString());
+                    });
+                }finally{
+                    original.flags=originalFlags;
+                    automation.setServiceInfo(original);
+                }
             }finally{scenario.onActivity(a->{a.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);assertTrue((a.getWindow().getAttributes().flags&WindowManager.LayoutParams.FLAG_SECURE)!=0);});}
         }
     }

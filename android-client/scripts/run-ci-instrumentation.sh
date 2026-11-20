@@ -31,6 +31,8 @@ timeout 180s adb shell am instrument -w -r \
   dev.herdrbridge.nativeclient.preview.test/androidx.test.runner.AndroidJUnitRunner \
   2>&1 | tee "$ui_report/instrumentation.txt"
 ui_status=${PIPESTATUS[0]}
+# Collect only the dedicated synthetic IME diagnostics tag, never full logcat.
+timeout 20s adb logcat -d -s BridgeSyntheticIme:I '*:S' > "$ui_report/ime-proof.txt" 2>&1 || true
 timeout 60s adb pull /sdcard/Android/data/dev.herdrbridge.nativeclient.preview/files/synthetic-ui/. "$ui_report/" > "$ui_report/pull.txt" 2>&1
 pull_status=$?
 set -e

@@ -14,11 +14,13 @@ public final class MainActivity extends Activity {
     private EditText origin, invitation, terminalDraft;
     private Spinner pairingRole;
     private LinearLayout inputPanel,homeScreen,detailScreen;
-    private TextView screenTitle,homeSummary,homeEmpty;
+    private TextView screenTitle,homeEmpty;
     private Button disconnectButton,homeReconnect, settingsButton;
     private String currentScreen="PAIR";
     private boolean settingsOpen, keyboardVisible, targetDetailsVisible;
     private TextView inputWarning;
+    private LinearLayout chromeMeta;
+    private int sessionCount=-1;
     private Button targetDetails;
     private String selectedStatus="";
     private Runnable unregisterScreenBack;
@@ -79,39 +81,36 @@ public final class MainActivity extends Activity {
             public void onTextChanged(CharSequence text,int start,int before,int count){updateCompactDetail();}
             public void afterTextChanged(android.text.Editable text){}
         });
-        accessLabel=text("端到端加密",11,TEAL);accessLabel.setPadding(dp(10),dp(4),dp(10),dp(4));accessLabel.setBackground(shape(TEAL_DARK,16));root.addView(accessLabel,spaced(-2,-2,6));
+        chromeMeta=new LinearLayout(this);chromeMeta.setGravity(android.view.Gravity.CENTER_VERTICAL);root.addView(chromeMeta,spaced(-1,-2,0));
+        accessLabel=text("端到端加密",12,MUTED);chromeMeta.addView(accessLabel,new LinearLayout.LayoutParams(0,-2,1));
+        targetDetails=button("ⓘ",false);targetDetails.setTextSize(21);targetDetails.setTextColor(MUTED);targetDetails.setBackground(new android.graphics.drawable.RippleDrawable(android.content.res.ColorStateList.valueOf(0x3362E6CE),null,shape(INK,24)));targetDetails.setContentDescription("终端详情");
+        targetDetails.setOnClickListener(v->{targetDetailsVisible=!targetDetailsVisible;showTargetDetails();});chromeMeta.addView(targetDetails,new LinearLayout.LayoutParams(dp(48),dp(48)));
         FrameLayout host=new FrameLayout(this);root.addView(host,new LinearLayout.LayoutParams(-1,0,1));
 
         setup=new ScrollView(this);setup.setFillViewport(true);setup.setClipToPadding(false);host.addView(setup,new FrameLayout.LayoutParams(-1,-1));
-        LinearLayout form=column();form.setPadding(0,dp(18),0,dp(16));setup.addView(form);
-        ImageView mark=new ImageView(this);mark.setImageResource(R.drawable.ic_terminal_mark);mark.setPadding(dp(12),dp(12),dp(12),dp(12));mark.setBackground(shape(TEAL_DARK,16));form.addView(mark,new LinearLayout.LayoutParams(dp(54),dp(54)));
-        TextView welcome=text("把电脑终端带在身边",26,INK);welcome.setTypeface(null,Typeface.BOLD);form.addView(welcome,spaced(-1,-2,16));
-        TextView intro=text("通过你的服务器连接电脑。邀请仅本次使用。",14,MUTED);form.addView(intro,spaced(-1,-2,8));
-        LinearLayout fields=column();fields.setPadding(dp(14),dp(12),dp(14),dp(12));fields.setBackground(surface(CARD,16));form.addView(fields,spaced(-1,-2,16));
+        LinearLayout form=column();form.setPadding(0,dp(6),0,dp(12));setup.addView(form);
+        LinearLayout fields=column();fields.setPadding(dp(14),dp(10),dp(14),dp(10));fields.setBackground(surface(CARD,16));form.addView(fields);
         fields.addView(text("服务器地址",13,INK));
-        origin=entry("https://bridge.example.com");origin.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_VARIATION_URI);origin.setText(getPreferences(MODE_PRIVATE).getString("origin",""));fields.addView(origin,spaced(-1,dp(52),8));
-        fields.addView(text("设备邀请",13,INK),spaced(-1,-2,20));
-        invitation=entry("粘贴邀请链接（不保存）");invitation.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_VARIATION_PASSWORD|InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);invitation.setImeOptions(android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING|android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI);invitation.setSaveEnabled(false);fields.addView(invitation,spaced(-1,dp(52),8));
+        origin=entry("https://bridge.example.com");origin.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_VARIATION_URI);origin.setText(getPreferences(MODE_PRIVATE).getString("origin",""));fields.addView(origin,spaced(-1,dp(48),4));
+        fields.addView(text("设备邀请",13,INK),spaced(-1,-2,10));
+        invitation=entry("粘贴邀请链接（不保存）");invitation.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_VARIATION_PASSWORD|InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);invitation.setImeOptions(android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING|android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI);invitation.setSaveEnabled(false);fields.addView(invitation,spaced(-1,dp(48),4));
         Button qr=button("从二维码图片导入",false);decorate(qr,R.drawable.ic_bridge_qr,0);qr.setOnClickListener(v->chooseQr());fields.addView(qr,spaced(-1,dp(48),8));
-        fields.addView(text("设备权限",13,INK),spaced(-1,-2,20));
-        pairingRole=new Spinner(this);pairingRole.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"Reader · 只读（默认）","Controller · 终端输入"}));pairingRole.setBackgroundTintList(android.content.res.ColorStateList.valueOf(TEAL));pairingRole.setSaveEnabled(false);fields.addView(pairingRole,spaced(-1,dp(48),8));
+        fields.addView(text("设备权限",13,INK),spaced(-1,-2,10));
+        pairingRole=new Spinner(this);pairingRole.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"Reader · 只读（默认）","Controller · 终端输入"}));pairingRole.setBackgroundTintList(android.content.res.ColorStateList.valueOf(TEAL));pairingRole.setSaveEnabled(false);fields.addView(pairingRole,spaced(-1,dp(48),4));
         TextView roleWarning=text("Controller 可向设备的受控窗格输入。请使用电脑生成的 Controller 邀请；只改选项不会授权。",12,MUTED);fields.addView(roleWarning,spaced(-1,-2,8));
-        Button pair=button("使用 Reader 邀请配对",true);pair.setOnClickListener(v->connect(true));form.addView(pair,spaced(-1,dp(52),20));
+        Button pair=button("使用 Reader 邀请配对",true);pair.setOnClickListener(v->connect(true));form.addView(pair,spaced(-1,dp(48),10));
         pairingRole.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener(){public void onItemSelected(AdapterView<?> p,View v,int position,long id){pair.setText(position==1?"使用 Controller 邀请配对":"使用 Reader 邀请配对");}public void onNothingSelected(AdapterView<?> p){}});
         Button connect=button("连接已配对设备",false);connect.setOnClickListener(v->connect(false));form.addView(connect,spaced(-1,dp(48),8));
         disconnectButton=button("断开并停止自动恢复",false);disconnectButton.setTextColor(0xFFFFA9A9);disconnectButton.setOnClickListener(v->{cancelQr(true);clearRecovery();stopConnection();showPairing();state.setText("已断开；再次连接需明确操作。");});disconnectButton.setVisibility(new DeviceVault(this).hasRecord()?View.VISIBLE:View.GONE);form.addView(disconnectButton,spaced(-1,dp(48),8));
         form.addView(text("预览版 · 终端文字视图",12,MUTED),spaced(-1,-2,20));
 
         homeScreen=column();host.addView(homeScreen,new FrameLayout.LayoutParams(-1,-1));
-        homeSummary=text("电脑会话",18,INK);homeSummary.setTypeface(null,Typeface.BOLD);homeScreen.addView(homeSummary,spaced(-1,-2,12));
         homeEmpty=text("还没有会话\n连接成功后，电脑上的会话会显示在这里。",15,MUTED);homeEmpty.setGravity(android.view.Gravity.CENTER);homeEmpty.setPadding(dp(16),dp(32),dp(16),dp(32));homeEmpty.setBackground(surface(CARD,16));homeScreen.addView(homeEmpty,spaced(-1,-2,16));
         sessionList=new ScrollView(this);sessionList.setClipToPadding(false);sessionList.setPadding(0,dp(8),0,dp(16));sessions=column();sessionList.addView(sessions);homeScreen.addView(sessionList,new LinearLayout.LayoutParams(-1,0,1));
         homeReconnect=button("重新连接",false);homeReconnect.setOnClickListener(v->connect(false));homeScreen.addView(homeReconnect,spaced(-1,dp(48),8));
 
         detailScreen=column();host.addView(detailScreen,new FrameLayout.LayoutParams(-1,-1));
-        LinearLayout targetRow=new LinearLayout(this);targetRow.setGravity(android.view.Gravity.CENTER_VERTICAL);detailScreen.addView(targetRow,spaced(-1,dp(48),0));
-        selectedLabel=text("",12,MUTED);selectedLabel.setMaxLines(2);targetRow.addView(selectedLabel,new LinearLayout.LayoutParams(0,-2,1));
-        targetDetails=button("终端详情",false);targetDetails.setTextSize(12);targetDetails.setOnClickListener(v->{targetDetailsVisible=!targetDetailsVisible;showTargetDetails();});targetRow.addView(targetDetails,new LinearLayout.LayoutParams(-2,dp(48)));
+        selectedLabel=text("",12,MUTED);selectedLabel.setMaxLines(2);selectedLabel.setVisibility(View.GONE);detailScreen.addView(selectedLabel,spaced(-1,-2,0));
         terminal=text("",13,INK);terminal.setTypeface(Typeface.MONOSPACE);terminal.setPadding(dp(14),dp(14),dp(14),dp(14));terminal.setTextIsSelectable(false);terminal.setSaveEnabled(false);
         HorizontalScrollView horizontal=new HorizontalScrollView(this);horizontal.addView(terminal,new android.view.ViewGroup.LayoutParams(-2,-2));
         output=new ScrollView(this);output.setFillViewport(true);output.setBackground(surface(TERMINAL,12));output.setClipToOutline(true);output.addView(horizontal);LinearLayout.LayoutParams terminalSpace=new LinearLayout.LayoutParams(-1,0,1);terminalSpace.topMargin=dp(6);detailScreen.addView(output,terminalSpace);
@@ -183,20 +182,24 @@ public final class MainActivity extends Activity {
     private LinearLayout.LayoutParams spaced(int width,int height,int top){LinearLayout.LayoutParams params=new LinearLayout.LayoutParams(width,height);params.topMargin=dp(top);return params;}
     private void setKeyboardVisible(boolean visible){if(keyboardVisible!=visible){keyboardVisible=visible;updateCompactDetail();}}
     private void updateCompactDetail(){
-        if(state==null||accessLabel==null||targetDetails==null||inputWarning==null)return;
-        boolean detail="DETAIL".equals(currentScreen), compact=detail&&keyboardVisible;
+        if(state==null||accessLabel==null||targetDetails==null||selectedLabel==null||inputWarning==null)return;
+        boolean detail="DETAIL".equals(currentScreen), home="HOME".equals(currentScreen), compact=detail&&keyboardVisible;
         String status=state.getText().toString();
-        boolean routine=status.startsWith("已连接")||status.startsWith("安全连接")||status.startsWith("正在读取终端")||status.startsWith("终端已更新")||status.startsWith("输入已确认")||status.startsWith("已复制");
-        state.setVisibility(compact&&routine?View.GONE:View.VISIBLE);
-        accessLabel.setVisibility(!"PAIR".equals(currentScreen)&&!compact?View.VISIBLE:View.GONE);
-        ((View)targetDetails.getParent()).setVisibility(compact?View.GONE:View.VISIBLE);
+        boolean routine=status.startsWith("填写服务器地址")||status.startsWith("已连接")||status.startsWith("安全连接")||status.startsWith("正在读取终端")||status.startsWith("终端已更新")||status.startsWith("输入已确认");
+        state.setVisibility(routine?View.GONE:View.VISIBLE);
+        chromeMeta.setVisibility((home||detail)&&!compact?View.VISIBLE:View.GONE);
+        targetDetails.setVisibility(detail&&selected!=null?View.VISIBLE:View.GONE);
+        selectedLabel.setVisibility(detail&&!compact&&targetDetailsVisible&&selected!=null?View.VISIBLE:View.GONE);
         inputWarning.setVisibility(compact?View.GONE:View.VISIBLE);
+        String access="controller".equals(verifiedRole)?"Controller · 可输入":"Reader · 只读";
+        String summary=ready?(detail&&status.startsWith("正在读取终端")?"读取中":detail&&!selectedStatus.isEmpty()?selectedStatus:"已连接"):"未连接";
+        accessLabel.setText(ready?summary+"  ·  "+access:summary);
+        if(home)screenTitle.setText(ready&&sessionCount>=0?"会话 · "+sessionCount:"会话");
     }
     private void showTargetDetails(){
-        if(selected==null){selectedLabel.setText("");return;}
-        String identity="窗格 "+shortText(selected.paneId,32)+" · "+shortText(selected.serverSessionId,24)+" / "+selected.generation;
-        selectedLabel.setText(targetDetailsVisible?identity:selectedStatus);
-        targetDetails.setText(targetDetailsVisible?"收起详情":"终端详情");
+        targetDetails.setContentDescription(targetDetailsVisible?"收起终端详情":"终端详情");
+        if(selected!=null)selectedLabel.setText("窗格 "+shortText(selected.paneId,32)+" · "+shortText(selected.serverSessionId,24)+" / "+selected.generation);
+        updateCompactDetail();
     }
     private void hideKeyboard(){android.view.inputmethod.InputMethodManager ime=(android.view.inputmethod.InputMethodManager)getSystemService(INPUT_METHOD_SERVICE);if(ime!=null)ime.hideSoftInputFromWindow(getWindow().getDecorView().getWindowToken(),0);}
     private void showScreen(String screen){
@@ -267,7 +270,7 @@ public final class MainActivity extends Activity {
     }
     private void updateInputControls(){
         if(sendText==null||sendEnter==null||acknowledgeInput==null)return;
-        accessLabel.setText(!ready?"端到端加密":"controller".equals(verifiedRole)?"Controller · 可输入":"Reader · 只读");
+        updateCompactDetail();
         boolean controller="controller".equals(verifiedRole)&&ready&&selected!=null&&inputTargets.contains(selected);
         inputPanel.setVisibility(controller?View.VISIBLE:View.GONE);
         boolean uncertain=getPreferences(MODE_PRIVATE).getBoolean("input_uncertain",false);
@@ -411,7 +414,7 @@ public final class MainActivity extends Activity {
                         if(!armRecovery(configured,status==SessionRepository.State.ENROLLED)){stopConnection();state.setText("无法验证已保存凭证；自动恢复已停止。");return;}
                     }
                     if(status==SessionRepository.State.ERROR||status==SessionRepository.State.REVOKED)clearRecovery();
-                    ready=status==SessionRepository.State.READY;updateScreenBack();showSessions.setEnabled(ready&&!inputPending);
+                    ready=status==SessionRepository.State.READY;if(!ready)sessionCount=-1;updateScreenBack();showSessions.setEnabled(ready&&!inputPending);
                     if(!ready){homeEmpty.setText("连接正在恢复\n后台不会保持网络连接。");homeEmpty.setVisibility(View.VISIBLE);refresh.setEnabled(false);copy.setEnabled(false);terminal.setText("");sessions.removeAllViews();selected=null;selectedLabel.setText("未选中会话");clearTerminalDraft();inputTargets.clear();}
                     else {refresh.setEnabled(selected!=null);disconnectButton.setVisibility(View.VISIBLE);showHomeOnReadyIfAppropriate();}
                     updateInputControls();
@@ -469,9 +472,9 @@ public final class MainActivity extends Activity {
                         item.setText(label);decorate(item,R.drawable.ic_terminal_mark,R.drawable.ic_bridge_chevron);item.setEnabled(!inputPending);
                         item.setOnClickListener(v->{if(!ready||connection==null||inputPending)return;clearTerminalDraft();selected=row.target;connection.selectTarget(selected);hideKeyboard();showDetail();screenTitle.setText(shortText(row.title.isEmpty()?"终端":row.title,24));sessionList.setVisibility(View.GONE);terminal.setText("");copy.setEnabled(false);selectedStatus=sessionStatus(row.status);targetDetailsVisible=false;showTargetDetails();state.setText("正在读取终端…");refresh.setEnabled(true);updateInputControls();connection.requestSnapshot(selected);});sessions.addView(item,spaced(-1,-2,10));
                     }
-                    homeSummary.setText("电脑会话 · "+Math.min(rows.size(),256));homeEmpty.setVisibility(rows.isEmpty()?View.VISIBLE:View.GONE);homeEmpty.setText("暂无会话\n在电脑上打开终端或启动会话后，这里会自动更新。");
+                    sessionCount=Math.min(rows.size(),256);homeEmpty.setVisibility(rows.isEmpty()?View.VISIBLE:View.GONE);homeEmpty.setText("暂无会话\n在电脑上打开终端或启动会话后，这里会自动更新。");
                     if(!retained){clearTerminalDraft();if(connection!=null)connection.selectTarget(null);sessionList.setVisibility(View.VISIBLE);selected=null;terminal.setText("");copy.setEnabled(false);refresh.setEnabled(false);selectedLabel.setText("未选中会话");if(!settingsOpen)showHome();}
-                    if(!settingsOpen&&rows.isEmpty())state.setText("已连接，服务器没有可显示的会话。");else if(!settingsOpen&&selected==null)state.setText("已连接："+Math.min(rows.size(),256)+" 个会话。选择一个会话查看终端。");
+                    if(!settingsOpen&&rows.isEmpty())state.setText("已连接，服务器没有可显示的会话。");else if(!settingsOpen&&selected==null)state.setText("已连接。选择一个会话查看终端。");
         updateInputControls();
     }
     private void displayPassiveSnapshot(SessionRepository.SessionTarget target,String content){
