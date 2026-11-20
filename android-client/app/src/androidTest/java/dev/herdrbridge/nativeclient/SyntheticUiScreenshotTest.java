@@ -293,7 +293,20 @@ public class SyntheticUiScreenshotTest {
                 assertFalse(hasRecent(a));assertTrue(((View)get(a,"searchEmpty")).isShown());
                 inventory(fake,ATLAS_TITLE);
                 assertTrue(hasRecent(a));
+                String prefix="0123456789012345678901234567890123456789012345678901234567890123456789";
+                fake.listener.onSessions(Arrays.asList(
+                        new SessionRepository.Session(TARGET,prefix+" 独特甲","working",true),
+                        new SessionRepository.Session(OTHER,prefix+" 独特乙","idle",true)));
+                query.setText("独特甲");
+                assertTrue("A suffix past the visual title limit must still match the exact recent session",hasRecent(a));
+                assertEquals(0,rows.getChildCount());
+                query.setText("独特乙");
+                assertFalse("Identical visible prefixes must not cause a false recent match",hasRecent(a));
+                assertEquals(1,rows.getChildCount());
+                inventory(fake,ATLAS_TITLE);
                 query.setText("地图");
+                assertEquals("搜索结果",((TextView)get(a,"homeHero")).getText().toString());
+                assertFalse(((View)get(a,"otherHeading")).isShown());
             });
             capture(scenario,"06-home-search");
             assertTrue("Search IME disappeared during screenshot",probeIme(scenario,"searchQuery",bottom).visible());

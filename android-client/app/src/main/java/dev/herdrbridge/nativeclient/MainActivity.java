@@ -24,7 +24,7 @@ public final class MainActivity extends Activity {
     private boolean compactComposer, compactHeading;
     private LinearLayout chromeMeta,recentCard,sessionBody;
     private Button recentButton;
-    private TextView homeCount,otherHeading,footRole,searchEmpty;
+    private TextView homeHero,homeCount,otherHeading,footRole,searchEmpty;
     private Button searchButton,searchClear;
     private EditText searchQuery;
     private LinearLayout searchBar;
@@ -136,7 +136,7 @@ public final class MainActivity extends Activity {
         });
         sessionList=new ScrollView(this);sessionList.setClipToPadding(false);sessionList.setPadding(0,0,0,dp(12));sessionBody=column();sessionList.addView(sessionBody);homeScreen.addView(sessionList,new LinearLayout.LayoutParams(-1,0,1));
         LinearLayout hero=new LinearLayout(this);hero.setGravity(android.view.Gravity.BOTTOM);sessionBody.addView(hero,spaced(-1,-2,6));
-        TextView homeHero=text("会话",49,INK);homeHero.setTypeface(null,Typeface.BOLD);hero.addView(homeHero,new LinearLayout.LayoutParams(0,-2,1));
+        homeHero=text("会话",49,INK);homeHero.setTypeface(null,Typeface.BOLD);hero.addView(homeHero,new LinearLayout.LayoutParams(0,-2,1));
         homeCount=text("",15,TEAL);homeCount.setTypeface(Typeface.MONOSPACE);homeCount.setPadding(0,0,dp(2),dp(7));hero.addView(homeCount);
         sessionBody.addView(rule(),spaced(-1,dp(1),9));
         searchEmpty=text("没有匹配的会话。试试其他名称，或清除搜索。",14,MUTED);searchEmpty.setPadding(0,dp(24),0,dp(24));sessionBody.addView(searchEmpty);
@@ -153,7 +153,7 @@ public final class MainActivity extends Activity {
         // names can scroll without pushing the terminal and composer off screen.
         headingViewport=new ScrollView(this){
             @Override protected void onMeasure(int widthSpec,int heightSpec){
-                int max=dp(keyboardVisible?74:112);
+                int max=dp(keyboardVisible?74:136);
                 int mode=View.MeasureSpec.getMode(heightSpec);
                 if(mode!=View.MeasureSpec.UNSPECIFIED)max=Math.min(max,View.MeasureSpec.getSize(heightSpec));
                 super.onMeasure(widthSpec,View.MeasureSpec.makeMeasureSpec(max,View.MeasureSpec.AT_MOST));
@@ -334,6 +334,9 @@ public final class MainActivity extends Activity {
         searchButton.setVisibility(home?View.VISIBLE:View.GONE);
         searchButton.setContentDescription(searchOpen?"关闭搜索":"搜索会话");
         searchBar.setVisibility(home&&searchOpen?View.VISIBLE:View.GONE);
+        setTextIfChanged(homeHero,searchOpen?"搜索结果":"会话");
+        homeHero.setTextSize(searchOpen?16:49);
+        homeCount.setPadding(0,0,dp(2),dp(searchOpen?1:7));
     }
     private void updateHomeCount(){
         homeCount.setText(ready&&sessionCount>=0?String.format(java.util.Locale.ROOT,"%02d",searchOpen?matchingCount:sessionCount):"");
@@ -630,7 +633,7 @@ public final class MainActivity extends Activity {
             sessions.addView(sessionButton(row,false),new LinearLayout.LayoutParams(-1,-2));
         }
         otherHeading.setText(recent==null?"全部会话":"其他会话");
-        otherHeading.setVisibility(sessions.getChildCount()==0?View.GONE:View.VISIBLE);
+        otherHeading.setVisibility(searchOpen||sessions.getChildCount()==0?View.GONE:View.VISIBLE);
         searchEmpty.setVisibility(ready&&searchOpen&&!query.isEmpty()&&!liveRows.isEmpty()&&matchingCount==0?View.VISIBLE:View.GONE);
         updateHomeCount();
     }
@@ -638,7 +641,7 @@ public final class MainActivity extends Activity {
         return shortText(row.title.isEmpty()?"未命名会话":row.title,64).replace('\n',' ');
     }
     private static boolean matchesTitle(SessionRepository.Session row,String query){
-        return query.isEmpty()||sessionTitle(row).toLowerCase(java.util.Locale.ROOT).contains(query);
+        return query.isEmpty()||TerminalSnapshot.render(row.title.isEmpty()?"未命名会话":row.title).replace('\n',' ').toLowerCase(java.util.Locale.ROOT).contains(query);
     }
     private Button sessionButton(SessionRepository.Session row,boolean recent){
         Button item=button("",false);item.setGravity(android.view.Gravity.START|android.view.Gravity.CENTER_VERTICAL);
