@@ -151,6 +151,8 @@ public final class MainActivity extends Activity {
         }
     }
 
+    // API 33+ gestures use the scoped platform dispatcher above; only API 28–32 need this fallback.
+    @android.annotation.SuppressLint("GestureBackNavigation")
     @Override @SuppressWarnings("deprecation")
     public void onBackPressed(){
         if(android.os.Build.VERSION.SDK_INT<33&&handlesScreenBack()){showHome();return;}
