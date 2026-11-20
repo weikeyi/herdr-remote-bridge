@@ -160,7 +160,7 @@ public final class MainActivity extends Activity {
             }
         };
         detailHeading=text("终端",22,INK);detailHeading.setTypeface(null,Typeface.BOLD);detailHeading.setIncludeFontPadding(false);
-        detailHeading.setBreakStrategy(android.text.Layout.BREAK_STRATEGY_SIMPLE);detailHeading.setAccessibilityHeading(true);detailHeading.setSaveEnabled(false);
+        if(android.os.Build.VERSION.SDK_INT>=29)detailHeading.setBreakStrategy(android.graphics.text.LineBreaker.BREAK_STRATEGY_SIMPLE);detailHeading.setAccessibilityHeading(true);detailHeading.setSaveEnabled(false);
         headingViewport.addView(detailHeading,new FrameLayout.LayoutParams(-1,-2));detailScreen.addView(headingViewport,new LinearLayout.LayoutParams(-1,-2));
         detailRole=text("Reader · 只读",12,TEAL);detailRole.setIncludeFontPadding(false);detailScreen.addView(detailRole,spaced(-1,-2,4));
         selectedLabel=text("",12,MUTED);selectedLabel.setMaxLines(2);selectedLabel.setVisibility(View.GONE);detailScreen.addView(selectedLabel,spaced(-1,-2,0));
