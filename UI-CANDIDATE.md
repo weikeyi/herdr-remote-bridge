@@ -30,3 +30,16 @@ invitation and pairing. No stable signing key is created here, so future
 in-place updates to this new package are still not guaranteed.
 Software-emulator screenshots and runtime tests are not physical-device, live
 Windows, or live relay acceptance.
+
+## Dark terminal redesign
+
+This iteration keeps the preview application ID and pair/role/input protocol
+unchanged. The app has a dark native theme and vectors, distinct setup and session
+hierarchy, accessible icon actions and a compact terminal composer. Emulator
+screenshots and geometry assertions use only synthetic fixture data.
+
+A different ephemeral debug signer prevents in-place upgrades even with a
+larger version code. Preserve the installed build and its pairing until a new
+invitation is ready and you decide to switch. A reinstall loses the phone's
+local credential; the existing bridge credential is not remotely revoked by
+uninstall. No signing key or real invitation is created in this candidate.

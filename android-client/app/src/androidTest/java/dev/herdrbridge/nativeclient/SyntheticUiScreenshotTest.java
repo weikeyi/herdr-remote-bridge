@@ -53,20 +53,55 @@ public class SyntheticUiScreenshotTest {
         },()->0.5);
         set(a,"connection",connection);connection.foreground();connection.explicitSaved();
         fake.listener.onAccess(role);fake.listener.onState(SessionRepository.State.READY,"");
-        fake.listener.onSessions(Arrays.asList(new SessionRepository.Session(TARGET,"示例项目 · 构建检查","working",true),new SessionRepository.Session(new SessionRepository.SessionTarget("primary","synthetic-pane-2","synthetic-terminal-2",1,""),"文档预览 · 待处理","idle",true)));
+        fake.listener.onSessions(Arrays.asList(new SessionRepository.Session(TARGET,"Atlas Web · 构建检查","working",true),new SessionRepository.Session(new SessionRepository.SessionTarget("primary","synthetic-pane-2","synthetic-terminal-2",1,""),"地图文档 · 预览服务","idle",true)));
         return fake;
     }
-    private static void snapshot(Fake fake){fake.listener.onSnapshot(TARGET,"$ npm run check\n\n✓ TypeScript 检查通过\n✓ 单元测试通过\n\n示例输出：这是合成测试数据，不连接真实终端。\n等待下一步操作…");}
-    private static void capture(String name)throws Exception{
+    private static void snapshot(Fake fake){
+        fake.listener.onSnapshot(TARGET,
+                "C:\\work\\atlas-web> npm run check\n"
+                +"\n> atlas-web@0.8.4 check\n> tsc --noEmit && vitest run\n\n"
+                +" ✓ src/map/layers.test.ts       (12 tests)\n"
+                +" ✓ src/map/selection.test.ts   ( 8 tests)\n"
+                +" ✓ src/import/geojson.test.ts  (16 tests)\n\n"
+                +" Test Files  3 passed (3)\n"
+                +"      Tests  36 passed (36)\n"
+                +"   Duration  1.43s\n\n"
+                +"C:\\work\\atlas-web> ");
+    }
+    private static void capture(ActivityScenario<MainActivity> scenario,String name)throws Exception{
         InstrumentationRegistry.getInstrumentation().waitForIdleSync();
         Thread.sleep(400);
-        Bitmap bitmap=InstrumentationRegistry.getInstrumentation().getUiAutomation().takeScreenshot();
-        assertNotNull("UiAutomation screenshot unavailable",bitmap);
+        Rect appFrame=new Rect();
+        scenario.onActivity(a->a.getWindow().getDecorView().getWindowVisibleDisplayFrame(appFrame));
+        Bitmap screenshot=InstrumentationRegistry.getInstrumentation().getUiAutomation().takeScreenshot();
+        assertNotNull("UiAutomation screenshot unavailable",screenshot);
+        Bitmap bitmap=screenshot.getConfig()==Bitmap.Config.HARDWARE?screenshot.copy(Bitmap.Config.ARGB_8888,false):screenshot;
+        if(bitmap!=screenshot)screenshot.recycle();
+        assertNotNull("Screenshot pixels unavailable",bitmap);
         try{
             File dir=new File(InstrumentationRegistry.getInstrumentation().getTargetContext().getExternalFilesDir(null),"synthetic-ui");
             assertTrue(dir.isDirectory()||dir.mkdirs());
             try(FileOutputStream out=new FileOutputStream(new File(dir,name+".png"))){assertTrue(bitmap.compress(Bitmap.CompressFormat.PNG,100,out));}
+            // Check actual pixels from the app viewport, never the system keyboard
+            // or status/navigation bars. Preserve PNG on failure for inspection.
+            assertTrue("Screen bounds outside screenshot",appFrame.intersect(0,0,bitmap.getWidth(),bitmap.getHeight()));
+            Set<Integer> colors=new HashSet<>();int dark=0, total=0;
+            for(int y=appFrame.top;y<appFrame.bottom;y+=3){
+                for(int x=appFrame.left;x<appFrame.right;x+=3){
+                    int pixel=bitmap.getPixel(x,y);colors.add(pixel&0x00F0F0F0);
+                    if(android.graphics.Color.luminance(pixel)<0.18f)dark++;
+                    total++;
+                }
+            }
+            assertTrue(name+" is blank or screenshot protection was not lifted",colors.size()>=8);
+            assertTrue(name+" should render a predominantly dark app surface",total>0&&dark/(double)total>=0.65);
         }finally{bitmap.recycle();}
+    }
+    private static void assertIconAction(Activity activity,String field,String expectedDescription){
+        View view=(View)get(activity,field);
+        assertTrue(field+" must be visible and actionable",view.isShown()&&view.isClickable());
+        assertEquals(field+" must have an exact accessible action label",expectedDescription,
+                view.getContentDescription()==null?null:view.getContentDescription().toString());
     }
     private static boolean imeVisible(Activity activity){
         Rect frame=new Rect();
@@ -86,6 +121,17 @@ public class SyntheticUiScreenshotTest {
         assertTrue(name+" hit area too small",control.getWidth()>=minimum&&control.getHeight()>=minimum);
         int[] position=new int[2];control.getLocationOnScreen(position);
         assertTrue(name+" outside visible screen above the IME",visible.contains(position[0],position[1],position[0]+control.getWidth(),position[1]+control.getHeight()));
+    }
+    private static void assertTerminalSpaceAboveIme(Activity activity){
+        View output=(View)get(activity,"output");
+        Rect visibleFrame=new Rect(), exposed=new Rect();
+        activity.getWindow().getDecorView().getWindowVisibleDisplayFrame(visibleFrame);
+        assertTrue("Terminal viewport must remain visible with IME open",output.isShown()&&output.getGlobalVisibleRect(exposed));
+        int dp96=Math.round(96*activity.getResources().getDisplayMetrics().density);
+        int minHeight=Math.max(dp96,visibleFrame.height()/4);
+        assertTrue("Terminal viewport too short above keyboard: "+exposed.height()+"px, required "+minHeight+"px",exposed.height()>=minHeight);
+        int[] where=new int[2];output.getLocationOnScreen(where);
+        assertTrue("Terminal viewport must lie above keyboard",where[1]+output.getHeight()<=visibleFrame.bottom);
     }
     private static void systemBack(){
         long now=SystemClock.uptimeMillis();
@@ -114,13 +160,21 @@ public class SyntheticUiScreenshotTest {
                     ((EditText)get(a,"origin")).setText("");((EditText)get(a,"invitation")).setText("");
                     assertTrue(((View)get(a,"setup")).isShown());
                 });
-                capture("01-pairing-empty");
-                scenario.onActivity(a->{fixture.set(install(a,"reader"));call(a,"showHome",new Class<?>[]{});assertEquals(2,((LinearLayout)get(a,"sessions")).getChildCount());assertTrue(((View)get(a,"sessions")).isShown());});
-                capture("02-session-home");
-                scenario.onActivity(a->{((LinearLayout)get(a,"sessions")).getChildAt(0).performClick();snapshot(fixture.get());assertTrue(((View)get(a,"terminal")).isShown());assertEquals(View.GONE,((View)get(a,"inputPanel")).getVisibility());});
-                capture("03-reader-detail");
-                scenario.onActivity(a->{fixture.set(install(a,"controller"));((LinearLayout)get(a,"sessions")).getChildAt(0).performClick();snapshot(fixture.get());assertTrue(((View)get(a,"inputPanel")).isShown());assertTrue(((Button)get(a,"sendEnter")).isEnabled());assertEquals("",((EditText)get(a,"terminalDraft")).getText().toString());});
-                capture("04-controller-composer");
+                capture(scenario,"01-pairing-empty");
+                scenario.onActivity(a->{fixture.set(install(a,"reader"));call(a,"showHome",new Class<?>[]{});assertEquals(2,((LinearLayout)get(a,"sessions")).getChildCount());assertTrue(((View)get(a,"sessions")).isShown());assertIconAction(a,"settingsButton","设置");assertTrue(((TextView)get(a,"accessLabel")).getText().toString().contains("Reader"));});
+                capture(scenario,"02-session-home");
+                scenario.onActivity(a->{
+                    ((LinearLayout)get(a,"sessions")).getChildAt(0).performClick();
+                    snapshot(fixture.get());
+                    assertTrue(((View)get(a,"terminal")).isShown());
+                    assertEquals(View.GONE,((View)get(a,"inputPanel")).getVisibility());
+                    assertIconAction(a,"showSessions","返回会话");
+                    assertIconAction(a,"refresh","刷新终端");
+                    assertIconAction(a,"copy","复制终端内容");
+                });
+                capture(scenario,"03-reader-detail");
+                scenario.onActivity(a->{fixture.set(install(a,"controller"));((LinearLayout)get(a,"sessions")).getChildAt(0).performClick();snapshot(fixture.get());assertTrue(((View)get(a,"inputPanel")).isShown());assertTrue(((TextView)get(a,"accessLabel")).getText().toString().contains("Controller"));assertTrue(((View)get(a,"sendEnter")).isEnabled());assertEquals("",((EditText)get(a,"terminalDraft")).getText().toString());});
+                capture(scenario,"04-controller-composer");
                 scenario.onActivity(a->{EditText draft=(EditText)get(a,"terminalDraft");draft.requestFocus();((InputMethodManager)a.getSystemService(Context.INPUT_METHOD_SERVICE)).showSoftInput(draft,InputMethodManager.SHOW_IMPLICIT);});
                 // API29 has no WindowInsets.Type.ime; verify the actual app-visible
                 // frame shrank by a keyboard-sized amount, never label a hidden IME.
@@ -129,8 +183,9 @@ public class SyntheticUiScreenshotTest {
                     assertFullyVisibleAboveIme(a,"terminalDraft",0);
                     assertFullyVisibleAboveIme(a,"sendText",44);
                     assertFullyVisibleAboveIme(a,"sendEnter",44);
+                    assertTerminalSpaceAboveIme(a);
                 });
-                capture("05-controller-ime-visible");
+                capture(scenario,"05-controller-ime-visible");
                 systemBack();
                 assertTrue("First system Back must dismiss IME",awaitIme(scenario,false));
                 scenario.onActivity(a->assertEquals("DETAIL",get(a,"currentScreen")));

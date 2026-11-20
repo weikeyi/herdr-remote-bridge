@@ -40,12 +40,13 @@ public class MainActivitySmokeTest {
         }
     }
 
-    private static Button button(View view, String text) {
-        if (view instanceof Button && text.contentEquals(((Button) view).getText())) return (Button) view;
+    private static View button(View view, String text) {
+        if (view.isClickable() && (text.contentEquals(view.getContentDescription() == null ? "" : view.getContentDescription())
+                || view instanceof Button && text.contentEquals(((Button) view).getText()))) return view;
         if (view instanceof ViewGroup) {
             ViewGroup group = (ViewGroup) view;
             for (int i = 0; i < group.getChildCount(); i++) {
-                Button found = button(group.getChildAt(i), text);
+                View found = button(group.getChildAt(i), text);
                 if (found != null) return found;
             }
         }
@@ -68,7 +69,7 @@ public class MainActivitySmokeTest {
         assertNull(field(activity, "repository", SessionRepository.class));
         assertEquals(0, field(activity, "sessions", LinearLayout.class).getChildCount());
         assertEquals("", field(activity, "terminal", TextView.class).getText().toString());
-        assertFalse(field(activity, "refresh", Button.class).isEnabled());
+        assertFalse(field(activity, "refresh", View.class).isEnabled());
     }
 
     @Test public void nativeInitialUiAndInvalidActionsNeverCreateConnection() {
@@ -84,8 +85,8 @@ public class MainActivitySmokeTest {
                 EditText invitation = field(activity, "invitation", EditText.class);
                 assertFalse(invitation.isSaveEnabled());
                 assertFalse(field(activity, "terminal", TextView.class).isSaveEnabled());
-                Button pair = button(root, "使用 Reader 邀请配对");
-                Button connect = button(root, "连接已配对设备");
+                View pair = button(root, "使用 Reader 邀请配对");
+                View connect = button(root, "连接已配对设备");
                 assertNotNull(pair);
                 assertNotNull(connect);
                 for (String invalid : new String[]{"", "not-an-origin", "http://invalid.invalid"}) {
@@ -178,7 +179,7 @@ public class MainActivitySmokeTest {
                 assertEquals("",field(activity,"invitation",EditText.class).getText().toString());
                 assertEquals("",field(activity,"terminal",TextView.class).getText().toString());
                 assertEquals(0,field(activity,"sessions",LinearLayout.class).getChildCount());
-                Button stop=button(activity.getWindow().getDecorView(),"断开并停止自动恢复");
+                View stop=button(activity.getWindow().getDecorView(),"断开并停止自动恢复");
                 assertNotNull(stop);stop.performClick();assertTrue(opened.get(1).closed);
                 assertFalse(activity.getPreferences(Context.MODE_PRIVATE).getBoolean("auto_connect",false));
             });
@@ -230,7 +231,7 @@ public class MainActivitySmokeTest {
                     // READY on initial pairing still goes to the home page.
                     land.invoke(activity);
                     assertEquals("HOME",field(activity,"currentScreen",String.class));
-                    Button settings=button(activity.getWindow().getDecorView(),"设置");
+                    View settings=button(activity.getWindow().getDecorView(),"设置");
                     assertNotNull(settings);
                     assertTrue(settings.performClick());
                     EditText origin=field(activity,"origin",EditText.class);
@@ -246,7 +247,7 @@ public class MainActivitySmokeTest {
                     assertTrue(origin.isShown());
                     assertEquals("https://example.invalid",origin.getText().toString());
                     assertEquals("synthetic settings feedback",state.getText().toString());
-                    Button back=field(activity,"showSessions",Button.class);
+                    View back=field(activity,"showSessions",View.class);
                     assertTrue(back.isShown());
                     assertTrue(back.performClick());
                     assertEquals("HOME",field(activity,"currentScreen",String.class));

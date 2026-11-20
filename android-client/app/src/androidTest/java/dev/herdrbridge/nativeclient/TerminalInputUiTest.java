@@ -44,32 +44,32 @@ public class TerminalInputUiTest {
  @Test public void readerCannotWriteAndControllerRequiresFreshSnapshotAndExplicitButtons(){
   try(ActivityScenario<MainActivity> scenario=ActivityScenario.launch(MainActivity.class)){
    scenario.onActivity(a->{
-    Fake reader=install(a,"reader");reader.listener.onSnapshot(TARGET,"snapshot");assertEquals(View.GONE,((View)get(a,"inputPanel")).getVisibility());assertFalse(((Button)get(a,"sendEnter")).isEnabled());assertEquals(0,reader.enters);
+    Fake reader=install(a,"reader");reader.listener.onSnapshot(TARGET,"snapshot");assertEquals(View.GONE,((View)get(a,"inputPanel")).getVisibility());assertFalse(((View)get(a,"sendEnter")).isEnabled());assertEquals(0,reader.enters);
     ((ForegroundConnection)get(a,"connection")).stop();Fake controller=install(a,"controller");
-    assertFalse(((Button)get(a,"sendEnter")).isEnabled());controller.listener.onSnapshot(TARGET,"fresh snapshot");assertTrue(((Button)get(a,"sendEnter")).isEnabled());
+    assertFalse(((View)get(a,"sendEnter")).isEnabled());controller.listener.onSnapshot(TARGET,"fresh snapshot");assertTrue(((View)get(a,"sendEnter")).isEnabled());
     EditText draft=(EditText)get(a,"terminalDraft");assertFalse(draft.isSaveEnabled());assertNotNull(draft.getTransformationMethod());
-    draft.setText("bad\nline");assertFalse(((Button)get(a,"sendText")).isEnabled());draft.setText("echo test");draft.onEditorAction(EditorInfo.IME_ACTION_DONE);assertEquals(0,controller.textSends);assertEquals(0,controller.enters);
-    ((Button)get(a,"sendText")).performClick();assertEquals("echo test",controller.text);assertEquals(1,controller.textSends);assertEquals(0,controller.enters);assertEquals("",draft.getText().toString());assertTrue(a.getPreferences(0).getBoolean("input_uncertain",false));
-    ((Button)get(a,"sendText")).performClick();((Button)get(a,"sendEnter")).performClick();assertEquals(1,controller.textSends);assertEquals(0,controller.enters);
-    controller.listener.onMutationResult(controller.id,TARGET,SessionRepository.MutationOutcome.NOT_STARTED);assertFalse(a.getPreferences(0).getBoolean("input_uncertain",false));assertFalse(((Button)get(a,"sendEnter")).isEnabled());
+    draft.setText("bad\nline");assertFalse(((View)get(a,"sendText")).isEnabled());draft.setText("echo test");draft.onEditorAction(EditorInfo.IME_ACTION_DONE);assertEquals(0,controller.textSends);assertEquals(0,controller.enters);
+    ((View)get(a,"sendText")).performClick();assertEquals("echo test",controller.text);assertEquals(1,controller.textSends);assertEquals(0,controller.enters);assertEquals("",draft.getText().toString());assertTrue(a.getPreferences(0).getBoolean("input_uncertain",false));
+    ((View)get(a,"sendText")).performClick();((View)get(a,"sendEnter")).performClick();assertEquals(1,controller.textSends);assertEquals(0,controller.enters);
+    controller.listener.onMutationResult(controller.id,TARGET,SessionRepository.MutationOutcome.NOT_STARTED);assertFalse(a.getPreferences(0).getBoolean("input_uncertain",false));assertFalse(((View)get(a,"sendEnter")).isEnabled());
     assertTrue(((Button)get(a,"refresh")).performClick()); // NOT_STARTED does not implicitly refresh.
-    controller.listener.onSnapshot(TARGET,"fresh before explicit second attempt");draft.setText("synthetic text");((Button)get(a,"sendText")).performClick();int readsBefore=controller.reads;
+    controller.listener.onSnapshot(TARGET,"fresh before explicit second attempt");draft.setText("synthetic text");((View)get(a,"sendText")).performClick();int readsBefore=controller.reads;
     controller.listener.onMutationResult(controller.id,TARGET,SessionRepository.MutationOutcome.COMPLETED);
-    assertEquals(readsBefore+1,controller.reads);assertEquals(2,controller.textSends);assertEquals(0,controller.enters);assertFalse(((Button)get(a,"sendEnter")).isEnabled());
-    controller.listener.onSnapshot(TARGET,"fresh post-text snapshot");assertTrue(((Button)get(a,"sendEnter")).isEnabled());
+    assertEquals(readsBefore+1,controller.reads);assertEquals(2,controller.textSends);assertEquals(0,controller.enters);assertFalse(((View)get(a,"sendEnter")).isEnabled());
+    controller.listener.onSnapshot(TARGET,"fresh post-text snapshot");assertTrue(((View)get(a,"sendEnter")).isEnabled());
    });
   }
  }
  @Test public void unknownPersistsAcrossRecreationUntilFreshExplicitInspection(){
   try(ActivityScenario<MainActivity> scenario=ActivityScenario.launch(MainActivity.class)){
-   scenario.onActivity(a->{Fake fake=install(a,"controller");fake.listener.onSnapshot(TARGET,"fresh");((Button)get(a,"sendEnter")).performClick();assertEquals(1,fake.enters);fake.listener.onState(SessionRepository.State.DISCONNECTED,"");assertTrue(a.getPreferences(0).getBoolean("input_uncertain",false));});
+   scenario.onActivity(a->{Fake fake=install(a,"controller");fake.listener.onSnapshot(TARGET,"fresh");((View)get(a,"sendEnter")).performClick();assertEquals(1,fake.enters);fake.listener.onState(SessionRepository.State.DISCONNECTED,"");assertTrue(a.getPreferences(0).getBoolean("input_uncertain",false));});
    scenario.recreate();
    scenario.onActivity(a->{
-    assertTrue(a.getPreferences(0).getBoolean("input_uncertain",false));Fake fresh=install(a,"controller");assertFalse(((Button)get(a,"acknowledgeInput")).isEnabled());fresh.listener.onSnapshot(TARGET,"inspect current terminal");assertFalse(((Button)get(a,"sendEnter")).isEnabled());assertTrue(((Button)get(a,"acknowledgeInput")).isEnabled());assertEquals(0,fresh.enters);
-    ((Button)get(a,"acknowledgeInput")).performClick();assertFalse(a.getPreferences(0).getBoolean("input_uncertain",false));assertTrue(((Button)get(a,"sendEnter")).isEnabled());assertEquals(0,fresh.enters);
-    ((Button)get(a,"sendEnter")).performClick();assertEquals(1,fresh.enters);int beforeReads=fresh.reads;fresh.listener.onMutationResult(fresh.id,TARGET,SessionRepository.MutationOutcome.COMPLETED);assertFalse(a.getPreferences(0).getBoolean("input_uncertain",false));
-    assertEquals(beforeReads+1,fresh.reads);assertEquals(1,fresh.enters);assertEquals(0,fresh.textSends);assertFalse(((Button)get(a,"sendEnter")).isEnabled());
-    fresh.listener.onSnapshot(TARGET,"fresh correlated post-delivery snapshot");assertTrue(((Button)get(a,"sendEnter")).isEnabled());
+    assertTrue(a.getPreferences(0).getBoolean("input_uncertain",false));Fake fresh=install(a,"controller");assertFalse(((View)get(a,"acknowledgeInput")).isEnabled());fresh.listener.onSnapshot(TARGET,"inspect current terminal");assertFalse(((View)get(a,"sendEnter")).isEnabled());assertTrue(((View)get(a,"acknowledgeInput")).isEnabled());assertEquals(0,fresh.enters);
+    ((View)get(a,"acknowledgeInput")).performClick();assertFalse(a.getPreferences(0).getBoolean("input_uncertain",false));assertTrue(((View)get(a,"sendEnter")).isEnabled());assertEquals(0,fresh.enters);
+    ((View)get(a,"sendEnter")).performClick();assertEquals(1,fresh.enters);int beforeReads=fresh.reads;fresh.listener.onMutationResult(fresh.id,TARGET,SessionRepository.MutationOutcome.COMPLETED);assertFalse(a.getPreferences(0).getBoolean("input_uncertain",false));
+    assertEquals(beforeReads+1,fresh.reads);assertEquals(1,fresh.enters);assertEquals(0,fresh.textSends);assertFalse(((View)get(a,"sendEnter")).isEnabled());
+    fresh.listener.onSnapshot(TARGET,"fresh correlated post-delivery snapshot");assertTrue(((View)get(a,"sendEnter")).isEnabled());
    });
   }
  }

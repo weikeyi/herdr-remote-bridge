@@ -11,8 +11,8 @@ android {
         applicationId 'dev.herdrbridge.nativeclient.preview'
         minSdk 28
         targetSdk 36
-        versionCode 1
-        versionName '0.2.0-phone-preview'
+        versionCode 2
+        versionName '0.3.0-phone-preview'
         testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
     buildTypes {

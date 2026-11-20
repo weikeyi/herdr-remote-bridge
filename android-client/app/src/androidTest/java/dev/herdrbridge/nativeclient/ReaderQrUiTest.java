@@ -82,30 +82,40 @@ public class ReaderQrUiTest {
 
     @Test public void nativeReaderLayoutShowsDistinctPaneAndExplicitSensitiveCopy(){
         SessionRepository.SessionTarget target=new SessionRepository.SessionTarget("server-A","pane-A","terminal-A",1,"");
+        SessionRepository.SessionTarget other=new SessionRepository.SessionTarget("server-A","pane-B","terminal-B",1,"");
+        List<SessionRepository.SessionTarget> requested=new ArrayList<>();
         try(ActivityScenario<MainActivity> scenario=ActivityScenario.launch(MainActivity.class)){
             scenario.onActivity(a->{
                 set(a,"ready",true);((ScrollView)field(a,"setup")).setVisibility(View.GONE);
                 // Test-only read transport records the selection without opening a socket.
                 ForegroundConnection c=new ForegroundConnection(new ForegroundConnection.Factory(){
-                    public boolean hasSaved(){return true;}public SessionRepository saved(){return new SessionRepository(){public void start(Listener l){}public void close(){}public void requestSnapshot(SessionTarget t){assertEquals(target,t);}};}
+                    public boolean hasSaved(){return true;}public SessionRepository saved(){return new SessionRepository(){public void start(Listener l){l.onState(State.READY,"");}public void close(){}public void requestSnapshot(SessionTarget t){requested.add(t);}};}
                 },new ForegroundConnection.Scheduler(){public void execute(Runnable r){r.run();}public void after(long d,Runnable r){}public void cancel(Runnable r){}},new SessionRepository.Listener(){public void onState(SessionRepository.State s,String x){}public void onSessions(List<SessionRepository.Session> s){}public void onSnapshot(SessionRepository.SessionTarget t,String x){}},()->0.5);
-                set(a,"connection",c);
+                set(a,"connection",c);c.foreground();c.explicitSaved();
                 call(a,"displaySessions",new Class<?>[]{List.class},Collections.emptyList());
                 assertTrue(((TextView)field(a,"state")).getText().toString().contains("没有可显示"));
-                SessionRepository.SessionTarget other=new SessionRepository.SessionTarget("server-A","pane-B","terminal-B",1,"");
-                call(a,"displaySessions",new Class<?>[]{List.class},Arrays.asList(new SessionRepository.Session(target,"","idle"),new SessionRepository.Session(other,"\u001b[31m标题","running")));
+                call(a,"displaySessions",new Class<?>[]{List.class},Arrays.asList(new SessionRepository.Session(target,"构建检查","idle"),new SessionRepository.Session(other,"\u001b[31m标题","running")));
                 LinearLayout sessions=(LinearLayout)field(a,"sessions");assertEquals(2,sessions.getChildCount());
-                assertTrue(((Button)sessions.getChildAt(0)).getText().toString().contains("pane-A"));assertTrue(((Button)sessions.getChildAt(1)).getText().toString().contains("pane-B"));
-                sessions.getChildAt(0).performClick();assertEquals(View.GONE,((ScrollView)field(a,"sessionList")).getVisibility());
+                assertTrue(((Button)sessions.getChildAt(0)).getText().toString().contains("构建检查"));
+                assertTrue(((Button)sessions.getChildAt(0)).getText().toString().contains("空闲"));
+                assertTrue(((Button)sessions.getChildAt(1)).getText().toString().contains("标题"));
+                assertTrue(((Button)sessions.getChildAt(1)).getText().toString().contains("运行中"));
+                assertFalse(((Button)sessions.getChildAt(1)).getText().toString().contains("\u001b"));
+                assertTrue(sessions.getChildAt(1).performClick());
+                assertEquals(Collections.singletonList(other),requested);
+                assertTrue(((View)field(a,"showSessions")).performClick());
+                assertTrue(sessions.getChildAt(0).performClick());
+                assertEquals(Arrays.asList(other,target),requested);
+                assertEquals(View.GONE,((ScrollView)field(a,"sessionList")).getVisibility());
                 assertTrue(((TextView)field(a,"state")).getText().toString().contains("正在读取"));
-                assertFalse(((Button)field(a,"copy")).isEnabled());
+                assertFalse(((View)field(a,"copy")).isEnabled());
                 call(a,"displaySnapshot",new Class<?>[]{SessionRepository.SessionTarget.class,String.class},target,"\u001b[31msynthetic snapshot\u001b[0m");
                 assertEquals("synthetic snapshot",((TextView)field(a,"terminal")).getText().toString());
             });
             awaitWindowFocus(scenario);
             scenario.onActivity(a->{
                 assertTrue("Clipboard check requires the app's focused window",a.hasWindowFocus());
-                Button copy=(Button)field(a,"copy");assertTrue(copy.isEnabled());assertTrue(copy.performClick());
+                View copy=(View)field(a,"copy");assertTrue(copy.isEnabled());assertTrue(copy.performClick());
                 assertTrue("Production copy handler must run",((TextView)field(a,"state")).getText().toString().contains("已复制"));
                 ClipboardManager clipboard=(ClipboardManager)a.getSystemService(Context.CLIPBOARD_SERVICE);
                 try{ClipData clip=clipboard.getPrimaryClip();assertNotNull("Explicit copy must reach the real system clipboard while focused",clip);assertEquals("synthetic snapshot",clip.getItemAt(0).getText().toString());if(Build.VERSION.SDK_INT>=33)assertTrue(clip.getDescription().getExtras().getBoolean(ClipDescription.EXTRA_IS_SENSITIVE));}
